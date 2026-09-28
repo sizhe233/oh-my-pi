@@ -1,0 +1,250 @@
+name: Fork Windows x64 build (manual)
+
+# The repository supports win32-x64-baseline, not 32-bit win32-x86.
+# Build the baseline addon on Linux (the Bazel MSVC cross toolchain does not run
+# on Windows), then smoke the resulting executable on hosted Windows x64.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit SHA at the selected main ref
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    name: Build Windows x64 baseline addon and CLI from source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      OMP_TEST_TIMEOUT: "120"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the trusted x64 source commit
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = x86_64
+          bazelisk --version
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Install frozen dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
+          bun install --frozen-lockfile
+      - name: Build extension and check committed embedded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build Linux test and Windows baseline native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
+          test ! -e packages/natives/native/pi_natives.win32-x64-baseline.node
+          bun scripts/bazel-natives.ts linux-x64-baseline win32-x64-baseline --dest packages/natives/native -- --jobs=2
+          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
+          test -s packages/natives/native/pi_natives.win32-x64-baseline.node
+      - name: Typecheck CLI and extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun --cwd=packages/coding-agent run check:types
+          bun --cwd=packages/browser-relay run check:types
+      - name: Run browser relay contracts on Linux
+        working-directory: packages/coding-agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun test \
+            test/tools/browser-relay-bridge.test.ts \
+            test/tools/browser-relay-daemon.test.ts \
+            test/tools/browser-relay-server.test.ts \
+            test/tools/browser-relay-probe.test.ts \
+            test/tools/browser-relay-kind.test.ts \
+            test/tools/browser-attach.test.ts \
+            test/tools/browser-op-tracking.test.ts \
+            test/tools/browser-screenshot-plus.test.ts \
+            test/tools/browser-tab-worker-startup.test.ts \
+            test/tools/browser-launch-cwd.test.ts
+      - name: Cross-compile Windows x64 release CLI with baseline addon
+        run: bun scripts/ci-release-build-binaries.ts --targets win32-x64
+      - name: Record same-commit cross-build checksums
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -s packages/coding-agent/binaries/omp-windows-x64.exe
+          bun scripts/ci-release-checksums.ts packages/coding-agent/binaries/SHA256SUMS.txt \
+            packages/coding-agent/binaries/omp-windows-x64.exe \
+            packages/natives/native/pi_natives.win32-x64-baseline.node \
+            packages/browser-relay/dist/omp-browser-relay-extension.zip
+          bun -e 'await Bun.write("packages/coding-agent/binaries/build.json", JSON.stringify({sourceSha:Bun.env.SOURCE_SHA,runId:Bun.env.RUN_ID,target:"win32-x64-baseline",buildHost:"linux-x64",bun:Bun.version,checksums:await Bun.file("packages/coding-agent/binaries/SHA256SUMS.txt").text(),result:"built"}, null, 2) + "\n")'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-fork-windows-x64-build-${{ github.sha }}
+          path: |
+            packages/coding-agent/binaries/omp-windows-x64.exe
+            packages/coding-agent/binaries/SHA256SUMS.txt
+            packages/coding-agent/binaries/build.json
+            packages/natives/native/pi_natives.win32-x64-baseline.node
+            packages/browser-relay/dist/omp-browser-relay-extension.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-smoke:
+    name: Smoke compiled CLI on hosted Windows x64
+    needs: cross-build
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: omp-fork-windows-x64-build-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-build
+      - name: Verify Windows architecture, source SHA and downloaded hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'Windows x64 host required' }
+          if ((git rev-parse HEAD).Trim() -ne '${{ github.sha }}') { throw 'Checkout SHA mismatch' }
+          $root = Join-Path $env:RUNNER_TEMP 'windows-build'
+          $files = @{
+            'omp-windows-x64.exe' = Join-Path $root 'coding-agent/binaries/omp-windows-x64.exe'
+            'pi_natives.win32-x64-baseline.node' = Join-Path $root 'natives/native/pi_natives.win32-x64-baseline.node'
+            'omp-browser-relay-extension.zip' = Join-Path $root 'browser-relay/dist/omp-browser-relay-extension.zip'
+          }
+          $manifestPath = Join-Path $root 'coding-agent/binaries/SHA256SUMS.txt'
+          $provenancePath = Join-Path $root 'coding-agent/binaries/build.json'
+          $provenance = Get-Content -Raw -LiteralPath $provenancePath | ConvertFrom-Json
+          if ($provenance.sourceSha -ne '${{ github.sha }}' -or $provenance.target -ne 'win32-x64-baseline') { throw 'Artifact provenance mismatch' }
+          $lines = @(Get-Content -LiteralPath $manifestPath)
+          if ($lines.Count -ne 3) { throw 'Expected three asset hashes' }
+          foreach ($line in $lines) {
+            if ($line -cnotmatch '^([0-9a-f]{64})  ([^ ]+)$') { throw "Invalid checksum line: $line" }
+            $expectedHash = $Matches[1]
+            $name = $Matches[2]
+            if (-not $files.ContainsKey($name)) { throw "Unknown artifact: $name" }
+            $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $files[$name]).Hash.ToLowerInvariant()
+            if ($actualHash -cne $expectedHash) { throw "Hash mismatch: $name" }
+          }
+      - name: Install Windows baseline addon and frozen dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'bun install failed' }
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'windows-build/natives/native/pi_natives.win32-x64-baseline.node') -Destination 'packages/natives/native/pi_natives.win32-x64-baseline.node'
+      - name: Run browser relay contracts on real Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          bun --cwd=packages/coding-agent test `
+            test/tools/browser-relay-bridge.test.ts `
+            test/tools/browser-relay-server.test.ts `
+            test/tools/browser-relay-kind.test.ts `
+            test/tools/browser-op-tracking.test.ts `
+            test/tools/browser-launch-cwd.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows browser relay tests failed' }
+      - name: Smoke standalone executable and caller cwd
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'windows-build'
+          $binary = Join-Path $root 'coding-agent/binaries/omp-windows-x64.exe'
+          $scratch = Join-Path $env:RUNNER_TEMP 'omp-windows-smoke'
+          $env:HOME = Join-Path $scratch 'home'
+          $env:USERPROFILE = $env:HOME
+          $env:LOCALAPPDATA = Join-Path $scratch 'local'
+          $env:XDG_DATA_HOME = Join-Path $scratch 'xdg'
+          # This placeholder selects a bundled model for RPC pwd; no model request is sent.
+          $env:OPENAI_API_KEY = 'offline-test-key'
+          New-Item -ItemType Directory -Force -Path $env:HOME, $env:LOCALAPPDATA, $env:XDG_DATA_HOME, (Join-Path $scratch 'project'), (Join-Path $scratch 'override') | Out-Null
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw 'Windows binary --version failed' }
+          & $binary --smoke-test
+          if ($LASTEXITCODE -ne 0) { throw 'Windows binary worker smoke failed' }
+          $code = @'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          binary, root = sys.argv[1:]
+          root = pathlib.Path(root)
+          for args, expected in [((), root / 'project'), (('--cwd=' + str(root / 'override'),), root / 'override')]:
+              run = subprocess.run(
+                  [binary, '--mode', 'rpc', '--no-ui', '--no-session', *args],
+                  cwd=root / 'project', input=json.dumps({'id': 'pwd', 'type': 'bash', 'command': 'pwd'}) + '\n',
+                  text=True, capture_output=True, timeout=90,
+              )
+              replies = [json.loads(line) for line in run.stdout.splitlines() if line.startswith('{')]
+              reply = next((entry for entry in replies if entry.get('type') == 'response' and entry.get('id') == 'pwd'), None)
+              assert run.returncode == 0 and reply and reply['success'], (run.returncode, run.stderr[-500:])
+              assert os.path.normcase(os.path.realpath(reply['data']['workingDir'])) == os.path.normcase(os.path.realpath(expected))
+              assert expected.name.lower() in reply['data']['output'].lower(), reply['data']['output']
+          '@
+          $code | python - $binary $scratch
+          if ($LASTEXITCODE -ne 0) { throw 'Windows caller cwd RPC smoke failed' }
+      - name: Verify CLI-embedded extension against ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'windows-build'
+          $binary = Join-Path $root 'coding-agent/binaries/omp-windows-x64.exe'
+          $embedded = Join-Path $env:RUNNER_TEMP 'omp-windows-smoke/embedded-extension'
+          $unzipped = Join-Path $env:RUNNER_TEMP 'omp-windows-smoke/unpacked-extension'
+          & $binary browser-relay install --dir $embedded
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot install embedded extension' }
+          Expand-Archive -LiteralPath (Join-Path $root 'browser-relay/dist/omp-browser-relay-extension.zip') -DestinationPath $unzipped -Force
+          foreach ($name in @('background.js', 'manifest.json', 'options.html', 'options.js')) {
+            $left = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $embedded $name)).Hash
+            $right = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $unzipped $name)).Hash
+            if ($left -cne $right) { throw "Embedded extension mismatch: $name" }
+          }
+      - name: Record Windows smoke result
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'windows-build/coding-agent/binaries/build.json'
+          $provenance = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $provenance | Add-Member -NotePropertyName smokeHost -NotePropertyValue 'windows-2025-x64' -Force
+          $provenance.result = 'passed'
+          $provenance | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 -LiteralPath $manifestPath
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-fork-windows-x64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/windows-build/coding-agent/binaries/omp-windows-x64.exe
+            ${{ runner.temp }}/windows-build/coding-agent/binaries/SHA256SUMS.txt
+            ${{ runner.temp }}/windows-build/coding-agent/binaries/build.json
+            ${{ runner.temp }}/windows-build/natives/native/pi_natives.win32-x64-baseline.node
+            ${{ runner.temp }}/windows-build/browser-relay/dist/omp-browser-relay-extension.zip
+          if-no-files-found: error
+          retention-days: 14
