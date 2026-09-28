@@ -21,6 +21,7 @@ Driven tabs join cyan `omp/<session ID>` groups within each Chrome window (the t
 
 - `bun run build` — bundles the extension into `dist/extension/`, zips it for GH releases, and regenerates the embedded CLI install assets under `packages/coding-agent/src/tools/browser/relay/extension-assets/` (**commit those**).
 - `bun scripts/smoke.ts [relay-url] [target-substring]` — end-to-end smoke replicating omp's supervisor + tab-worker double-connection pattern against a live relay.
+- The GitHub fork keeps inherited upstream workflows as `.yml.upstream-disabled` files; only `.github/workflows/fork-build-manual.yml` is runnable. Dispatch it on `main` with `source_sha` set to the full current commit SHA. Its one Apple Silicon job builds the addon, extension, and CLI from that checkout, runs browser/type/cwd/worker checks, and uploads checksums plus build provenance; it never publishes a release or updates a local installation.
 
 ## Limitations
 

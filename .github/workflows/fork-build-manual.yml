@@ -1,0 +1,145 @@
+name: Fork browser build (manual)
+
+# This fork does not run unreviewed PR code or publish releases automatically.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit SHA at the selected main ref
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    name: Build and smoke macOS arm64 CLI and relay extension
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      OMP_TEST_TIMEOUT: "120"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Verify trusted source and Apple Silicon host
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          test "${SOURCE_SHA,,}" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          bazelisk --version
+          df -h .
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Install frozen workspace dependencies
+        run: |
+          set -euo pipefail
+          bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
+          bun install --frozen-lockfile
+      - name: Build extension and check committed embedded assets
+        run: |
+          set -euo pipefail
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build native addon from this checkout
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.darwin-arm64.node
+          bun scripts/bazel-natives.ts darwin-arm64 --dest packages/natives/native -- --jobs=2 --local_ram_resources=4096
+          test -s packages/natives/native/pi_natives.darwin-arm64.node
+      - name: Check CLI and extension types
+        run: |
+          set -euo pipefail
+          bun --cwd=packages/coding-agent run check:types
+          bun --cwd=packages/browser-relay run check:types
+      - name: Exercise browser relay contracts
+        working-directory: packages/coding-agent
+        run: |
+          set -euo pipefail
+          bun test \
+            test/tools/browser-relay-bridge.test.ts \
+            test/tools/browser-relay-daemon.test.ts \
+            test/tools/browser-relay-server.test.ts \
+            test/tools/browser-relay-probe.test.ts \
+            test/tools/browser-relay-kind.test.ts \
+            test/tools/browser-attach.test.ts \
+            test/tools/browser-op-tracking.test.ts \
+            test/tools/browser-screenshot-plus.test.ts \
+            test/tools/browser-tab-worker-startup.test.ts \
+            test/tools/browser-launch-cwd.test.ts
+      - name: Compile one release CLI from the same SHA
+        run: bun scripts/ci-release-build-binaries.ts --targets darwin-arm64
+      - name: Smoke compiled workers and caller directory handling
+        shell: bash
+        env:
+          # Enables model selection for the offline RPC pwd probe; no provider request is made.
+          OPENAI_API_KEY: offline-test-key
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/packages/coding-agent/binaries/omp-darwin-arm64"
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          mkdir -p "$scratch/home" "$scratch/xdg" "$scratch/project" "$scratch/override"
+          export HOME="$scratch/home" XDG_DATA_HOME="$scratch/xdg"
+          codesign --verify --strict "$binary"
+          (cd "$scratch/project" && "$binary" --version && "$binary" --smoke-test)
+          python3 - "$binary" "$scratch" <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          binary, root = sys.argv[1:]
+          root = pathlib.Path(root)
+          for args, expected in [((), root / "project"), (("--cwd=" + str(root / "override"),), root / "override")]:
+              completed = subprocess.run(
+                  [binary, "--mode", "rpc", "--no-ui", "--no-session", *args],
+                  cwd=root / "project", input=json.dumps({"id": "pwd", "type": "bash", "command": "pwd"}) + "\n",
+                  text=True, capture_output=True, timeout=90,
+              )
+              responses = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")]
+              reply = next((frame for frame in responses if frame.get("type") == "response" and frame.get("id") == "pwd"), None)
+              assert completed.returncode == 0 and reply and reply["success"], (completed.returncode, completed.stderr[-500:])
+              assert os.path.realpath(reply["data"]["workingDir"]) == os.path.realpath(expected)
+              assert os.path.realpath(reply["data"]["output"].strip()) == os.path.realpath(expected)
+          PY
+      - name: Verify CLI-embedded extension matches the packaged extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="packages/coding-agent/binaries/omp-darwin-arm64"
+          "$binary" browser-relay install --dir "$RUNNER_TEMP/embedded-extension"
+          for file in background.js manifest.json options.html options.js; do
+            cmp "$RUNNER_TEMP/embedded-extension/$file" "packages/browser-relay/dist/extension/$file"
+          done
+          unzip -p packages/browser-relay/dist/omp-browser-relay-extension.zip background.js | cmp - packages/browser-relay/dist/extension/background.js
+      - name: Record provenance and checksums
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          bun scripts/ci-release-checksums.ts packages/coding-agent/binaries/SHA256SUMS.txt \
+            packages/coding-agent/binaries/omp-darwin-arm64 \
+            packages/browser-relay/dist/omp-browser-relay-extension.zip
+          bun -e 'await Bun.write("packages/coding-agent/binaries/build.json", JSON.stringify({sourceSha:Bun.env.SOURCE_SHA,runId:Bun.env.RUN_ID,platform:process.platform,arch:process.arch,bun:Bun.version,checksums:await Bun.file("packages/coding-agent/binaries/SHA256SUMS.txt").text(),result:"passed"}, null, 2) + "\n")'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-fork-darwin-arm64-${{ github.sha }}
+          path: |
+            packages/coding-agent/binaries/omp-darwin-arm64
+            packages/coding-agent/binaries/SHA256SUMS.txt
+            packages/coding-agent/binaries/build.json
+            packages/browser-relay/dist/omp-browser-relay-extension.zip
+          if-no-files-found: error
+          retention-days: 14
