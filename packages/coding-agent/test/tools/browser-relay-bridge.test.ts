@@ -170,9 +170,10 @@ async function claimTab(
 	cdp: FakeCdpSocket,
 	connId: number,
 	tabId: number,
+	label?: string,
 ): Promise<void> {
 	const sessionId = await attachPage(bridge, ext, cdp, connId, tabId);
-	bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, sessionId, method: "OMP.claimTarget" }));
+	bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, sessionId, method: "OMP.claimTarget", params: { label } }));
 	await flush();
 }
 
@@ -245,6 +246,84 @@ describe("RelayBridge tab grouping", () => {
 		expect(groups[0]!.color).toBe("cyan");
 	});
 
+	it("groups two sessions' separate tabs under distinct labels", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
+		const first = new FakeCdpSocket();
+		await claimTab(bridge, ext, first, bridge.cdpConnected(first), 1, "a");
+		ack(bridge, ext, "group", { grouped: { "1": 41 } });
+		await flush();
+		const second = new FakeCdpSocket();
+		await claimTab(bridge, ext, second, bridge.cdpConnected(second), 2, "b");
+		expect(ext.rpcs("group").map(rpc => ({ tabIds: rpc.tabIds, title: rpc.title }))).toEqual([
+			{ tabIds: [1], title: "omp/a" },
+			{ tabIds: [2], title: "omp/b" },
+		]);
+	});
+
+	it("migrates a newly created tab after its default-group RPC completes", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		expect(ext.rpcs("group").map(rpc => rpc.title)).toEqual(["omp"]);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 9);
+		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 9, groupId: 42 }) }));
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, sessionId, method: "OMP.claimTarget", params: { label: " Session A " } }),
+		);
+		ack(bridge, ext, "group", { grouped: { "9": 42 } });
+		await flush();
+		expect(ext.rpcs("ungroup").map(rpc => rpc.tabIds)).toEqual([[9]]);
+		expect(ext.rpcs("group").map(rpc => rpc.title)).toEqual(["omp", "omp/Session A"]);
+		ack(bridge, ext, "ungroup");
+		ack(bridge, ext, "group", { grouped: { "9": 43 } });
+		await flush();
+		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 9, groupId: 43 }) }));
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId,
+				method: "OMP.claimTarget",
+				params: { label: `  ${"x".repeat(40)}  ` },
+			}),
+		);
+		await flush();
+		expect(ext.rpcs("ungroup").map(rpc => rpc.tabIds)).toEqual([[9], [9]]);
+		expect(ext.rpcs("group").map(rpc => rpc.title)).toEqual(["omp", "omp/Session A", `omp/${"x".repeat(32)}`]);
+	});
+
+	it("rejects a second driver until the first connection releases its claim", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const first = new FakeCdpSocket();
+		const firstConn = bridge.cdpConnected(first);
+		await claimTab(bridge, ext, first, firstConn, 1);
+		const second = new FakeCdpSocket();
+		const secondConn = bridge.cdpConnected(second);
+		const sessionId = await attachPage(bridge, ext, second, secondConn, 1);
+		const conflictId = ++msgSeq;
+		bridge.cdpMessage(secondConn, JSON.stringify({ id: conflictId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(second.messages.find(message => message.id === conflictId)?.error).toEqual({
+			code: -32000,
+			message: `Tab ${ANON}:1 is already driven by another omp session`,
+		});
+		bridge.cdpClosed(firstConn);
+		const retryId = ++msgSeq;
+		bridge.cdpMessage(secondConn, JSON.stringify({ id: retryId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(second.messages.find(message => message.id === retryId)?.result).toEqual({});
+	});
+
 	it("never groups pinned tabs or tabs in a user group, even when claimed", async () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
@@ -281,6 +360,50 @@ describe("RelayBridge tab grouping", () => {
 		const groups = ext.rpcs("group");
 		expect(groups).toHaveLength(1);
 		expect(groups[0]!.tabIds).toEqual([9]);
+	});
+
+	it("hands a created tab from its supervisor to the owned worker without opening a second claim", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const supervisor = new FakeCdpSocket();
+		const supervisorConn = bridge.cdpConnected(supervisor);
+		bridge.cdpMessage(supervisorConn, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+
+		const worker = new FakeCdpSocket();
+		const workerConn = bridge.cdpConnected(worker);
+		const workerSession = await attachPage(bridge, ext, worker, workerConn, 9);
+		const other = new FakeCdpSocket();
+		const otherConn = bridge.cdpConnected(other);
+		const otherSession = await attachPage(bridge, ext, other, otherConn, 9);
+		const claim = (connId: number, sessionId: string, ownsTarget = false) => {
+			const id = ++msgSeq;
+			bridge.cdpMessage(
+				connId,
+				JSON.stringify({ id, sessionId, method: "OMP.claimTarget", params: { ownsTarget } }),
+			);
+			return id;
+		};
+		const earlyConflict = claim(otherConn, otherSession);
+		await flush();
+		expect(other.messages.find(message => message.id === earlyConflict)?.error).toMatchObject({
+			message: expect.stringContaining("already driven by another omp session"),
+		});
+		const handoff = claim(workerConn, workerSession, true);
+		await flush();
+		expect(worker.messages.find(message => message.id === handoff)?.result).toEqual({});
+		bridge.cdpClosed(supervisorConn);
+		const held = claim(otherConn, otherSession);
+		await flush();
+		expect(other.messages.find(message => message.id === held)?.error).toMatchObject({
+			message: expect.stringContaining("already driven by another omp session"),
+		});
+		bridge.cdpClosed(workerConn);
+		const released = claim(otherConn, otherSession);
+		await flush();
+		expect(other.messages.find(message => message.id === released)?.result).toEqual({});
 	});
 
 	it("never re-groups a tab the user pulled out of the omp group", async () => {
@@ -689,7 +812,7 @@ describe("RelayBridge attachment release", () => {
 		const firstAttemptId = ++msgSeq;
 		bridge.cdpMessage(
 			connId,
-			JSON.stringify({ id: firstAttemptId, method: "Target.attachToTarget", params: { targetId: "PAGE1" } }),
+			JSON.stringify({ id: firstAttemptId, method: "Target.attachToTarget", params: { targetId: `PAGE${ANON}.1` } }),
 		);
 		nack(bridge, ext, "attach", "debugger unavailable");
 		await flush();
@@ -698,7 +821,7 @@ describe("RelayBridge attachment release", () => {
 		const retryId = ++msgSeq;
 		bridge.cdpMessage(
 			connId,
-			JSON.stringify({ id: retryId, method: "Target.attachToTarget", params: { targetId: "PAGE1" } }),
+			JSON.stringify({ id: retryId, method: "Target.attachToTarget", params: { targetId: `PAGE${ANON}.1` } }),
 		);
 		ack(bridge, ext, "attach");
 		await flush();
@@ -726,7 +849,7 @@ describe("RelayBridge attachment release", () => {
 		const reattachId = ++msgSeq;
 		bridge.cdpMessage(
 			connId,
-			JSON.stringify({ id: reattachId, method: "Target.attachToTarget", params: { targetId: "PAGE1" } }),
+			JSON.stringify({ id: reattachId, method: "Target.attachToTarget", params: { targetId: `PAGE${ANON}.1` } }),
 		);
 		ack(bridge, replacement, "attach");
 		await flush();
@@ -752,7 +875,7 @@ describe("RelayBridge attachment release", () => {
 		const reattachId = ++msgSeq;
 		bridge.cdpMessage(
 			connId,
-			JSON.stringify({ id: reattachId, method: "Target.attachToTarget", params: { targetId: "PAGE1" } }),
+			JSON.stringify({ id: reattachId, method: "Target.attachToTarget", params: { targetId: `PAGE${ANON}.1` } }),
 		);
 		await flush();
 		// Banned: the bridge never even asks the extension to reattach.

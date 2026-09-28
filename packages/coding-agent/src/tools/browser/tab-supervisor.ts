@@ -420,7 +420,7 @@ async function acquireTabImpl(
 	}
 	let initPayload: WorkerInitPayload;
 	try {
-		initPayload = await buildInitPayload(browser, opts);
+		initPayload = await buildInitPayload(browser, opts, name);
 	} catch (error) {
 		// Failing before the worker took its own hold must release the
 		// temporary one, or the browser's refCount never reaches 0 again.
@@ -1287,7 +1287,16 @@ function sameAllowedDomains(left: readonly string[], right: readonly string[] | 
 	return left.every((domain, index) => domain === right[index]);
 }
 
-async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTabOptions): Promise<WorkerInitPayload> {
+/** Keep every tab in one owning session group, even when tab names differ. */
+function groupLabelForTab(name: string, ownerSessionId?: string): string {
+	return ownerSessionId?.slice(-32) || name;
+}
+
+async function buildInitPayload(
+	browser: PuppeteerBrowserHandle,
+	opts: AcquireTabOptions,
+	name: string,
+): Promise<WorkerInitPayload> {
 	const safeDir = getPuppeteerDir();
 	const browserWSEndpoint = browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
@@ -1314,10 +1323,9 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	// Connected and relay browsers are user-driven. A relay drive with no
 	// explicit target never adopts "the visible tab" — that guesswork silently
 	// hijacks whatever the user or another concurrent omp session happens to be
-	// looking at. Instead it forces a brand-new tab omp owns outright (the
-	// relay auto-groups it under "omp"; see relay/bridge.ts #claimTab),
-	// mirroring Claude in Chrome. An explicit target is a deliberate request to
-	// attach an existing tab and keeps the old adopt-and-avoid-raising behavior.
+	// looking at. Instead it forces a brand-new tab omp owns outright. The
+	// relay initially groups it under "omp"; the worker claim assigns its session
+	// label. An explicit target deliberately adopts an existing tab instead.
 	const userDriven = browser.kind.kind === "connected" || browser.kind.kind === "relay";
 	const activateForScreenshot = !userDriven || !shouldPreserveConnectedBrowserFocus(opts.target);
 	const { page, ownsTarget } = await resolveAttachTarget(browser.browser, {
@@ -1351,6 +1359,8 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 		timeoutMs: opts.timeoutMs,
 		activateForScreenshot,
 		ownsTarget,
+		groupLabel: ownsTarget ? groupLabelForTab(name, opts.ownerSessionId) : undefined,
+		emulateFocus: ownsTarget === true,
 	};
 }
 
@@ -1456,13 +1466,14 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		// Unblock a wedged page (open JS dialog, hung navigation) before adopting it —
 		// otherwise init stalls, times out, and the tab gets force-killed.
 		recover: true,
-		emulateFocus: tab.kindTag === "headless",
+		emulateFocus: tab.kindTag === "headless" || tab.ownsTarget,
 		timeoutMs,
 		activateForScreenshot: tab.activateForScreenshot,
 		// A recycled worker is a fresh WorkerCore instance: it must be told the
 		// tab's ownership again, or its own #ownsTarget defaults false and a
 		// later graceful close leaks the Chrome tab omp created for this session.
 		ownsTarget: tab.ownsTarget,
+		groupLabel: tab.ownsTarget ? groupLabelForTab(tab.name, tab.ownerSessionId) : undefined,
 	};
 	let worker = await spawnTabWorker();
 	try {

@@ -1193,15 +1193,19 @@ export function describeScreenshot(opts?: ScreenshotOptions): string {
 	if (opts?.fullPage) return "tab.screenshot({ fullPage: true })";
 	return "tab.screenshot()";
 }
+const BACKGROUND_SCREENSHOT_OPTIONS = { requireVisible: false } as const;
+
 export async function preparePageForScreenshot(
 	page: Pick<Page, "bringToFront" | "evaluate">,
 	signal: AbortSignal | undefined,
 	activate: boolean,
+	opts?: { requireVisible?: boolean },
 ): Promise<void> {
 	if (activate) {
 		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
 		return;
 	}
+	if (opts?.requireVisible === false) return;
 	const visible = await untilAborted(signal, () => page.evaluate(() => document.visibilityState === "visible")).catch(
 		() => false,
 	);
@@ -1232,6 +1236,7 @@ export class WorkerCore {
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
 	#activateForScreenshot = true;
+	#mode: WorkerInitPayload["mode"] = "headless";
 	#dialogs?: RuntimeDialogController;
 	#network?: BrowserNetworkManager;
 	#initScripts?: InitScriptManager;
@@ -1244,6 +1249,7 @@ export class WorkerCore {
 	#webmcp?: WebMcpController;
 	readonly #recording = new RecordingController();
 	#ownsTarget = false;
+	#groupLabel?: string;
 
 	constructor(transport: Transport, isolated: boolean) {
 		this.#transport = transport;
@@ -1344,7 +1350,9 @@ export class WorkerCore {
 
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
+			this.#mode = payload.mode;
 			this.#ownsTarget = payload.mode === "headless" || payload.ownsTarget === true;
+			this.#groupLabel = payload.mode === "attach" ? payload.groupLabel : undefined;
 			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
@@ -1443,9 +1451,9 @@ export class WorkerCore {
 	}
 
 	/**
-	 * Tell the omp browser relay this worker drives the adopted page, so the
-	 * relay adds it to the per-window "omp" tab group. Best-effort: plain CDP
-	 * backends (real Chrome, cmux) reject the relay-private method.
+	 * Tell the omp browser relay which page this worker drives, handing off a
+	 * freshly created tab's provisional claim and assigning its session group.
+	 * Best-effort: plain CDP backends reject this relay-private method.
 	 */
 	async #claimRelayTarget(page: Page): Promise<void> {
 		let session: CDPSession | undefined;
@@ -1453,10 +1461,13 @@ export class WorkerCore {
 			session = await page.createCDPSession();
 			// Puppeteer's protocol map cannot express the relay-private method; the
 			// send signature is otherwise identical.
-			const raw = session as unknown as { send(method: string): Promise<unknown> };
-			await raw.send("OMP.claimTarget");
-		} catch {
-			// Not the omp relay; nothing to claim.
+			const raw = session as unknown as {
+				send(method: string, params?: { label?: string; ownsTarget?: boolean }): Promise<unknown>;
+			};
+			await raw.send("OMP.claimTarget", { label: this.#groupLabel, ownsTarget: this.#ownsTarget });
+		} catch (err) {
+			// Plain CDP backends do not support this relay-private command.
+			if (err instanceof Error && err.message.includes("already driven by another omp session")) throw err;
 		} finally {
 			await session?.detach().catch(() => undefined);
 		}
@@ -2587,7 +2598,12 @@ export class WorkerCore {
 		opts: ScreenshotOptions = {},
 	): Promise<string | ScreenshotChangeResult> {
 		const page = this.#requirePage();
-		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
+		await preparePageForScreenshot(
+			page,
+			signal,
+			this.#activateForScreenshot,
+			this.#ownsTarget ? BACKGROUND_SCREENSHOT_OPTIONS : undefined,
+		);
 		screenshotQuality(opts);
 		const threshold = screenshotThreshold(opts.threshold);
 		const changeDetection = opts.ifChanged === true || opts.threshold !== undefined;
@@ -2689,7 +2705,12 @@ export class WorkerCore {
 		opts: DiffScreenshotOptions = {},
 	): Promise<DiffScreenshotResult> {
 		const page = this.#requirePage();
-		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
+		await preparePageForScreenshot(
+			page,
+			signal,
+			this.#activateForScreenshot,
+			this.#ownsTarget ? BACKGROUND_SCREENSHOT_OPTIONS : undefined,
+		);
 		const absoluteBaseline = resolveToCwd(baselinePath, session.cwd);
 		const baseline = await untilAborted(signal, () => fs.promises.readFile(absoluteBaseline));
 		const current = await captureScreenshotBuffer(page, {}, signal, async () => null, "png");

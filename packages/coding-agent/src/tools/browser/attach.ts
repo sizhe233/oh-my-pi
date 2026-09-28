@@ -482,10 +482,9 @@ export interface ResolvedAttachTarget {
  * guessing at "the visible tab" — which silently hijacks whatever the user or
  * another concurrent omp session happens to be looking at — open a tab omp
  * owns outright, mirroring how Claude in Chrome always drives a tab it opened
- * itself. `Target.createTarget` auto-joins the relay's "omp" tab group (see
- * `relay/bridge.ts` `#claimTab`), so the fresh tab is visibly and structurally
- * isolated from the rest of the user's browsing. An explicit `matcher` is a
- * deliberate request to attach a specific existing tab and always wins.
+ * itself. `Target.createTarget` temporarily puts the new tab in "omp"; the
+ * worker moves it to its owning session's group. An explicit `matcher` instead
+ * deliberately attaches an existing tab.
  */
 export async function resolveAttachTarget(
 	browser: Browser,

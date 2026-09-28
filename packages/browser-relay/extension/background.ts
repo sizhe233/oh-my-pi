@@ -65,9 +65,6 @@ function snapshot(tab: ChromeTab): TabSnapshot | null {
 	};
 }
 
-/** Title of the omp tab group; mirrored to session storage so a restarted service worker can still dissolve it. */
-let ompGroupTitle: string | null = null;
-
 /**
  * Serialize group mutations. Chrome's query→group→set-title sequence is not
  * atomic: two concurrent runs both miss the not-yet-titled group and mint
@@ -80,10 +77,8 @@ function enqueueGroupOp<T>(fn: () => Promise<T>): Promise<T> {
 	return result;
 }
 
-/** Move tabs into the per-window omp group, creating or reusing it by title. */
+/** Move tabs into their named per-window omp session group, creating or reusing it by title. */
 async function groupTabs(tabIds: number[], title: string, color: string): Promise<{ grouped: Record<string, number> }> {
-	ompGroupTitle = title;
-	void chrome.storage.session.set({ ompGroupTitle: title });
 	const byWindow = new Map<number, number[]>();
 	for (const tabId of tabIds) {
 		try {
@@ -119,16 +114,11 @@ async function groupTabs(tabIds: number[], title: string, color: string): Promis
 	return { grouped };
 }
 
-/** Dissolve every omp-titled group (relay disconnected or asked us to release tabs). */
+/** Dissolve all omp session groups when the relay disconnects. */
 async function restoreGroups(): Promise<void> {
-	if (!ompGroupTitle) {
-		// Service worker restarted since the last group op; recover the title.
-		const stored = await chrome.storage.session.get({ ompGroupTitle: "" }).catch(() => ({ ompGroupTitle: "" }));
-		ompGroupTitle = typeof stored.ompGroupTitle === "string" && stored.ompGroupTitle ? stored.ompGroupTitle : null;
-	}
-	if (!ompGroupTitle) return;
-	const groups = await chrome.tabGroups.query({ title: ompGroupTitle }).catch(() => []);
+	const groups = await chrome.tabGroups.query({}).catch(() => []);
 	for (const group of groups) {
+		if (group.title !== "omp" && !group.title?.startsWith("omp/")) continue;
 		const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
 		const ids = tabs.map(tab => tab.id).filter(id => id !== undefined);
 		if (ids.length > 0) await chrome.tabs.ungroup(ids).catch(() => {});
@@ -191,7 +181,7 @@ async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<un
 				msg.params,
 			);
 		case "createTab": {
-			const tab = await chrome.tabs.create({ url: msg.url });
+			const tab = await chrome.tabs.create({ url: msg.url, active: false });
 			const snap = snapshot(tab);
 			if (!snap) throw new Error("created tab has no id");
 			return { tab: snap };
@@ -258,7 +248,7 @@ async function connect(): Promise<void> {
 			pingTimer = null;
 		}
 		void setBadge(false);
-		void restoreGroups();
+		void enqueueGroupOp(restoreGroups);
 		scheduleReconnect();
 	};
 	socket.onerror = () => {

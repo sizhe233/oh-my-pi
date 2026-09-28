@@ -39,7 +39,6 @@ function snapshot(tab) {
     groupId: tab.groupId
   };
 }
-var ompGroupTitle = null;
 var groupOps = Promise.resolve();
 function enqueueGroupOp(fn) {
   const result = groupOps.then(fn, fn);
@@ -47,8 +46,6 @@ function enqueueGroupOp(fn) {
   return result;
 }
 async function groupTabs(tabIds, title, color) {
-  ompGroupTitle = title;
-  chrome.storage.session.set({ ompGroupTitle: title });
   const byWindow = new Map;
   for (const tabId of tabIds) {
     try {
@@ -83,14 +80,10 @@ async function groupTabs(tabIds, title, color) {
   return { grouped };
 }
 async function restoreGroups() {
-  if (!ompGroupTitle) {
-    const stored = await chrome.storage.session.get({ ompGroupTitle: "" }).catch(() => ({ ompGroupTitle: "" }));
-    ompGroupTitle = typeof stored.ompGroupTitle === "string" && stored.ompGroupTitle ? stored.ompGroupTitle : null;
-  }
-  if (!ompGroupTitle)
-    return;
-  const groups = await chrome.tabGroups.query({ title: ompGroupTitle }).catch(() => []);
+  const groups = await chrome.tabGroups.query({}).catch(() => []);
   for (const group of groups) {
+    if (group.title !== "omp" && !group.title?.startsWith("omp/"))
+      continue;
     const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
     const ids = tabs.map((tab) => tab.id).filter((id) => id !== undefined);
     if (ids.length > 0)
@@ -147,7 +140,7 @@ async function runRpc(msg) {
     case "send":
       return await chrome.debugger.sendCommand(msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId }, msg.method, msg.params);
     case "createTab": {
-      const tab = await chrome.tabs.create({ url: msg.url });
+      const tab = await chrome.tabs.create({ url: msg.url, active: false });
       const snap = snapshot(tab);
       if (!snap)
         throw new Error("created tab has no id");
@@ -214,7 +207,7 @@ async function connect() {
       pingTimer = null;
     }
     setBadge(false);
-    restoreGroups();
+    enqueueGroupOp(restoreGroups);
     scheduleReconnect();
   };
   socket.onerror = () => {

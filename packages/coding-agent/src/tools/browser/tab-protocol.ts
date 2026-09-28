@@ -103,6 +103,8 @@ export type WorkerInitPayload =
 			 * the worker on `{ type: "close" }` — an adopted tab belongs to the user.
 			 */
 			ownsTarget?: boolean;
+			/** Session tab name used to group omp-owned relay tabs. */
+			groupLabel?: string;
 	  };
 
 /** Result of one host tool requested by browser-run JavaScript. */
