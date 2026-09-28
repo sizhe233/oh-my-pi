@@ -54,7 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           test ! -e packages/natives/native/pi_natives.darwin-arm64.node
-          bun scripts/bazel-natives.ts darwin-arm64 --dest packages/natives/native -- --jobs=2 --local_ram_resources=4096
+          bun scripts/bazel-natives.ts darwin-arm64 --dest packages/natives/native -- --jobs=2
           test -s packages/natives/native/pi_natives.darwin-arm64.node
       - name: Check CLI and extension types
         run: |
