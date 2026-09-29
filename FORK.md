@@ -1,0 +1,116 @@
+# sizhe233/oh-my-pi fork
+
+本仓库是 [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) 的长期 fork。日常使用的 `omp` 由本 fork 的 GitHub Actions 构建，不使用上游发布。
+agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请求，与根目录 `AGENTS.md` 并存），本文件记录事实与操作流程。
+
+## 仓库与分支
+
+| remote | 地址 | 用途 |
+|---|---|---|
+| `origin` | `https://github.com/sizhe233/oh-my-pi.git` | 主仓库；`main` 是唯一构建来源 |
+| `upstream` | `https://github.com/can1357/oh-my-pi.git` | 只读；fetch refspec 为 `+refs/heads/main:refs/remotes/upstream/main` |
+| `gitea` | `http://192.168.71.56:23000/yuyi233/oh-my-pi` | 内网备份；`main` 更新后镜像推送 |
+
+- 首次分叉点：上游 `2e07c170b5`（18.4.1）。查看当前 fork 差异：`git log --oneline upstream/main..main`、`git diff upstream/main...main`。
+- `origin/main` 目前**没有**分支保护，只靠约定：不强推，只通过 PR 合并。
+
+## Fork 改动清单
+
+| # | 改动 | 提交 | 主要文件 |
+|---|---|---|---|
+| F1 | Relay 自有标签（移植上游未合并的 [PR #12101](https://github.com/can1357/oh-my-pi/pull/12101)，作者 Koichi Kimura） | `eb8634a408` `e85e9bdca0` `d462f9cff9` | `attach.ts`（`resolveAttachTarget`）、`tab-supervisor.ts`（`ownsTarget`、`closeAbandonedOwnedTarget`）、`tab-worker.ts`、`tab-protocol.ts`、`relay/bridge.ts`（非真实 detach 不再 ban） |
+| F2 | 会话隔离：后台建页、claim 互斥、按会话分组、后台截图 | `89e1fb1ec4` | `packages/browser-relay/extension/background.ts`、`relay/bridge.ts`（`#claimTab`、`provisionalClaimConnId`、`#drainGroupQueue`）、`tab-supervisor.ts`（`buildInitPayload`、`groupLabelForTab`）、`tab-worker.ts`（`#claimRelayTarget`、`preparePageForScreenshot`）、`relay/extension-assets/*` |
+| F3 | Fork CI：停用上游 workflow，只保留手动构建 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml` |
+
+上表中 `tab-*.ts`、`attach.ts`、`relay/*` 均位于 `packages/coding-agent/src/tools/browser/`。
+
+### 必须保持的行为
+
+合并上游或修改上述文件后，下列行为都必须仍然成立：
+
+1. 使用 relay 且未给 `app.target` 时，`browser.open()` 新建一个 omp 自有标签，不接管用户当前标签；Chrome 前台标签与焦点不变（`createTab` 使用 `active: false`）。
+2. 自有标签的截图不切换前台（`requireVisible: false`，并开启 `emulateFocus`）。
+3. 同一个已有标签只能被一个 omp 会话驱动；第二个会话收到 `already driven by another omp session`，不能被静默吞掉。
+4. 自有标签进入 `omp/<会话 ID>` 分组（没有会话 ID 时用标签名）；断开连接时解散所有 `omp`、`omp/*` 分组。
+5. 关闭会话时关闭自有标签；借用的用户标签保留；没有持有者时 detach，调试提示条消失。
+6. `supervisor → worker` 交接新建标签的临时 claim 时不能误报冲突。
+
+回归测试位于 `packages/coding-agent/test/tools/`：`browser-relay-bridge.test.ts`（分组、互斥、交接、ban）、`browser-attach.test.ts`（`resolveAttachTarget`）。
+
+### 已知问题
+
+- 超时回收（`recycleTimedOutWorkerTab`）如果旧 worker 是 inline 回退模式，旧连接的 claim 不会释放，新 worker 可能被互斥拒绝。尚未修复。
+- 分组标题取会话 ID 的后 32 个字符，可读性较差。
+- 扩展握手不报告构建哈希，无法从 relay 侧确认 Chrome 实际加载的扩展版本；更新后必须人工重载并实测。
+
+## CI 构建
+
+- 继承的上游 workflow 已改名为 `.yml.upstream-disabled`，不会运行。只有下面两个手动 workflow 生效，均不发布 release，也不改动本机安装：
+  - `fork-build-manual.yml`：GitHub 托管的 `macos-15` arm64 runner，产物名 `omp-fork-darwin-arm64-<sha>`。
+  - `fork-build-windows-manual.yml`：Windows x64 baseline（`win32-x64`，不是 32 位 x86）。native addon 和 CLI 在 Linux 上交叉编译，再到托管的 Windows x64 runner 上验证二进制、测试和内嵌扩展。
+- 触发方式：`gh workflow run <workflow> --repo sizhe233/oh-my-pi --ref <分支> -f source_sha=<该分支头的完整 SHA>`。`source_sha` 必须等于运行时检出的提交。
+- 每次构建都从干净 checkout 编译 native addon、扩展和 CLI，检查生成的扩展资源没有漂移，运行浏览器测试、类型检查、worker smoke、外部 cwd 与显式 `--cwd`，并上传 `SHA256SUMS.txt` 和 `build.json`。
+
+## 定期同步上游
+
+频率：每周一次；上游有浏览器相关提交时尽快同步。当前还是手动流程，没有自动化。
+
+1. 准备：`git fetch upstream && git fetch origin`，确认工作树干净且 `main == origin/main`。没有新提交（`git rev-list --count main..upstream/main` 为 0）就结束。
+2. 建分支：`git switch -c sync/upstream-$(date +%Y%m%d) main`，然后 `git merge --no-ff upstream/main`。使用 merge，不使用 rebase，以保留公开历史，也不需要强推。
+3. 解决冲突时优先保留 fork 行为：
+   - `packages/coding-agent/src/tools/browser/**`、`packages/browser-relay/extension/**`：逐条对照上文“必须保持的行为”。上游若改了同一逻辑，把 fork 语义重新实现在上游的新结构上，不要整块回退上游代码。
+   - `relay/extension-assets/*` 是生成物：不要手工合并，冲突时执行 `bun run --cwd packages/browser-relay build` 重新生成。
+   - `.github/workflows/`：上游新增或恢复的 `*.yml` 一律改名为 `*.yml.upstream-disabled`，除非明确决定采用。上游对已停用 workflow 的修改接受其内容即可，文件名保持停用。
+   - `bun.lock`、`package.json`：以上游为准，然后执行 `bun install`。
+4. 本地验证（全部通过才能推送）：
+   ```sh
+   bun install --frozen-lockfile
+   bun run --cwd packages/browser-relay build
+   git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+   bun --cwd=packages/coding-agent run check:types
+   bun --cwd=packages/browser-relay run check:types
+   cd packages/coding-agent && bun test test/tools/browser-relay-bridge.test.ts test/tools/browser-relay-daemon.test.ts \
+     test/tools/browser-relay-server.test.ts test/tools/browser-relay-probe.test.ts test/tools/browser-relay-kind.test.ts \
+     test/tools/browser-attach.test.ts test/tools/browser-op-tracking.test.ts test/tools/browser-screenshot-plus.test.ts \
+     test/tools/browser-tab-worker-startup.test.ts test/tools/browser-launch-cwd.test.ts
+   ```
+5. 推送并开 PR：`git push origin sync/upstream-YYYYMMDD`，然后 `gh pr create --repo sizhe233/oh-my-pi --base main`。PR 描述写明上游区间、冲突文件及解决方式、测试结果。
+6. 在同步分支上跑构建：`gh workflow run fork-build-manual.yml --repo sizhe233/oh-my-pi --ref sync/upstream-YYYYMMDD -f source_sha=<分支头完整 SHA>`。需要 Windows 产物时，同样再跑 `fork-build-windows-manual.yml`。
+7. 按下文“本机安装”装上该分支的产物，做真实 Chrome 验收（上文行为 1–5 各验一次）。验收通过后由用户合并 PR，然后执行 `git push gitea main`。
+8. 冲突无法在保持 fork 行为的前提下解决，或任何检查失败：停止，不合并，在 PR 中报告。
+
+如果上游合入了等价修复（例如 PR #12101），优先采用上游实现，删掉对应的 fork 补丁，并更新上文改动清单。
+
+## 本机安装与回退（macOS arm64）
+
+`~/.bun/bin/omp` 只安装本 fork 的构建产物。**不要运行 `omp update`**：它会下载上游发布并覆盖本 fork 构建（2026-09-29 已发生过两次，备份文件形如 `omp.<时间戳>.<pid>.0.bak`）。
+启动时的新版本提示（`startup.checkUpdate`）只是提示，可用 `omp config set startup.checkUpdate false` 关闭。
+
+1. 确认没有正在使用浏览器的 omp 会话。
+2. 下载并校验产物：
+   ```sh
+   sha=<完整 SHA>; run=<run id>; dir=~/.omp/fork-builds/$sha
+   gh run download "$run" -R sizhe233/oh-my-pi -n "omp-fork-darwin-arm64-$sha" -D "$dir"
+   cd "$dir" && while read -r sum name; do printf '%s  %s\n' "$sum" "$(find . -type f -name "$name")"; done \
+     < coding-agent/binaries/SHA256SUMS.txt | shasum -a 256 -c
+   ```
+3. 替换：先 `cp -p ~/.bun/bin/omp ~/.bun/bin/omp.fork-prev`，再 `install -m 755 "$dir/coding-agent/binaries/omp-darwin-arm64" ~/.bun/bin/omp.new && mv -f ~/.bun/bin/omp.new ~/.bun/bin/omp`。
+4. 冒烟：在其他项目目录运行 `omp --version && omp --smoke-test`，确认工作目录仍是调用者目录，显式 `--cwd` 也仍然生效。
+5. 扩展：运行 `omp browser-relay install`，然后在 `chrome://extensions` 中点“OMP Browser Relay”卡片上的**重新加载**。这一步必须人工完成，磁盘哈希不能证明 Chrome 已加载新代码。
+6. daemon：停止旧的 relay 进程（`pkill -f 'browser-relay serve'`）。下一次 `browser.open()` 会用新二进制自动拉起；9224 端口上已有任何 relay 都会被直接复用，不检查版本。
+7. 验收：两个会话分别执行无参数 `browser.open()` 和截图，核对行为 1–5。
+
+回退：`mv -f ~/.bun/bin/omp.fork-prev ~/.bun/bin/omp`，然后重复第 5、6 步，让扩展与 daemon 跟随旧版本。
+
+Actions 产物只保留 14 天；需要长期保留的版本，保存在 `~/.omp/fork-builds/<sha>`。
+
+## Fork 变更记录
+
+fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.md`，以免每次同步都产生冲突。
+
+### 2026-09-29
+
+- Relay 未给 `app.target` 时，改为在后台新建 omp 自有标签，不再接管当前可见标签；自有标签在释放时关闭，截图不切换前台。（F1、F2）
+- 新建标签的临时 claim 交接给 worker；其他会话驱动同一标签时返回可读错误。（F2）
+- 按会话分组被驱动的标签；扩展断开时解散所有 `omp`、`omp/*` 分组。（F2）
+- 新增手动触发的 macOS arm64、Windows x64 构建 workflow，停用继承的上游 workflow。（F3）

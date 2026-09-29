@@ -21,8 +21,6 @@ Driven tabs join cyan `omp/<session ID>` groups within each Chrome window (the t
 
 - `bun run build` — bundles the extension into `dist/extension/`, zips it for GH releases, and regenerates the embedded CLI install assets under `packages/coding-agent/src/tools/browser/relay/extension-assets/` (**commit those**).
 - `bun scripts/smoke.ts [relay-url] [target-substring]` — end-to-end smoke replicating omp's supervisor + tab-worker double-connection pattern against a live relay.
-- This GitHub fork parks inherited workflows as `.yml.upstream-disabled` files. Only `.github/workflows/fork-build-manual.yml` (macOS arm64) and `fork-build-windows-manual.yml` (Windows x64) are active, and both require `workflow_dispatch` on `main` with `source_sha` set to its full commit SHA. They build from that checkout, run browser/type/cwd/worker checks, and upload checksums plus build provenance; neither publishes a release or updates a local installation.
-- Windows uses the supported x86-64 baseline target (`win32-x64`), not 32-bit x86: its native addon and CLI are cross-built on Linux, then the binary, tests, and embedded extension are checked on hosted Windows x64.
 
 ## Limitations
 
