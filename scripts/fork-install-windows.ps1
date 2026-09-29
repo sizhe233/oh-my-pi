@@ -44,13 +44,12 @@ function Resolve-TargetExe {
 # omp processes (other than the relay itself) connected to the relay port are live browser sessions.
 function Assert-BrowserIdle {
     $relayPids = @(Get-RelayProcesses | ForEach-Object { $_.ProcessId })
-    $clients = @()
-    try {
-        $clients = @(Get-NetTCPConnection -RemotePort $RelayPort -State Established -ErrorAction Stop | ForEach-Object { $_.OwningProcess } | Sort-Object -Unique)
-    } catch {
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
         Write-Warning 'Get-NetTCPConnection is unavailable; cannot check for active browser sessions.'
         return
     }
+    # "No matching connection" is reported as an error; it just means nothing is connected.
+    $clients = @(Get-NetTCPConnection -RemotePort $RelayPort -State Established -ErrorAction SilentlyContinue | ForEach-Object { $_.OwningProcess } | Sort-Object -Unique)
     $busy = @()
     foreach ($clientPid in $clients) {
         if ($relayPids -contains $clientPid) { continue }
@@ -218,14 +217,16 @@ Stop-Relay
 $staged = "$target.new"
 Copy-Item -LiteralPath $exe -Destination $staged -Force
 # Renaming a running .exe is allowed on Windows; deleting it is not.
+$previous = 'none'
 if (Test-Path -LiteralPath $target) {
     Move-Aside $backup
     Move-Item -LiteralPath $target -Destination $backup -Force
+    $previous = $backup
 }
 Move-Item -LiteralPath $staged -Destination $target -Force
 Hide-Shims $targetDir
 Add-UserPath $targetDir
-Write-Host "Installed $($script:Sha) to $target (previous: $backup)"
+Write-Host "Installed $($script:Sha) to $target (previous: $previous)"
 Invoke-Smoke $target
 Install-Extension $target
 Write-Host 'Restart running omp sessions to pick up the new version.'

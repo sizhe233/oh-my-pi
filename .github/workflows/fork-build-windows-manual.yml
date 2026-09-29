@@ -260,6 +260,14 @@ jobs:
           if (-not (Test-Path -LiteralPath (Join-Path $installDir 'omp.cmd'))) { throw 'rollback did not restore the launcher' }
           $version = & (Join-Path $installDir 'omp.exe') --version
           if ($LASTEXITCODE -ne 0) { throw 'rolled-back binary does not run' }
+          # A non-browser client holding the relay port must block installation.
+          $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 9224)
+          $listener.Start()
+          $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 9224)
+          $blocked = $false
+          try { & $script -ArtifactDir $root -InstallDir $installDir } catch { $blocked = $_.Exception.Message -match 'using the browser relay' }
+          $client.Dispose(); $listener.Stop()
+          if (-not $blocked) { throw 'installer did not refuse while a session held the relay port' }
           Write-Host "installer ok: $version"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
