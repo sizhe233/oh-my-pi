@@ -118,3 +118,4 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 按会话分组被驱动的标签；扩展断开时解散所有 `omp`、`omp/*` 分组。（F2）
 - 新增手动触发的 macOS arm64、Windows x64 构建 workflow，停用继承的上游 workflow。（F3）
 - Chrome 窗口最小化时，`browser.open()` 可以新建标签，自有标签也能截图：扩展建标签时显式指定普通窗口，截图前等动画帧最多 250ms。（F4）
+- 手动构建里的浏览器测试显式传 `bun test --timeout=120000`：`OMP_TEST_TIMEOUT` 只对 `scripts/ci-test-ts.ts` 生效，直接 `bun test` 时 `beforeAll` 启动 Chromium 会被 5 秒默认超时误判失败。（F3）

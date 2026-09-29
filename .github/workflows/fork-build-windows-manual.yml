@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bun test \
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
             test/tools/browser-relay-bridge.test.ts \
             test/tools/browser-relay-daemon.test.ts \
             test/tools/browser-relay-server.test.ts \
@@ -165,7 +165,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          bun --cwd=packages/coding-agent test `
+          bun --cwd=packages/coding-agent test --timeout=120000 `
             test/tools/browser-relay-bridge.test.ts `
             test/tools/browser-relay-server.test.ts `
             test/tools/browser-relay-kind.test.ts `

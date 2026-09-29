@@ -65,7 +65,7 @@ jobs:
         working-directory: packages/coding-agent
         run: |
           set -euo pipefail
-          bun test \
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
             test/tools/browser-relay-bridge.test.ts \
             test/tools/browser-relay-daemon.test.ts \
             test/tools/browser-relay-server.test.ts \
