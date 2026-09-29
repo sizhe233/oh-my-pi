@@ -3,6 +3,8 @@
 本仓库是 [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) 的长期 fork。日常使用的 `omp` 由本 fork 的 GitHub Actions 构建，不使用上游发布。
 agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请求，与根目录 `AGENTS.md` 并存），本文件记录事实与操作流程。
 
+常见请求对应的章节：“同步上游 / 上游有更新” → 定期同步上游；“更新本机 omp / 装新版” → 本机安装与回退；“改浏览器行为” → Fork 改动清单 + 必须保持的行为；任何安装之后 → 真实 Chrome 验收。
+
 ## 仓库与分支
 
 | remote | 地址 | 用途 |
@@ -13,6 +15,14 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 
 - 首次分叉点：上游 `2e07c170b5`（18.4.1）。查看当前 fork 差异：`git log --oneline upstream/main..main`、`git diff upstream/main...main`。
 - `origin/main` 已开启分支保护：必须通过 PR 合并（不要求审批人数，便于单人维护），管理员同样受约束，禁止强推和删除。合并后的 PR 分支要删除。
+- 新克隆需要补的本地配置（不在仓库里）：
+  ```sh
+  git remote add upstream https://github.com/can1357/oh-my-pi.git
+  git config remote.upstream.fetch '+refs/heads/main:refs/remotes/upstream/main'
+  git remote add gitea http://192.168.71.56:23000/yuyi233/oh-my-pi
+  git config remote.origin.proxy http://127.0.0.1:7890; git config remote.upstream.proxy http://127.0.0.1:7890
+  ```
+  本机访问 GitHub（git、`gh`、artifact 下载）都走 clash 代理 `127.0.0.1:7890`；`gh` 需要 `export HTTPS_PROXY=http://127.0.0.1:7890`。
 
 ## Fork 改动清单
 
@@ -52,6 +62,8 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
   - `fork-build-windows-manual.yml`：Windows x64 baseline（`win32-x64`，不是 32 位 x86）。native addon 和 CLI 在 Linux 上交叉编译，再到托管的 Windows x64 runner 上验证二进制、测试和内嵌扩展。
 - 触发方式：`gh workflow run <workflow> --repo sizhe233/oh-my-pi --ref <分支> -f source_sha=<该分支头的完整 SHA>`。`source_sha` 必须等于运行时检出的提交。
 - 每次构建都从干净 checkout 编译 native addon、扩展和 CLI，检查生成的扩展资源没有漂移，运行浏览器测试、类型检查、worker smoke、外部 cwd 与显式 `--cwd`，并上传 `SHA256SUMS.txt` 和 `build.json`。
+- macOS 构建约 30 分钟，其中 native addon 编译约 29–31 分钟，属正常耗时。用 `gh run watch <run id> --repo sizhe233/oh-my-pi --exit-status` 等待；失败时先用 `gh run view <run id> --log-failed` 看原因，不要盲目重跑。
+- workflow 里直接调用 `bun test`，必须显式传 `--timeout`；`OMP_TEST_TIMEOUT` 只被 `scripts/ci-test-ts.ts` 读取。
 
 ## 定期同步上游
 
@@ -78,7 +90,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
    ```
 5. 推送并开 PR：`git push origin sync/upstream-YYYYMMDD`，然后 `gh pr create --repo sizhe233/oh-my-pi --base main`。PR 描述写明上游区间、冲突文件及解决方式、测试结果。
 6. 在同步分支上跑构建：`gh workflow run fork-build-manual.yml --repo sizhe233/oh-my-pi --ref sync/upstream-YYYYMMDD -f source_sha=<分支头完整 SHA>`。需要 Windows 产物时，同样再跑 `fork-build-windows-manual.yml`。
-7. 按下文“本机安装”装上该分支的产物，做真实 Chrome 验收（上文行为 1–5 各验一次）。验收通过后由用户合并 PR，然后执行 `git push gitea main`。
+7. 按下文“本机安装与回退”装上该分支的产物，再按“真实 Chrome 验收”逐条核对行为 1–7。验收通过后由用户合并 PR，然后执行 `git push gitea main`。
 8. 冲突无法在保持 fork 行为的前提下解决，或任何检查失败：停止，不合并，在 PR 中报告。
 
 如果上游合入了等价修复（例如 PR #12101），优先采用上游实现，删掉对应的 fork 补丁，并更新上文改动清单。
@@ -88,7 +100,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 `~/.bun/bin/omp` 只安装本 fork 的构建产物。**不要运行 `omp update`**：它会下载上游发布并覆盖本 fork 构建（2026-09-29 已发生过两次，备份文件形如 `omp.<时间戳>.<pid>.0.bak`）。
 启动时的新版本提示（`startup.checkUpdate`）只是提示，可用 `omp config set startup.checkUpdate false` 关闭。
 
-1. 确认没有正在使用浏览器的 omp 会话。
+1. 确认没有 omp 会话在使用浏览器：`lsof -nP -iTCP:9224 -sTCP:ESTABLISHED` 里除了 relay 进程自己，只剩 Chrome（`Google`）的扩展连接。
 2. 下载并校验产物：
    ```sh
    sha=<完整 SHA>; run=<run id>; dir=~/.omp/fork-builds/$sha
@@ -100,12 +112,25 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 3. 替换：先 `cp -p ~/.bun/bin/omp ~/.bun/bin/omp.fork-prev`，再 `install -m 755 "$dir/coding-agent/binaries/omp-darwin-arm64" ~/.bun/bin/omp.new && mv -f ~/.bun/bin/omp.new ~/.bun/bin/omp`。
 4. 冒烟：在其他项目目录运行 `omp --version && omp --smoke-test`，确认工作目录仍是调用者目录，显式 `--cwd` 也仍然生效。
 5. 扩展：运行 `omp browser-relay install`，然后在 `chrome://extensions` 中点“OMP Browser Relay”卡片上的**重新加载**。这一步必须人工完成，磁盘哈希不能证明 Chrome 已加载新代码。
-6. daemon：停止旧的 relay 进程（`pkill -f 'browser-relay serve'`）。下一次 `browser.open()` 会用新二进制自动拉起；9224 端口上已有任何 relay 都会被直接复用，不检查版本。
-7. 验收：两个会话分别执行无参数 `browser.open()` 和截图，核对行为 1–5。
+6. daemon：停止旧的 relay 进程（`pkill -f 'browser-relay.*--port'`；编译版进程名是 `omp browser-relay --port 9224`，源码版是 `browser-relay serve --port 9224`）。下一次 `browser.open()` 会用新二进制自动拉起；9224 端口上已有任何 relay 都会被直接复用，不检查版本，所以必须先停掉旧的。
+7. 按“真实 Chrome 验收”核对行为 1–7。
+
+已经在运行的 omp 会话仍在执行旧代码，需要用户重启会话才会用上新版；安装完成后要提醒用户。
 
 回退：`mv -f ~/.bun/bin/omp.fork-prev ~/.bun/bin/omp`，然后重复第 5、6 步，让扩展与 daemon 跟随旧版本。
 
 Actions 产物只保留 14 天；需要长期保留的版本，保存在 `~/.omp/fork-builds/<sha>`。
+
+## 真实 Chrome 验收
+
+单测和 CI 通过不等于验收通过。验收要用日常 `omp` 驱动用户真实 Chrome，并与“仅单测/协议测试通过”分开汇报。
+
+- 驱动方式：在临时目录启动 `omp --mode rpc --no-ui --auto-approve --no-session`，通过 stdin 发送 JSONL 命令 `{"id":…,"type":"prompt","message":…}`，让它只调用一次 `eval(language: js)` 执行指定代码（如 `const tab = await browser.open(); await tab.goto(url); await tab.screenshot()`）。同时起两个进程就是两个会话。
+- 前台未被切走：`osascript -e 'tell application "System Events" to get name of (first process whose frontmost is true)'` 在操作前后保持不变。用户 Chrome 进程由 `--user-data-dir=…/Library/Application Support/Google/Chrome` 识别；按 PID 查询窗口标题 `name of every window` 和 `value of attribute "AXMinimized"`。
+- 分组与调试提示条：读取 Chrome 辅助功能树（Swift `AXUIElement` 遍历窗口），查找 `AXTabGroup` 名称是否含 `omp/<会话 ID>`，以及文本“已开始调试此浏览器”。提示条在最后一个会话退出后几秒内消失。
+- 截图结果：打开返回的截图文件，确认是目标页面的真实画面。
+- 最小化场景（行为 7）：先设置 `AXMinimized` 为 true，再执行开标签和截图；结束后把窗口状态恢复到验收前的样子。
+- 借用标签只做只读操作（`app.target` 指向用户已打开的页面，不导航、不点击、不关闭）；验收时新建的标签必须在结束前全部关闭。
 
 ## Fork 变更记录
 
