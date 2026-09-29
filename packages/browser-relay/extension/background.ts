@@ -160,6 +160,21 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 	};
 }
 
+/**
+ * Window for a new background tab. Without an explicit `windowId`,
+ * `chrome.tabs.create` rejects with "No current window" whenever every Chrome
+ * window is minimized; prefer the focused window, then a visible one, then any
+ * normal window (a minimized window still accepts tabs without restoring it).
+ */
+async function tabWindowId(): Promise<number | undefined> {
+	const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+	const chosen =
+		windows.find(window => window.focused) ??
+		windows.find(window => window.state !== "minimized") ??
+		windows[0];
+	return chosen?.id;
+}
+
 async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<unknown> {
 	switch (msg.op) {
 		case "attach":
@@ -181,7 +196,7 @@ async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<un
 				msg.params,
 			);
 		case "createTab": {
-			const tab = await chrome.tabs.create({ url: msg.url, active: false });
+			const tab = await chrome.tabs.create({ url: msg.url, active: false, windowId: await tabWindowId() });
 			const snap = snapshot(tab);
 			if (!snap) throw new Error("created tab has no id");
 			return { tab: snap };

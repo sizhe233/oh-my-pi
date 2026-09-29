@@ -123,6 +123,11 @@ async function buildHello() {
     attachedTabIds
   };
 }
+async function tabWindowId() {
+  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  const chosen = windows.find((window) => window.focused) ?? windows.find((window) => window.state !== "minimized") ?? windows[0];
+  return chosen?.id;
+}
 async function runRpc(msg) {
   switch (msg.op) {
     case "attach":
@@ -140,7 +145,7 @@ async function runRpc(msg) {
     case "send":
       return await chrome.debugger.sendCommand(msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId }, msg.method, msg.params);
     case "createTab": {
-      const tab = await chrome.tabs.create({ url: msg.url, active: false });
+      const tab = await chrome.tabs.create({ url: msg.url, active: false, windowId: await tabWindowId() });
       const snap = snapshot(tab);
       if (!snap)
         throw new Error("created tab has no id");

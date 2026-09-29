@@ -23,6 +23,13 @@ interface ChromeTab {
 	groupId: number;
 }
 
+interface ChromeWindow {
+	id?: number;
+	focused: boolean;
+	/** "minimized" windows are still valid tab destinations. */
+	state?: "normal" | "minimized" | "maximized" | "fullscreen" | "locked-fullscreen";
+}
+
 interface ChromeTabChangeInfo {
 	url?: string;
 	title?: string;
@@ -48,7 +55,7 @@ declare const chrome: {
 	tabs: {
 		query(queryInfo: { url?: string; groupId?: number }): Promise<ChromeTab[]>;
 		get(tabId: number): Promise<ChromeTab>;
-		create(createProperties: { url?: string; active?: boolean }): Promise<ChromeTab>;
+		create(createProperties: { url?: string; active?: boolean; windowId?: number }): Promise<ChromeTab>;
 		remove(tabId: number): Promise<void>;
 		update(tabId: number, updateProperties: { active?: boolean }): Promise<ChromeTab>;
 		group(options: { tabIds: number[]; groupId?: number }): Promise<number>;
@@ -63,6 +70,7 @@ declare const chrome: {
 	};
 	windows: {
 		update(windowId: number, updateInfo: { focused?: boolean }): Promise<unknown>;
+		getAll(queryOptions: { windowTypes?: Array<"normal" | "popup" | "panel" | "app" | "devtools"> }): Promise<ChromeWindow[]>;
 	};
 	debugger: {
 		attach(target: ChromeDebuggerSession, requiredVersion: string): Promise<void>;
