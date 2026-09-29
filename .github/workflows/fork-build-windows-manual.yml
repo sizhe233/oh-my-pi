@@ -237,6 +237,38 @@ jobs:
           $provenance | Add-Member -NotePropertyName smokeHost -NotePropertyValue 'windows-2025-x64' -Force
           $provenance.result = 'passed'
           $provenance | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 -LiteralPath $manifestPath
+      - name: Exercise fork installer, reinstall and rollback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'windows-build'
+          $scratch = Join-Path $env:RUNNER_TEMP 'omp-installer-smoke'
+          $installDir = Join-Path $scratch 'bin'
+          $env:HOME = Join-Path $scratch 'home'
+          $env:USERPROFILE = $env:HOME
+          $env:LOCALAPPDATA = Join-Path $scratch 'local'
+          New-Item -ItemType Directory -Force -Path $installDir, $env:HOME, $env:LOCALAPPDATA | Out-Null
+          # A pre-existing npm script launcher must be retired so PowerShell resolves omp.exe.
+          Set-Content -LiteralPath (Join-Path $installDir 'omp.cmd') -Value '@echo stale npm shim'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/fork-install-windows.ps1'
+          & $script -ArtifactDir $root -InstallDir $installDir
+          if (Test-Path -LiteralPath (Join-Path $installDir 'omp.cmd')) { throw 'npm launcher was not retired' }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:HOME '.omp/browser-relay/extension/background.js'))) { throw 'extension was not installed' }
+          & $script -ArtifactDir $root -InstallDir $installDir
+          if (-not (Test-Path -LiteralPath (Join-Path $installDir 'omp.exe.fork-prev'))) { throw 'reinstall kept no backup' }
+          & $script -InstallDir $installDir -Rollback
+          if (-not (Test-Path -LiteralPath (Join-Path $installDir 'omp.cmd'))) { throw 'rollback did not restore the launcher' }
+          $version = & (Join-Path $installDir 'omp.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'rolled-back binary does not run' }
+          # A non-browser client holding the relay port must block installation.
+          $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 9224)
+          $listener.Start()
+          $client = [Net.Sockets.TcpClient]::new('127.0.0.1', 9224)
+          $blocked = $false
+          try { & $script -ArtifactDir $root -InstallDir $installDir } catch { $blocked = $_.Exception.Message -match 'using the browser relay' }
+          $client.Dispose(); $listener.Stop()
+          if (-not $blocked) { throw 'installer did not refuse while a session held the relay port' }
+          Write-Host "installer ok: $version"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omp-fork-windows-x64-${{ github.sha }}

@@ -3,7 +3,7 @@
 本仓库是 [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) 的长期 fork。日常使用的 `omp` 由本 fork 的 GitHub Actions 构建，不使用上游发布。
 agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请求，与根目录 `AGENTS.md` 并存），本文件记录事实与操作流程。
 
-常见请求对应的章节：“同步上游 / 上游有更新” → 定期同步上游；“更新本机 omp / 装新版” → 本机安装与回退；“改浏览器行为” → Fork 改动清单 + 必须保持的行为；任何安装之后 → 真实 Chrome 验收。
+常见请求对应的章节：“同步上游 / 上游有更新” → 定期同步上游；“更新本机 omp / 装新版” → 本机安装与回退（macOS arm64 或 Windows x64）；“改浏览器行为” → Fork 改动清单 + 必须保持的行为；任何安装之后 → 真实 Chrome 验收。
 
 ## 仓库与分支
 
@@ -30,7 +30,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 |---|---|---|---|
 | F1 | Relay 自有标签（移植上游未合并的 [PR #12101](https://github.com/can1357/oh-my-pi/pull/12101)，作者 Koichi Kimura） | `eb8634a408` `e85e9bdca0` `d462f9cff9` | `attach.ts`（`resolveAttachTarget`）、`tab-supervisor.ts`（`ownsTarget`、`closeAbandonedOwnedTarget`）、`tab-worker.ts`、`tab-protocol.ts`、`relay/bridge.ts`（非真实 detach 不再 ban） |
 | F2 | 会话隔离：后台建页、claim 互斥、按会话分组、后台截图 | `89e1fb1ec4` | `packages/browser-relay/extension/background.ts`、`relay/bridge.ts`（`#claimTab`、`provisionalClaimConnId`、`#drainGroupQueue`）、`tab-supervisor.ts`（`buildInitPayload`、`groupLabelForTab`）、`tab-worker.ts`（`#claimRelayTarget`、`preparePageForScreenshot`）、`relay/extension-assets/*` |
-| F3 | Fork CI：停用上游 workflow，只保留手动构建 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml` |
+| F3 | Fork CI：停用上游 workflow，只保留手动构建；Windows 安装脚本 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml`、`scripts/fork-install-windows.ps1` |
 | F4 | 最小化窗口：建标签指定窗口、截图等帧有上限 | 见变更记录 | `packages/browser-relay/extension/background.ts`（`tabWindowId`）、`packages/browser-relay/extension/chrome.d.ts`、`screenshot.ts`（`waitForRenderFrame`）、`relay/extension-assets/*` |
 
 上表中 `tab-*.ts`、`attach.ts`、`screenshot.ts`、`relay/*` 均位于 `packages/coding-agent/src/tools/browser/`。
@@ -121,6 +121,23 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 
 Actions 产物只保留 14 天；需要长期保留的版本，保存在 `~/.omp/fork-builds/<sha>`。
 
+## 本机安装与回退（Windows x64）
+
+Windows 用 `scripts/fork-install-windows.ps1`，同样**不要运行 `omp update`**。脚本支持 Windows PowerShell 5.1 和 PowerShell 7，只安装 `fork-build-windows-manual.yml` 产出、`build.json` 为 `passed` 且 SHA-256 全部匹配的构建。
+
+1. 前提：安装并登录 `gh`（`gh auth login`）。需要代理时加 `-Proxy http://127.0.0.1:7890`。没有 `gh` 时，可在 Actions 运行页面下载 `omp-fork-windows-x64-<sha>` 的 ZIP，用 `-ArtifactDir <zip 或解压目录>` 安装。
+2. 关闭所有使用浏览器的 omp 会话。脚本会检查 9224 上的连接，发现有 omp 进程仍连着 relay 就拒绝安装（`-Force` 可跳过）。
+3. 运行（仓库根目录，或把脚本单独下载下来）：
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fork-install-windows.ps1
+   ```
+   默认安装 `main` 上最新一次成功的 Windows 构建；`-RunId <id>` 指定某次构建。
+4. 脚本做的事：下载到 `%LOCALAPPDATA%\omp-fork-builds\<sha>` 并校验；安装位置取当前 `omp` 命令所在目录下的 `omp.exe`（没有安装过时是 `%LOCALAPPDATA%\omp\omp.exe`，`-InstallDir` 可覆盖）；旧的 `omp.exe` 保存为 `omp.exe.fork-prev`；把同目录下 npm/bun 的 `omp`、`omp.cmd`、`omp.ps1`、`omp.bunx` 改名为 `*.fork-retired`（否则 PowerShell 仍会启动旧版）；把目录加入用户 PATH；停止旧的 relay；运行 `--version`、`--smoke-test`；执行 `omp browser-relay install` 写入扩展文件。
+5. 在 Chrome 的 `chrome://extensions` 中重新加载 “OMP Browser Relay”（首次使用则“加载已解压的扩展程序”，目录是 `%USERPROFILE%\.omp\browser-relay\extension`），然后重启 omp 会话。
+6. 按“真实 Chrome 验收”核对行为 1–7（Windows 上前台与窗口状态用肉眼确认即可）。
+
+回退：`scripts\fork-install-windows.ps1 -Rollback`，恢复 `omp.exe.fork-prev` 和被改名的启动器，然后同样重新加载扩展。
+
 ## 真实 Chrome 验收
 
 单测和 CI 通过不等于验收通过。验收要用日常 `omp` 驱动用户真实 Chrome，并与“仅单测/协议测试通过”分开汇报。
@@ -144,3 +161,4 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 新增手动触发的 macOS arm64、Windows x64 构建 workflow，停用继承的上游 workflow。（F3）
 - Chrome 窗口最小化时，`browser.open()` 可以新建标签，自有标签也能截图：扩展建标签时显式指定普通窗口，截图前等动画帧最多 250ms。（F4）
 - 手动构建里的浏览器测试显式传 `bun test --timeout=120000`：`OMP_TEST_TIMEOUT` 只对 `scripts/ci-test-ts.ts` 生效，直接 `bun test` 时 `beforeAll` 启动 Chromium 会被 5 秒默认超时误判失败。（F3）
+- 新增 `scripts/fork-install-windows.ps1`：Windows x64 一键安装、重装与回退 fork 构建，Windows 构建会在托管 runner 上实际跑一遍安装、重装、回退。（F3）
