@@ -27,3 +27,5 @@
 - NEVER 运行 `omp update`，也 NEVER 用任何上游发布覆盖 `~/.bun/bin/omp`。
 - 本机只安装本 fork Actions 产出、且已校验 SHA-256 的二进制，按 `FORK.md`“本机安装与回退”执行；替换 CLI、daemon 或扩展之前先征得用户同意，并保留回退副本。
 - 必须明确区分“真实 Chrome/CLI 实测通过”和“仅单测或协议测试通过”；Chrome 扩展重载需要人工操作，NEVER 仅凭磁盘文件哈希声称扩展已更新。
+- omp 启动时提示“有新版本”、或用户说上游有更新时，指的是上游发布：NEVER 执行 `omp update`，改为按 `FORK.md`“定期同步上游”走同步 PR → 构建 → 安装 → 真实 Chrome 验收。
+- 安装新版本后提醒用户：已在运行的 omp 会话仍是旧代码，需要重启；扩展有改动时需要用户在 `chrome://extensions` 手动重新加载。
