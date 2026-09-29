@@ -2,12 +2,6 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- Relay opens without `app.target` now create an omp-owned Chrome tab in the background instead of adopting the visible tab; owned tabs close on release and can be screenshotted without switching foreground focus.
-- Transferred each newly created tab's provisional supervisor claim to its worker, while rejecting concurrent claims from other sessions on the same target with an actionable error.
-- Grouped driven tabs by owning session (with a tab-name fallback when no session ID exists), migrated provisional groups after worker claims, and dissolved all `omp`/`omp/*` groups when the extension disconnects.
-
 ## [18.3.1] - 2026-09-25
 
 ### Fixed

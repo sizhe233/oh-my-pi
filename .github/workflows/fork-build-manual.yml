@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit SHA at the selected main ref
+        description: Full 40-character commit SHA at the selected ref (main or a sync/upstream-* branch)
         required: true
         type: string
 
