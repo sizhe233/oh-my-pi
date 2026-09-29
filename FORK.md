@@ -12,7 +12,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 | `gitea` | `http://192.168.71.56:23000/yuyi233/oh-my-pi` | 内网备份；`main` 更新后镜像推送 |
 
 - 首次分叉点：上游 `2e07c170b5`（18.4.1）。查看当前 fork 差异：`git log --oneline upstream/main..main`、`git diff upstream/main...main`。
-- `origin/main` 目前**没有**分支保护，只靠约定：不强推，只通过 PR 合并。
+- `origin/main` 已开启分支保护：必须通过 PR 合并（不要求审批人数，便于单人维护），管理员同样受约束，禁止强推和删除。合并后的 PR 分支要删除。
 
 ## Fork 改动清单
 
