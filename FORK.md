@@ -21,8 +21,9 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 | F1 | Relay 自有标签（移植上游未合并的 [PR #12101](https://github.com/can1357/oh-my-pi/pull/12101)，作者 Koichi Kimura） | `eb8634a408` `e85e9bdca0` `d462f9cff9` | `attach.ts`（`resolveAttachTarget`）、`tab-supervisor.ts`（`ownsTarget`、`closeAbandonedOwnedTarget`）、`tab-worker.ts`、`tab-protocol.ts`、`relay/bridge.ts`（非真实 detach 不再 ban） |
 | F2 | 会话隔离：后台建页、claim 互斥、按会话分组、后台截图 | `89e1fb1ec4` | `packages/browser-relay/extension/background.ts`、`relay/bridge.ts`（`#claimTab`、`provisionalClaimConnId`、`#drainGroupQueue`）、`tab-supervisor.ts`（`buildInitPayload`、`groupLabelForTab`）、`tab-worker.ts`（`#claimRelayTarget`、`preparePageForScreenshot`）、`relay/extension-assets/*` |
 | F3 | Fork CI：停用上游 workflow，只保留手动构建 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml` |
+| F4 | 最小化窗口：建标签指定窗口、截图等帧有上限 | 见变更记录 | `packages/browser-relay/extension/background.ts`（`tabWindowId`）、`packages/browser-relay/extension/chrome.d.ts`、`screenshot.ts`（`waitForRenderFrame`）、`relay/extension-assets/*` |
 
-上表中 `tab-*.ts`、`attach.ts`、`relay/*` 均位于 `packages/coding-agent/src/tools/browser/`。
+上表中 `tab-*.ts`、`attach.ts`、`screenshot.ts`、`relay/*` 均位于 `packages/coding-agent/src/tools/browser/`。
 
 ### 必须保持的行为
 
@@ -34,8 +35,9 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 4. 自有标签进入 `omp/<会话 ID>` 分组（没有会话 ID 时用标签名）；断开连接时解散所有 `omp`、`omp/*` 分组。
 5. 关闭会话时关闭自有标签；借用的用户标签保留；没有持有者时 detach，调试提示条消失。
 6. `supervisor → worker` 交接新建标签的临时 claim 时不能误报冲突。
+7. Chrome 所有窗口都最小化时，`browser.open()` 仍能新建自有标签（放进普通窗口，不恢复窗口），截图仍能完成（不因 `requestAnimationFrame` 不触发而超时）。
 
-回归测试位于 `packages/coding-agent/test/tools/`：`browser-relay-bridge.test.ts`（分组、互斥、交接、ban）、`browser-attach.test.ts`（`resolveAttachTarget`）。
+回归测试位于 `packages/coding-agent/test/tools/`：`browser-relay-bridge.test.ts`（分组、互斥、交接、ban）、`browser-attach.test.ts`（`resolveAttachTarget`）、`browser-op-tracking.test.ts`（永不触发动画帧时截图仍完成）。
 
 ### 已知问题
 
@@ -115,3 +117,4 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 新建标签的临时 claim 交接给 worker；其他会话驱动同一标签时返回可读错误。（F2）
 - 按会话分组被驱动的标签；扩展断开时解散所有 `omp`、`omp/*` 分组。（F2）
 - 新增手动触发的 macOS arm64、Windows x64 构建 workflow，停用继承的上游 workflow。（F3）
+- Chrome 窗口最小化时，`browser.open()` 可以新建标签，自有标签也能截图：扩展建标签时显式指定普通窗口，截图前等动画帧最多 250ms。（F4）

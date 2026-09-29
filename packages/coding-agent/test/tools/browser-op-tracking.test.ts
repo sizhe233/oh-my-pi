@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { captureScreenshotBuffer } from "@oh-my-pi/pi-coding-agent/tools/browser/screenshot";
 import {
 	describeInflight,
 	describeScreenshot,
@@ -7,6 +8,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 
 type ScreenshotPage = Parameters<typeof preparePageForScreenshot>[0];
+type CapturePage = Parameters<typeof captureScreenshotBuffer>[0];
 
 describe("browser op tracking — timeout diagnostics", () => {
 	it("labels a screenshot op by its distinguishing argument", () => {
@@ -80,5 +82,39 @@ describe("browser screenshot activation", () => {
 		await expect(preparePageForScreenshot(page as ScreenshotPage, undefined, false)).rejects.toThrow(
 			"The attached browser tab is not visible",
 		);
+	});
+});
+
+describe("browser screenshot capture", () => {
+	it("captures a tab whose animation frames never run (minimized Chrome window)", async () => {
+		let captures = 0;
+		const png = new Uint8Array([137, 80, 78, 71]);
+		const page = {
+			// A minimized window never services requestAnimationFrame.
+			evaluate: () => new Promise<never>(() => {}),
+			screenshot: async () => {
+				captures += 1;
+				return png;
+			},
+		};
+
+		const started = performance.now();
+		const result = await captureScreenshotBuffer(page as unknown as CapturePage, {}, undefined, async () => null);
+
+		expect(result).toBe(png);
+		expect(captures).toBe(1);
+		expect(performance.now() - started).toBeLessThan(2_000);
+	});
+
+	it("still aborts when the caller cancels during the frame wait", async () => {
+		const controller = new AbortController();
+		const page = {
+			evaluate: () => new Promise<never>(() => {}),
+			screenshot: async () => new Uint8Array(),
+		};
+		const capture = captureScreenshotBuffer(page as unknown as CapturePage, {}, controller.signal, async () => null);
+		controller.abort(new Error("cancelled"));
+
+		await expect(capture).rejects.toThrow("cancelled");
 	});
 });

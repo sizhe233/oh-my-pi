@@ -119,8 +119,16 @@ export function screenshotQuality(opts: ScreenshotOptions): number | undefined {
 	return opts.quality;
 }
 
-async function waitForRenderFrame(page: Page, signal: AbortSignal | undefined): Promise<void> {
-	await untilAborted(signal, () =>
+/**
+ * Upper bound on the pre-capture animation-frame wait. A tab whose Chrome
+ * window is minimized never runs `requestAnimationFrame`, yet
+ * `Page.captureScreenshot` still forces a fresh frame; waiting unbounded would
+ * hang the capture until the caller's timeout.
+ */
+const RENDER_FRAME_WAIT_MS = 250;
+
+async function waitForRenderFrame(page: Pick<Page, "evaluate">, signal: AbortSignal | undefined): Promise<void> {
+	const frame = untilAborted(signal, () =>
 		page.evaluate(
 			() =>
 				new Promise<void>(resolve => {
@@ -131,6 +139,10 @@ async function waitForRenderFrame(page: Page, signal: AbortSignal | undefined): 
 				}),
 		),
 	);
+	// The abandoned frame promise may still settle later; never surface that as an unhandled rejection.
+	frame.catch(() => undefined);
+	await Promise.race([frame, Bun.sleep(RENDER_FRAME_WAIT_MS)]);
+	signal?.throwIfAborted();
 }
 
 /**
@@ -139,7 +151,7 @@ async function waitForRenderFrame(page: Page, signal: AbortSignal | undefined): 
  * `.toBase64()`, never `.toString("base64")` (which serializes decimal bytes).
  */
 export async function captureScreenshotBuffer(
-	page: Page,
+	page: Pick<Page, "evaluate" | "screenshot">,
 	opts: ScreenshotOptions,
 	signal: AbortSignal | undefined,
 	resolveSelector: (selector: string) => Promise<ElementHandle | null>,
