@@ -90,6 +90,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 2. 下载并校验产物：
    ```sh
    sha=<完整 SHA>; run=<run id>; dir=~/.omp/fork-builds/$sha
+   export HTTPS_PROXY=http://127.0.0.1:7890  # 本机直连 GitHub 下载 artifact 极慢，走 clash 代理
    gh run download "$run" -R sizhe233/oh-my-pi -n "omp-fork-darwin-arm64-$sha" -D "$dir"
    cd "$dir" && while read -r sum name; do printf '%s  %s\n' "$sum" "$(find . -type f -name "$name")"; done \
      < coding-agent/binaries/SHA256SUMS.txt | shasum -a 256 -c
