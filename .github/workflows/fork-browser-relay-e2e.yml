@@ -9,15 +9,27 @@ on:
       paths:
          - .github/workflows/fork-browser-relay-e2e.yml
          - scripts/fork-browser-relay-e2e.ts
+         - scripts/fork-browser-minimized-e2e.ts
+         - packages/coding-agent/src/tools/browser/screenshot.ts
 
 permissions:
    contents: read
 
 jobs:
    real-extension:
-      name: Real extension and relay on Windows (headless)
+      name: Real extension and relay on Windows (${{ matrix.mode }})
       runs-on: windows-2025
       timeout-minutes: 20
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - mode: headless
+                 script: scripts/fork-browser-relay-e2e.ts
+                 headless: "true"
+               - mode: minimized
+                 script: scripts/fork-browser-minimized-e2e.ts
+                 headless: "false"
       steps:
          - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
            with:
@@ -54,14 +66,14 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'Chrome for Testing installation failed' }
          - name: Exercise real extension and emit explicit coverage
            env:
-              OMP_E2E_HEADLESS: "true"
+              OMP_E2E_HEADLESS: ${{ matrix.headless }}
               OMP_E2E_SOURCE_SHA: ${{ github.sha }}
-           run: bun scripts/fork-browser-relay-e2e.ts
+           run: bun ${{ matrix.script }}
          - name: Preserve screenshots, logs and coverage even on failure
            if: always()
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
-              name: omp-windows-real-extension-${{ github.sha }}
+              name: omp-windows-real-extension-${{ matrix.mode }}-${{ github.sha }}
               path: ${{ runner.temp }}/omp-e2e-report
               if-no-files-found: warn
               retention-days: 14

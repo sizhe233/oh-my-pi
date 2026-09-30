@@ -4,6 +4,12 @@ name: Fork Windows x64 build (manual)
 # Build the baseline addon on Linux (the Bazel MSVC cross toolchain does not run
 # on Windows), then smoke the resulting executable on hosted Windows x64.
 on:
+  # Narrow automatic rebuild for the authorized minimized-screenshot repair.
+  push:
+    branches: [sync/upstream-20260930]
+    paths:
+      - packages/coding-agent/src/tools/browser/screenshot.ts
+      - packages/coding-agent/src/tools/browser/screenshot-capture.ts
   workflow_dispatch:
     inputs:
       source_sha:
@@ -29,7 +35,7 @@ jobs:
       - name: Verify the trusted x64 source commit
         shell: bash
         env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
