@@ -98,7 +98,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
    ```
 5. 推送并开 PR：`git push origin sync/upstream-YYYYMMDD`，然后 `gh pr create --repo sizhe233/oh-my-pi --base main`。PR 描述写明上游区间、冲突文件及解决方式、测试结果。
 6. 在同步分支上跑构建：`gh workflow run fork-build-manual.yml --repo sizhe233/oh-my-pi --ref sync/upstream-YYYYMMDD -f source_sha=<分支头完整 SHA>`。需要 Windows 产物时，同样再跑 `fork-build-windows-manual.yml`。
-7. 按下文“本机安装与回退”装上该分支的产物，再按“真实 Chrome 验收”逐条核对行为 1–10。验收通过后由用户合并 PR，然后执行 `git push gitea main`。
+7. 按下文“本机安装与回退”装上该分支的产物，再按“真实 Chrome 验收”逐条核对行为 1–11。验收通过后由用户合并 PR，然后执行 `git push gitea main`。
 8. 冲突无法在保持 fork 行为的前提下解决，或任何检查失败：停止，不合并，在 PR 中报告。
 
 如果上游合入了等价修复（例如 PR #12101），优先采用上游实现，删掉对应的 fork 补丁，并更新上文改动清单。
@@ -121,7 +121,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 4. 冒烟：在其他项目目录运行 `omp --version && omp --smoke-test`，确认工作目录仍是调用者目录，显式 `--cwd` 也仍然生效。
 5. 扩展：运行 `omp browser-relay install`，然后在 `chrome://extensions` 中点“OMP Browser Relay”卡片上的**重新加载**。这一步必须人工完成，磁盘哈希不能证明 Chrome 已加载新代码。
 6. daemon：停止旧的 relay 进程（`pkill -f 'browser-relay.*--port'`；编译版进程名是 `omp browser-relay --port 9224`，源码版是 `browser-relay serve --port 9224`）。下一次 `browser.open()` 会用新二进制自动拉起；9224 端口上已有任何 relay 都会被直接复用，不检查版本，所以必须先停掉旧的。
-7. 按“真实 Chrome 验收”核对行为 1–10。
+7. 按“真实 Chrome 验收”核对行为 1–11。
 
 已经在运行的 omp 会话仍在执行旧代码，需要用户重启会话才会用上新版；安装完成后要提醒用户。
 
@@ -142,7 +142,7 @@ Windows 用 `scripts/fork-install-windows.ps1`，同样**不要运行 `omp updat
    默认安装 `main` 上最新一次成功的 Windows 构建；`-RunId <id>` 指定某次构建。
 4. 脚本做的事：下载到 `%LOCALAPPDATA%\omp-fork-builds\<sha>` 并校验；安装位置取当前 `omp` 命令所在目录下的 `omp.exe`（没有安装过时是 `%LOCALAPPDATA%\omp\omp.exe`，`-InstallDir` 可覆盖）；旧的 `omp.exe` 保存为 `omp.exe.fork-prev`；把同目录下 npm/bun 的 `omp`、`omp.cmd`、`omp.ps1`、`omp.bunx` 改名为 `*.fork-retired`（否则 PowerShell 仍会启动旧版）；把目录加入用户 PATH；停止旧的 relay；运行 `--version`、`--smoke-test`；执行 `omp browser-relay install` 写入扩展文件。
 5. 在 Chrome 的 `chrome://extensions` 中重新加载 “OMP Browser Relay”（首次使用则“加载已解压的扩展程序”，目录是 `%USERPROFILE%\.omp\browser-relay\extension`），然后重启 omp 会话。
-6. 按“真实 Chrome 验收”核对行为 1–10（Windows 上前台与窗口状态用肉眼确认即可）。
+6. 按“真实 Chrome 验收”核对行为 1–11（Windows 上前台与窗口状态用肉眼确认即可）。
 
 回退：`scripts\fork-install-windows.ps1 -Rollback`，恢复 `omp.exe.fork-prev` 和被改名的启动器，然后同样重新加载扩展。
 
