@@ -30,7 +30,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 |---|---|---|---|
 | F1 | Relay 自有标签（移植上游未合并的 [PR #12101](https://github.com/can1357/oh-my-pi/pull/12101)，作者 Koichi Kimura） | `eb8634a408` `e85e9bdca0` `d462f9cff9` | `attach.ts`（`resolveAttachTarget`）、`tab-supervisor.ts`（`ownsTarget`、`closeAbandonedOwnedTarget`）、`tab-worker.ts`、`tab-protocol.ts`、`relay/bridge.ts`（非真实 detach 不再 ban） |
 | F2 | 会话隔离：后台建页、claim 互斥、按会话分组、后台截图 | `89e1fb1ec4` | `packages/browser-relay/extension/background.ts`、`relay/bridge.ts`（`#claimTab`、`provisionalClaimConnId`、`#drainGroupQueue`）、`tab-supervisor.ts`（`buildInitPayload`、`groupLabelForTab`）、`tab-worker.ts`（`#claimRelayTarget`、`preparePageForScreenshot`）、`relay/extension-assets/*` |
-| F3 | Fork CI：停用上游 workflow，只保留手动构建；Windows 安装脚本 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml`、`scripts/fork-install-windows.ps1` |
+| F3 | Fork CI：停用上游 workflow，手动构建及独立 Windows 真实扩展集成验证；Windows 安装脚本 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml`、`fork-browser-relay-e2e.yml`、`scripts/fork-browser-relay-e2e.ts`、`scripts/fork-install-windows.ps1` |
 | F4 | 最小化窗口：建标签指定窗口、截图等帧有上限 | 见变更记录 | `packages/browser-relay/extension/background.ts`（`tabWindowId`）、`packages/browser-relay/extension/chrome.d.ts`、`screenshot.ts`（`waitForRenderFrame`）、`relay/extension-assets/*` |
 | F5 | 会话崩溃残留回收、`app.target` 同名复用报错、扩展重连降噪 | 见变更记录 | `relay/owned-targets.ts`（`relayTargetScope`、`closeRelayTarget`、`closeRelayOwnedTarget`）、`relay/bridge.ts`（`ompCreated`、`OMP.closeOwnedTarget`）、`relay/protocol.ts`（hello `ownedTabIds`）、`orphan-registry.ts`（`runtimeDir`、可注入关闭函数）、`registry.ts`（relay 连接时回收）、`tab-supervisor.ts`（`attachTarget`、`sharedScopeOf`、`closeTargetById`）、`packages/browser-relay/extension/background.ts`（`ompCreatedTabIds`、`relayListening`、单一重连定时器）、`relay/extension-assets/*` |
 | F6 | 多个浏览器实例连 relay 时，新建标签只发给有标签（有窗口）的实例 | 见变更记录 | `relay/bridge.ts`（`#instanceForNewTab`） |
@@ -55,6 +55,8 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 
 回归测试位于 `packages/coding-agent/test/tools/`：`browser-relay-bridge.test.ts`（分组、互斥、交接、ban、`OMP.closeOwnedTarget` 只关自建且无人驱动的标签、新建标签不发给无窗口实例）、`browser-attach.test.ts`（`resolveAttachTarget`、同名标签不同 `app.target` 报错）、`browser-op-tracking.test.ts`（永不触发动画帧时截图仍完成）。
 
+`scripts/fork-browser-relay-e2e.ts` 使用隔离的 Chrome for Testing 配置、实际扩展及实际 relay 检查可自动化的浏览器行为，逐项输出上述 1–11 的覆盖结果。它不调用模型，不使用用户浏览器资料；协议层通过不代表完整 CLI 会话通过，headless 结果也不能替代操作系统前台焦点、最小化窗口和提示条的桌面验收。未覆盖的部分必须保留为 partial/blocked，不得算作通过。
+
 ### 已知问题
 
 - 超时回收（`recycleTimedOutWorkerTab`）如果旧 worker 是 inline 回退模式，旧连接的 claim 不会释放，新 worker 可能被互斥拒绝。尚未修复。
@@ -65,9 +67,10 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 
 ## CI 构建
 
-- 继承的上游 workflow 已改名为 `.yml.upstream-disabled`，不会运行。只有下面两个手动 workflow 生效，均不发布 release，也不改动本机安装：
+- 继承的上游 workflow 已改名为 `.yml.upstream-disabled`，不会运行。以下 fork workflow 均不发布 release，也不改动本机安装：
   - `fork-build-manual.yml`：GitHub 托管的 `macos-15` arm64 runner，产物名 `omp-fork-darwin-arm64-<sha>`。
   - `fork-build-windows-manual.yml`：Windows x64 baseline（`win32-x64`，不是 32 位 x86）。native addon 和 CLI 在 Linux 上交叉编译，再到托管的 Windows x64 runner 上验证二进制、测试和内嵌扩展。
+  - `fork-browser-relay-e2e.yml`：独立 `windows-2025` 真实扩展集成验证，不依赖原生二进制重编译。Bun 固定为 1.4.2，Chrome for Testing 版本取冻结依赖中的 Puppeteer revision；重建扩展并校验与 CLI 内嵌资源一致。可手动运行；此外仅在 `sync/upstream-20260930` 分支且修改该 workflow 或测试脚本时自动运行。产物 `omp-windows-real-extension-<sha>` 保存覆盖 JSON、截图及日志。此任务成功只说明被执行的断言成功，未覆盖的完整 CLI/桌面验收仍待完成。
 - 触发方式：`gh workflow run <workflow> --repo sizhe233/oh-my-pi --ref <分支> -f source_sha=<该分支头的完整 SHA>`。`source_sha` 必须等于运行时检出的提交。
 - 每次构建都从干净 checkout 编译 native addon、扩展和 CLI，检查生成的扩展资源没有漂移，运行浏览器测试、类型检查、worker smoke、外部 cwd 与显式 `--cwd`，并上传 `SHA256SUMS.txt` 和 `build.json`。
 - macOS 构建约 30 分钟，其中 native addon 编译约 29–31 分钟，属正常耗时。用 `gh run watch <run id> --repo sizhe233/oh-my-pi --exit-status` 等待；失败时先用 `gh run view <run id> --log-failed` 看原因，不要盲目重跑。
@@ -174,6 +177,7 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 
 ### 2026-09-30
 
+- 新增独立 Windows 真实扩展集成 workflow 和脚本，使用临时配置及实际 Chrome for Testing/扩展/relay，保存 1–11 的显式覆盖证据；不将 headless 或协议层验证冒充完整真实 Chrome/CLI 桌面验收。（F3）
 - 同名标签已打开时，`app.target` 不同的 `browser.open` 改为报错，不再静默复用别的标签。（F5）
 - 会话被强杀后遗留的自有标签，由下一个连接 relay 的 omp 进程回收：自建标签写入全局 relay 运行目录下的 PID 归属记录，扩展在 hello 里报告本次浏览器会话建过的标签，relay 只关闭其中无人驱动的。（F5）
 - 修复 relay 上关闭标签的兜底路径：relay 没有 browser target，`browser.target()` 直接抛错，导致 open 被放弃时的 `closeAbandonedOwnedTarget` 与强制回收时的 `closeOrphanTarget` 从未生效；改为直接向 relay 根会话发 `Target.closeTarget`。（F1、F5）

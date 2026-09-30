@@ -1,0 +1,67 @@
+name: Fork Windows real-extension integration
+
+# This push trigger is deliberately limited to the authorized sync PR and the
+# new harness. It does not turn on upstream CI or rebuild release binaries.
+on:
+   workflow_dispatch:
+   push:
+      branches: [sync/upstream-20260930]
+      paths:
+         - .github/workflows/fork-browser-relay-e2e.yml
+         - scripts/fork-browser-relay-e2e.ts
+
+permissions:
+   contents: read
+
+jobs:
+   real-extension:
+      name: Real extension and relay on Windows (headless)
+      runs-on: windows-2025
+      timeout-minutes: 20
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              persist-credentials: false
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: 1.4.2
+         - name: Install frozen dependencies without lifecycle scripts
+           run: bun install --frozen-lockfile --ignore-scripts
+         - name: Rebuild and verify the actual embedded extension
+           shell: pwsh
+           run: |
+              $ErrorActionPreference = 'Stop'
+              $extension = Join-Path $env:RUNNER_TEMP 'omp-e2e-extension'
+              New-Item -ItemType Directory -Force $extension | Out-Null
+              Push-Location packages/browser-relay
+              bun build extension/background.ts --target browser --outfile "$extension/background.js"
+              Pop-Location
+              if ($LASTEXITCODE -ne 0) { throw 'Extension build failed' }
+              foreach ($name in @('manifest.json', 'options.html', 'options.js')) {
+                Copy-Item "packages/browser-relay/extension/$name" "$extension/$name"
+              }
+              foreach ($name in @('background.js', 'manifest.json', 'options.html', 'options.js')) {
+                $built = (Get-FileHash "$extension/$name" -Algorithm SHA256).Hash
+                $embedded = (Get-FileHash "packages/coding-agent/src/tools/browser/relay/extension-assets/$name.txt" -Algorithm SHA256).Hash
+                if ($built -cne $embedded) { throw "Embedded extension mismatch: $name" }
+              }
+              "OMP_E2E_EXTENSION_DIR=$extension" >> $env:GITHUB_ENV
+              "OMP_E2E_REPORT_DIR=$env:RUNNER_TEMP/omp-e2e-report" >> $env:GITHUB_ENV
+         - name: Install Puppeteer's pinned Chrome for Testing
+           shell: pwsh
+           run: |
+              bun -e 'import { Browser, install } from "@puppeteer/browsers"; import { PUPPETEER_REVISIONS } from "puppeteer-core"; import { appendFile } from "node:fs/promises"; const result = await install({ browser: Browser.CHROME, buildId: PUPPETEER_REVISIONS.chrome, cacheDir: process.env.RUNNER_TEMP + "/omp-e2e-browser" }); await appendFile(process.env.GITHUB_ENV, "OMP_E2E_BROWSER_PATH=" + result.executablePath + "\n");'
+              if ($LASTEXITCODE -ne 0) { throw 'Chrome for Testing installation failed' }
+         - name: Exercise real extension and emit explicit coverage
+           env:
+              OMP_E2E_HEADLESS: "true"
+              OMP_E2E_SOURCE_SHA: ${{ github.sha }}
+           run: bun scripts/fork-browser-relay-e2e.ts
+         - name: Preserve screenshots, logs and coverage even on failure
+           if: always()
+           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+           with:
+              name: omp-windows-real-extension-${{ github.sha }}
+              path: ${{ runner.temp }}/omp-e2e-report
+              if-no-files-found: warn
+              retention-days: 14
