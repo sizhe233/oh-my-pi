@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import puppeteer, { type Browser, type ConnectionTransport, type WebWorker } from "puppeteer-core";
+import puppeteer, { type Browser, type CDPSession, type ConnectionTransport, type WebWorker } from "puppeteer-core";
 import { startRelayServer, type RelayServer } from "../packages/coding-agent/src/tools/browser/relay/server";
 
 const reportDir = path.resolve(process.env.OMP_E2E_REPORT_DIR ?? "artifacts/browser-minimized-e2e");
@@ -11,6 +11,8 @@ const extensionDir = path.resolve(process.env.OMP_E2E_EXTENSION_DIR ?? "packages
 const diagnostics: Array<Record<string, unknown>> = [];
 const results: Array<Record<string, unknown>> = [];
 const timeoutMs = 5_000;
+// Diagnostic A/B only: never a production launch flag or a proposed product fix.
+const enableNewSurfaceDiagnostic = process.env.OMP_E2E_ENABLE_NEW_SURFACE === "true";
 let observer: Browser | undefined;
 let relay: RelayServer | undefined;
 let profile: string | undefined;
@@ -198,6 +200,9 @@ const modes = [
 	"raw-beyond",
 	"raw-explicit-clip",
 	"raw-device-metrics",
+	"raw-screencast",
+	"raw-lifecycle-active",
+	"raw-direct-browser",
 	"puppeteer-viewport",
 	"puppeteer-fullpage",
 ] as const;
@@ -222,6 +227,9 @@ try {
 			puppeteer.launch({
 				executablePath: process.env.OMP_E2E_BROWSER_PATH,
 				headless: false,
+				// Isolated diagnostic A/B only; this is not a fix for an existing user's browser.
+				args:
+					process.env.OMP_E2E_ENABLE_NEW_SURFACE === "true" ? ["--enable-features=CDPScreenshotNewSurface"] : [],
 				userDataDir: profile,
 				enableExtensions: [extensionDir],
 				pipe: true,
@@ -256,6 +264,11 @@ try {
 		let browser: Browser | undefined;
 		let transport: TraceTransport | undefined;
 		let targetId: string | undefined;
+		let captureSession: CDPSession | undefined;
+		let directRoot: CDPSession | undefined;
+		let directSession: CDPSession | undefined;
+		let screencastStarted = false;
+		let screencastFrames = 0;
 		try {
 			await checkMinimized(`${mode}:before-create`);
 			creator = new RawClient(await TraceTransport.open(`${mode}:creator`));
@@ -276,6 +289,7 @@ try {
 			const page = await step(`${mode}:target.page`, () => target.page());
 			assert(page);
 			const session = await step(`${mode}:create-session`, () => page.createCDPSession());
+			captureSession = session;
 			const raw = session as unknown as { send<T>(method: string, params?: Record<string, unknown>): Promise<T> };
 			await step(`${mode}:claim-owned`, () => raw.send("OMP.claimTarget", { ownsTarget: true, label: mode }));
 			await step(`${mode}:emulate-focused-page`, () => page.emulateFocusedPage(true));
@@ -287,6 +301,45 @@ try {
 				assert(!ready.exceptionDetails, JSON.stringify(ready.exceptionDetails));
 				return ready.result.value === true;
 			});
+			if (mode === "raw-direct-browser") {
+				directRoot = await step(`${mode}:create-direct-root`, () => observer!.target().createCDPSession());
+				const directTargets = await step(`${mode}:direct-Target.getTargets`, () =>
+					directRoot!.send("Target.getTargets", {}, { timeout: timeoutMs }),
+				);
+				const directTarget = directTargets.targetInfos.find(info => info.type === "page" && info.url === url);
+				assert(directTarget, "Cannot identify isolated fixture's real Chrome target");
+				const attached = await step(`${mode}:direct-Target.attachToTarget`, () =>
+					directRoot!.send(
+						"Target.attachToTarget",
+						{ targetId: directTarget.targetId, flatten: true },
+						{ timeout: timeoutMs },
+					),
+				);
+				directSession = directRoot.connection()?.session(attached.sessionId) ?? undefined;
+				assert(directSession, "Direct CDP session was not registered");
+				log({ mode, directTargetId: directTarget.targetId, relayTargetId: targetId });
+			}
+			if (mode === "raw-screencast") {
+				session.on("Page.screencastFrame", event => {
+					screencastFrames++;
+					log({ mode, event: "Page.screencastFrame", frame: screencastFrames, metadata: event.metadata });
+					void session
+						.send("Page.screencastFrameAck", { sessionId: event.sessionId })
+						.catch(error => log({ mode, acknowledgementError: String(error) }));
+				});
+				// Mark before send so cleanup also stops a start that timed out after reaching Chrome.
+				screencastStarted = true;
+				await step(`${mode}:start-screencast-candidate`, () =>
+					session.send("Page.startScreencast", { format: "png", everyNthFrame: 1 }),
+				);
+				await checkMinimized(`${mode}:after-start-screencast`);
+			}
+			if (mode === "raw-lifecycle-active") {
+				await step(`${mode}:lifecycle-active-candidate`, () =>
+					session.send("Page.setWebLifecycleState", { state: "active" }),
+				);
+				await checkMinimized(`${mode}:after-lifecycle-active`);
+			}
 			for (const [index, rgb] of [
 				[201, 31, 51],
 				[19, 71, 213],
@@ -335,14 +388,18 @@ try {
 					);
 				} else {
 					const capture = await step(`${name}:Page.captureScreenshot`, () =>
-						session.send("Page.captureScreenshot", {
-							format: "png",
-							fromSurface: true,
-							captureBeyondViewport: mode !== "raw-default",
-							...(mode === "raw-explicit-clip"
-								? { clip: { x: 0, y: 0, width: metrics.width, height: metrics.height, scale: 1 } }
-								: {}),
-						}),
+						(directSession ?? session).send(
+							"Page.captureScreenshot",
+							{
+								format: "png",
+								fromSurface: true,
+								captureBeyondViewport: mode !== "raw-default",
+								...(mode === "raw-explicit-clip"
+									? { clip: { x: 0, y: 0, width: metrics.width, height: metrics.height, scale: 1 } }
+									: {}),
+							},
+							{ timeout: timeoutMs },
+						),
 					);
 					png = Buffer.from(capture.data, "base64");
 				}
@@ -361,6 +418,23 @@ try {
 			results.push({ mode, status: "fail", error: String(error) });
 			log({ mode, failure: String(error) });
 		} finally {
+			if (screencastStarted && captureSession) {
+				await step(`${mode}:stop-screencast`, () => captureSession!.send("Page.stopScreencast")).catch(error =>
+					log({ cleanup: "stop-screencast", error: String(error) }),
+				);
+				log({ mode, screencastFrames });
+				await checkMinimized(`${mode}:after-stop-screencast`).catch(error =>
+					log({ cleanup: "window-check", error: String(error) }),
+				);
+			}
+			if (directSession)
+				await step(`${mode}:detach-direct-session`, () => directSession!.detach()).catch(error =>
+					log({ cleanup: "detach-direct-session", error: String(error) }),
+				);
+			if (directRoot)
+				await step(`${mode}:detach-direct-root`, () => directRoot!.detach()).catch(error =>
+					log({ cleanup: "detach-direct-root", error: String(error) }),
+				);
 			// A timed-out screenshot can retain Puppeteer's screenshot mutex. Never reuse this browser connection or target.
 			await browser?.disconnect().catch(error => log({ cleanup: "disconnect", error: String(error) }));
 			transport?.close();
@@ -390,11 +464,13 @@ try {
 		path.join(reportDir, "minimized-report.json"),
 		JSON.stringify(
 			{
+				diagnosticEnableNewSurface: process.env.OMP_E2E_ENABLE_NEW_SURFACE === "true",
 				startedAt,
 				sourceSha: process.env.GITHUB_SHA ?? process.env.OMP_E2E_SOURCE_SHA ?? "unknown",
 				finishedAt: new Date().toISOString(),
 				platform: process.platform,
 				headed: true,
+				diagnosticLaunchArgs: enableNewSurfaceDiagnostic ? ["--enable-features=CDPScreenshotNewSurface"] : [],
 				version,
 				capability:
 					"Isolated headed Chrome for Testing; chrome.windows states measured. OS foreground app, full CLI/model session, and user desktop UI are not measured. No restore/focus call is made after minimizing.",
