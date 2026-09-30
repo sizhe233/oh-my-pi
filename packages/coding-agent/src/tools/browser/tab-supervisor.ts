@@ -19,6 +19,7 @@ import { CmuxTab, runCmuxCode } from "./cmux/cmux-tab";
 import { mapWaitUntil } from "./cmux/rpc";
 import { DEFAULT_VIEWPORT } from "./launch";
 import { closeCdpTarget, forgetSharedTarget, recordSharedTarget, type SharedTargetScope } from "./orphan-registry";
+import { closeRelayTarget, relayTargetScope } from "./relay/owned-targets";
 import {
 	type BrowserHandle,
 	type BrowserKindTag,
@@ -117,6 +118,12 @@ export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle>
 	 * targets are closed on release — an adopted tab belongs to the user.
 	 */
 	ownsTarget: boolean;
+	/**
+	 * `app.target` matcher this tab adopted; undefined when opened without one.
+	 * Reopening the same name with a different matcher is rejected instead of
+	 * silently reusing this tab.
+	 */
+	attachTarget?: string;
 }
 
 export interface CmuxTabSession extends TabSessionBase<CmuxBrowserHandle> {
@@ -335,6 +342,13 @@ async function acquireTabImpl(
 	const existing = tabs.get(name);
 	if (existing) {
 		if (existing.browser === browser && existing.state === "alive") {
+			// `app.target` names the tab to adopt. Reusing a same-name tab that
+			// adopted something else would drive the wrong page without error.
+			if (existing.backend === "worker" && opts.target !== undefined && opts.target !== existing.attachTarget) {
+				throw new ToolError(
+					`Tab ${JSON.stringify(name)} is already open${existing.attachTarget === undefined ? "" : ` on target ${JSON.stringify(existing.attachTarget)}`}; pass a distinct name to adopt target ${JSON.stringify(opts.target)}, or close ${JSON.stringify(name)} first.`,
+				);
+			}
 			const requestedCmuxSurface = "client" in browser ? (opts.cmuxSurface ?? browser.surface) : undefined;
 			if (existing.backend === "cmux" && existing.cmuxAttachedSurface !== requestedCmuxSurface) {
 				holdBrowser(browser);
@@ -523,6 +537,7 @@ async function acquireTabImpl(
 		kindTag: browser.kind.kind,
 		activateForScreenshot: initPayload.mode === "headless" || initPayload.activateForScreenshot !== false,
 		ownsTarget: initPayload.mode === "headless" || initPayload.ownsTarget === true,
+		attachTarget: opts.target,
 		ownerSessionId: opts.ownerSessionId,
 		persist: opts.persist ?? false,
 		lastActivityAt: Date.now(),
@@ -531,9 +546,10 @@ async function acquireTabImpl(
 	worker.onMessage(msg => handleTabMessage(tab, msg));
 	tabs.set(name, tab);
 	// Durably record ownership so another live omp process can reap this page if
-	// this process dies abnormally before its own teardown closes the tab.
+	// this process dies abnormally before its own teardown closes the tab. Only
+	// pages omp created: an adopted relay tab belongs to the user.
 	const scope = sharedScopeOf(browser);
-	if (scope) void recordSharedTarget(scope, info.targetId);
+	if (scope && tab.ownsTarget) void recordSharedTarget(scope, info.targetId);
 	return { tab, created: true };
 }
 
@@ -1536,16 +1552,23 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
  * protocol timeout, retaining the cleanup hold for tens of seconds.
  */
 async function closeTargetById(browser: PuppeteerBrowserHandle, targetId: string): Promise<void> {
+	// The relay has no browser target for a CDP session; it takes root commands on its endpoint.
+	if (browser.kind.kind === "relay") {
+		await closeRelayTarget(browser.browser.wsEndpoint(), targetId);
+		return;
+	}
 	await closeCdpTarget(browser.browser, targetId);
 }
 
 /**
- * Durable-ownership scope for a browser handle, or undefined when the handle is
- * not the project-shared broker-owned Chromium (the only browser whose targets
- * outlive their creating process and thus need cross-process orphan reaping).
+ * Durable-ownership scope for a browser handle, or undefined when its targets
+ * cannot outlive this process unnoticed. The project-shared broker-owned
+ * Chromium and the relay (tabs omp created in the user's Chrome) both keep
+ * pages alive after an abnormal exit, so both need cross-process reaping.
  */
 function sharedScopeOf(browser: BrowserHandle): SharedTargetScope | undefined {
 	if ("client" in browser) return undefined;
+	if (browser.kind.kind === "relay" && browser.cdpUrl) return relayTargetScope(browser.cdpUrl);
 	if (browser.kind.kind !== "headless" || !browser.sharedDaemon) return undefined;
 	return { projectDir: browser.sharedDaemon.projectDir, daemonName: browser.sharedDaemon.name };
 }

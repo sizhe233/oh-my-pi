@@ -11,8 +11,9 @@
  * This module records, on disk under the broker runtime dir, which OS process
  * created each shared-browser page target. Any live omp process can then reap
  * targets whose owning process is gone. It only ever touches OMP-owned
- * shared-browser targets — user-owned connected/relay/spawned browsers have no
- * registry and are never scanned.
+ * targets: shared-browser pages and tabs omp itself created through the
+ * browser relay (`relay/owned-targets.ts`). Borrowed relay tabs and
+ * connected/spawned browsers are never recorded.
  *
  * Ownership is authoritative in the safe direction: a target is reaped only
  * when its owner PID reports `ESRCH` (definitively dead). A live PID is never
@@ -32,6 +33,8 @@ export interface SharedTargetScope {
 	projectDir: string;
 	/** Broker daemon name, e.g. `omp.browser.headless`. */
 	daemonName: string;
+	/** Registry parent dir; defaults to the project's daemon runtime dir. Machine-global daemons (browser relay) pass their own. */
+	runtimeDir?: string;
 }
 
 /** On-disk ownership record: one file per owning omp process. */
@@ -55,7 +58,7 @@ const ownedByDir = new Map<string, Set<string>>();
 const writeChains = new Map<string, Promise<void>>();
 
 function registryDir(scope: SharedTargetScope): string {
-	return path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
+	return path.join(scope.runtimeDir ?? daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
 }
 
 /** Serialize a write against others for the same registry dir. */
@@ -245,7 +248,11 @@ async function updateOwnershipFile(owner: OrphanOwner, targetIds: string[]): Pro
  * failures atomically retain the unresolved ids for the next attach to retry.
  * Failures are logged, never thrown, so cleanup cannot block browser open.
  */
-export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTargetScope): Promise<number> {
+export async function reapOrphanSharedTargets(
+	browser: Browser,
+	scope: SharedTargetScope,
+	closeTarget: (targetId: string) => Promise<boolean> = targetId => closeCdpTarget(browser, targetId),
+): Promise<number> {
 	let scan: OrphanScan;
 	try {
 		scan = await collectOrphanTargets(scope);
@@ -259,7 +266,7 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 	for (const owner of scan.owners) {
 		const retained: string[] = [];
 		for (const targetId of owner.targetIds) {
-			if (await closeCdpTarget(browser, targetId)) {
+			if (await closeTarget(targetId)) {
 				closed++;
 			} else {
 				retained.push(targetId);

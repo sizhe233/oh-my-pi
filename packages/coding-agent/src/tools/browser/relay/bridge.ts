@@ -167,6 +167,13 @@ class TabState {
 	provisionalClaimConnId?: number;
 	/** User pulled the tab out of the omp group — never re-group it. */
 	groupOptOut = false;
+	/**
+	 * The extension created this tab for omp in the current browser session
+	 * (hello `ownedTabIds`, or `Target.createTarget` here). The orphan reaper
+	 * closes only such tabs, so a stale record whose tab id Chrome reused after
+	 * a restart can never close a user tab.
+	 */
+	ompCreated = false;
 	/** Real Chrome session ids (OOPIF/worker children) living under this tab's root session. */
 	readonly realSessions = new Set<string>();
 	/** Live execution contexts from the shared root debugger session. */
@@ -427,8 +434,11 @@ export class RelayBridge {
 			if (tab.instanceId !== instanceId || seen.has(tab.tabId)) continue;
 			this.#onTabRemoved(key);
 		}
+		// Absent on older extensions: keep what this relay learned from its own createTarget calls.
+		const ompCreated = Array.isArray(msg.ownedTabIds) ? new Set(msg.ownedTabIds) : null;
 		for (const tab of this.#tabs.values()) {
 			if (tab.instanceId !== instanceId) continue;
+			if (ompCreated) tab.ompCreated = ompCreated.has(tab.tabId);
 			const wasAttached = tab.attached;
 			tab.attached = attachedNow.has(tab.tabId);
 			tab.attaching = null;
@@ -847,7 +857,10 @@ export class RelayBridge {
 				// Creating a tab is an explicit act of driving it.
 				const createdKey = tabKeyOf(inst.code, result.tab.tabId);
 				const createdTab = this.#claimTab(conn, createdKey);
-				if (createdTab) createdTab.provisionalClaimConnId = conn.id;
+				if (createdTab) {
+					createdTab.provisionalClaimConnId = conn.id;
+					createdTab.ompCreated = true;
+				}
 				this.#reply(conn, msg, { targetId: pageTargetIdFromKey(createdKey) });
 				return;
 			}
@@ -905,6 +918,31 @@ export class RelayBridge {
 			case "Browser.setDownloadBehavior":
 				this.#reply(conn, msg, {});
 				return;
+			case "OMP.closeOwnedTarget": {
+				// Relay-private orphan reaper close. `closed: false` means the record
+				// is stale (tab gone, not omp-created in this browser session, or
+				// driven by a live connection) and must be dropped, never retried.
+				const parsed = typeof msg.params?.targetId === "string" ? parseTargetId(msg.params.targetId) : null;
+				if (!parsed) {
+					this.#reply(conn, msg, { closed: false });
+					return;
+				}
+				const code = parsed.key.slice(0, parsed.key.lastIndexOf(":"));
+				const inst = [...this.#instances.values()].find(candidate => candidate.code === code);
+				if (!inst?.socket) {
+					// Its browser is not connected: the tab may still exist, keep the record.
+					this.#replyError(conn, msg, "relay extension for this target is not connected");
+					return;
+				}
+				const owned = this.#tabs.get(parsed.key);
+				if (!owned?.ompCreated || this.#claimed(parsed.key)) {
+					this.#reply(conn, msg, { closed: false });
+					return;
+				}
+				await this.#rpc({ op: "removeTab", tabId: owned.tabId }, inst);
+				this.#reply(conn, msg, { closed: true });
+				return;
+			}
 			case "Target.createBrowserContext":
 				this.#replyError(conn, msg, "Browser contexts are not supported by the omp browser relay");
 				return;

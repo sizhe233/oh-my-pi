@@ -7,19 +7,53 @@
  *
  * Service-worker lifetime: the open websocket plus a periodic ping keeps the
  * worker alive while connected (Chrome 116+); a chrome.alarms tick revives it
- * and re-dials after Chrome reaps it while disconnected.
+ * and re-dials after Chrome reaps it while disconnected. Each dial probes the
+ * port with a fetch first: a refused WebSocket is logged into the extension's
+ * error list by Chrome's network layer on every attempt, a refused fetch is not.
  */
 import type { ExtToRelayMessage, RelayToExtMessage, TabSnapshot } from "../../coding-agent/src/tools/browser/relay/protocol";
 
 const DEFAULT_PORT = 9224;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
-const RECONNECT_MAX_MS = 10_000;
+/** The 30s keepalive alarm also re-dials; omp's relay wait assumes one dial per alarm period. */
+const RECONNECT_MAX_MS = 30_000;
+const PROBE_TIMEOUT_MS = 2_000;
 
 let ws: WebSocket | null = null;
 let reconnectDelay = RECONNECT_MIN_MS;
+let reconnectTimer: NodeJS.Timeout | null = null;
+let dialing = false;
 let pingTimer: NodeJS.Timeout | null = null;
 const relayInitiatedDetachTabs = new Set<number>();
+
+/**
+ * Tab ids this extension created for omp (`createTab`), reported in hello as
+ * `ownedTabIds`. The relay's orphan reaper closes only these, so a record left
+ * by a crashed omp session can never close a user tab. `chrome.storage.session`
+ * survives service-worker restarts and is cleared with the browser session,
+ * exactly when Chrome starts reusing tab ids.
+ */
+const CREATED_TABS_KEY = "ompCreatedTabIds";
+let createdTabs: Promise<Set<number>> | null = null;
+function loadCreatedTabs(): Promise<Set<number>> {
+	createdTabs ??= chrome.storage.session
+		.get({ [CREATED_TABS_KEY]: [] })
+		.then(stored => {
+			const raw = stored[CREATED_TABS_KEY];
+			return new Set(Array.isArray(raw) ? raw.filter((id): id is number => typeof id === "number") : []);
+		})
+		.catch(() => new Set<number>());
+	return createdTabs;
+}
+
+async function markCreatedTab(tabId: number, created: boolean): Promise<void> {
+	const ids = await loadCreatedTabs();
+	if (created === ids.has(tabId)) return;
+	if (created) ids.add(tabId);
+	else ids.delete(tabId);
+	await chrome.storage.session.set({ [CREATED_TABS_KEY]: [...ids] }).catch(() => {});
+}
 
 /**
  * Stable per-install browser identity, persisted in `chrome.storage.local` and
@@ -139,7 +173,11 @@ async function setBadge(connected: boolean): Promise<void> {
 }
 
 async function buildHello(): Promise<ExtToRelayMessage> {
-	const [tabs, targets] = await Promise.all([chrome.tabs.query({}), chrome.debugger.getTargets()]);
+	const [tabs, targets, created] = await Promise.all([
+		chrome.tabs.query({}),
+		chrome.debugger.getTargets(),
+		loadCreatedTabs(),
+	]);
 	const snapshots: TabSnapshot[] = [];
 	for (const tab of tabs) {
 		const snap = snapshot(tab);
@@ -157,6 +195,7 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 		browserVersion: versionMatch?.[0] ?? "Chrome/unknown",
 		tabs: snapshots,
 		attachedTabIds,
+		ownedTabIds: snapshots.filter(snap => created.has(snap.tabId)).map(snap => snap.tabId),
 	};
 }
 
@@ -199,6 +238,7 @@ async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<un
 			const tab = await chrome.tabs.create({ url: msg.url, active: false, windowId: await tabWindowId() });
 			const snap = snapshot(tab);
 			if (!snap) throw new Error("created tab has no id");
+			await markCreatedTab(snap.tabId, true);
 			return { tab: snap };
 		}
 		case "removeTab":
@@ -233,42 +273,70 @@ function handleRelayMessage(raw: string): void {
 		});
 }
 
+/** Single retry timer: alarm-driven dials must not each start another backoff chain. */
 function scheduleReconnect(): void {
+	if (reconnectTimer !== null) return;
 	const delay = reconnectDelay;
 	reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-	setTimeout(() => void connect(), delay);
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		void connect();
+	}, delay);
+}
+
+/** True when something answers HTTP on the relay port; a refused fetch leaves no extension error entry. */
+async function relayListening(port: number): Promise<boolean> {
+	try {
+		await fetch(`http://127.0.0.1:${port}/json/version`, {
+			mode: "no-cors",
+			cache: "no-store",
+			signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+		});
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 async function connect(): Promise<void> {
-	if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-	const settings = await loadSettings();
-	const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
-	const socket = new WebSocket(url);
-	ws = socket;
-	socket.onopen = () => {
-		reconnectDelay = RECONNECT_MIN_MS;
-		void setBadge(true);
-		void buildHello().then(hello => post(hello));
-		clearInterval(pingTimer ?? undefined);
-		pingTimer = setInterval(() => post({ t: "ping" }), PING_INTERVAL_MS);
-	};
-	socket.onmessage = event => {
-		if (typeof event.data === "string") handleRelayMessage(event.data);
-	};
-	socket.onclose = () => {
-		if (ws !== socket) return;
-		ws = null;
-		if (pingTimer !== null) {
-			clearInterval(pingTimer);
-			pingTimer = null;
+	if (dialing || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
+	dialing = true;
+	try {
+		const settings = await loadSettings();
+		if (!(await relayListening(settings.port))) {
+			scheduleReconnect();
+			return;
 		}
-		void setBadge(false);
-		void enqueueGroupOp(restoreGroups);
-		scheduleReconnect();
-	};
-	socket.onerror = () => {
-		socket.close();
-	};
+		const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
+		const socket = new WebSocket(url);
+		ws = socket;
+		socket.onopen = () => {
+			reconnectDelay = RECONNECT_MIN_MS;
+			void setBadge(true);
+			void buildHello().then(hello => post(hello));
+			clearInterval(pingTimer ?? undefined);
+			pingTimer = setInterval(() => post({ t: "ping" }), PING_INTERVAL_MS);
+		};
+		socket.onmessage = event => {
+			if (typeof event.data === "string") handleRelayMessage(event.data);
+		};
+		socket.onclose = () => {
+			if (ws !== socket) return;
+			ws = null;
+			if (pingTimer !== null) {
+				clearInterval(pingTimer);
+				pingTimer = null;
+			}
+			void setBadge(false);
+			void enqueueGroupOp(restoreGroups);
+			scheduleReconnect();
+		};
+		socket.onerror = () => {
+			socket.close();
+		};
+	} finally {
+		dialing = false;
+	}
 }
 
 // ---- event streaming ---------------------------------------------------------
@@ -295,6 +363,7 @@ chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+	void markCreatedTab(tabId, false);
 	post({ t: "tabRemoved", tabId });
 });
 
@@ -312,7 +381,11 @@ chrome.storage.onChanged.addListener((_changes, areaName) => {
 	void connect();
 });
 
-chrome.action.onClicked.addListener(() => void chrome.runtime.openOptionsPage());
+chrome.action.onClicked.addListener(() => {
+	// A click is also a cheap way to re-dial a relay that just came up.
+	void connect();
+	void chrome.runtime.openOptionsPage();
+});
 chrome.runtime.onInstalled.addListener(() => void connect());
 chrome.runtime.onStartup.addListener(() => void connect());
 
