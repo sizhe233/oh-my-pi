@@ -45,14 +45,21 @@ function result(n: number, status: Status, evidence: string): void {
 	cases.push({ case: n, status, evidence });
 	console.log(`case ${n}: ${status}: ${evidence}`);
 }
-async function until<T>(label: string, check: () => Promise<T | undefined | false>, timeout = 15_000): Promise<T> {
+async function until<T>(
+	label: string,
+	check: () => Promise<T | undefined | false>,
+	timeout = 15_000,
+	diagnostics?: () => unknown,
+): Promise<T> {
 	const deadline = Date.now() + timeout;
 	while (Date.now() < deadline) {
 		const value = await check();
 		if (value !== undefined && value !== false) return value;
 		await Bun.sleep(100);
 	}
-	throw new Error(`Timed out: ${label} (${timeout} ms)`);
+	throw new Error(
+		`Timed out: ${label} (${timeout} ms)${diagnostics ? `; last observation: ${JSON.stringify(diagnostics())}` : ""}`,
+	);
 }
 class CdpClient {
 	#socket: WebSocket;
@@ -132,7 +139,11 @@ async function launch(
 		userDataDir: path.join(profileRoot!, label),
 		enableExtensions: [extensionDir],
 		pipe: true,
-		waitForInitialPage: !windowless,
+		// Puppeteer observes only the extension worker. Its default auto-attachment
+		// to page/tab targets would make debugger.getTargets().attached measure
+		// the test observer as well as the relay, invalidating detach assertions.
+		targetFilter: target => target.type() === "service_worker",
+		waitForInitialPage: false,
 		ignoreDefaultArgs: windowless ? ["about:blank"] : [],
 		args: windowless ? ["--no-startup-window"] : [],
 		dumpio: true,
@@ -145,6 +156,7 @@ async function launch(
 	const worker = await target.worker();
 	assert(worker, "Extension service worker did not start");
 	await worker.evaluate(`chrome.storage.local.set({port: ${port}})`);
+	if (!windowless) await until("normal browser has its startup tab", async () => (await tabs(worker)).length > 0);
 	return { browser, worker };
 }
 async function expectConflict(client: CdpClient, session: string): Promise<void> {
@@ -295,15 +307,26 @@ try {
 	reaper.close();
 	await competitor.send("Target.closeTarget", { targetId: owned.targetId });
 	competitor.close();
-	await until("owned gone and debugger detached", async () => {
-		const remaining = await tabs(first.worker);
-		const attached = (await first.worker.evaluate(
-			"chrome.debugger.getTargets().then(items => items.filter(t => t.tabId !== undefined && t.attached))",
-		)) as unknown[];
-		return (
-			!remaining.some(t => t.id === ownedTabId) && remaining.some(t => t.id === userTab.id) && attached.length === 0
-		);
-	});
+	let detachObservation: Record<string, unknown> = {};
+	await until(
+		"owned gone and debugger detached",
+		async () => {
+			const remaining = await tabs(first.worker);
+			const debuggerTargets = (await first.worker.evaluate(
+				"chrome.debugger.getTargets().then(items => items.filter(t => t.tabId !== undefined))",
+			)) as Array<{ id: string; tabId: number; attached: boolean; url: string; title: string }>;
+			const attached = debuggerTargets.filter(target => target.attached);
+			detachObservation = { ownedTabId, userTabId: userTab.id, remaining, debuggerTargets };
+			return (
+				!remaining.some(t => t.id === ownedTabId) &&
+				remaining.some(t => t.id === userTab.id) &&
+				attached.length === 0
+			);
+		},
+		15_000,
+		() => detachObservation,
+	);
+	logs.push({ time: Date.now(), message: "owned close and debugger detach observed", data: detachObservation });
 	result(
 		5,
 		"partial",
