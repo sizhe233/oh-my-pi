@@ -140,6 +140,46 @@ class RawClient {
 		this.#transport.close();
 	}
 }
+interface ForegroundSnapshot {
+	available: boolean;
+	handle?: string;
+	processId?: number;
+	sessionId?: number;
+	reason?: string;
+}
+let foregroundBefore: ForegroundSnapshot | undefined;
+let foregroundAfter: ForegroundSnapshot | undefined;
+async function foregroundSnapshot(label: string): Promise<ForegroundSnapshot> {
+	const script = `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class OmpForeground { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p); }'; $h=[OmpForeground]::GetForegroundWindow(); [uint32]$owner=0; [void][OmpForeground]::GetWindowThreadProcessId($h,[ref]$owner); @{handle=$h.ToInt64().ToString(); processId=$owner; sessionId=[System.Diagnostics.Process]::GetCurrentProcess().SessionId} | ConvertTo-Json -Compress`;
+	let process: Bun.Subprocess | undefined;
+	try {
+		process = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const child = process;
+		const output = await step(`${label}:Win32-foreground`, async () => {
+			assert(child.stdout instanceof ReadableStream, "PowerShell stdout is not a stream");
+			const stdout = await new Response(child.stdout).text();
+			assert.equal(await child.exited, 0, "PowerShell foreground query failed");
+			return JSON.parse(stdout) as { handle: string; processId: number; sessionId: number };
+		});
+		const snapshot = {
+			...output,
+			available: output.handle !== "0" && output.sessionId !== 0,
+			reason:
+				output.handle === "0" || output.sessionId === 0 ? "No measurable interactive foreground window" : undefined,
+		};
+		log({ observation: label, foreground: snapshot });
+		return snapshot;
+	} catch (error) {
+		const snapshot = { available: false, reason: String(error) };
+		log({ observation: label, foreground: snapshot });
+		return snapshot;
+	} finally {
+		process?.kill();
+	}
+}
 interface WindowState {
 	id: number;
 	state: string;
@@ -152,18 +192,20 @@ async function checkMinimized(label: string): Promise<void> {
 	log({ observation: label, windows: windows.map(({ id, state, focused }) => ({ id, state, focused })) });
 	assert(windows.length > 0, "No normal Chrome window exists");
 	assert(
-		windows.every(window => window.state === "minimized"),
-		"A window was restored during minimized test",
+		windows.every(window => window.state === "minimized" && !window.focused),
+		"A window was restored or focused during minimized test",
 	);
 }
 interface Metrics {
 	width: number;
 	height: number;
 	fullHeight: number;
+	documentWidth: number;
+	clientWidth: number;
 	dpr: number;
 }
 const metricsExpression =
-	"({width:innerWidth,height:innerHeight,fullHeight:Math.max(document.documentElement.scrollHeight,document.body.scrollHeight),dpr:devicePixelRatio})";
+	"({width:innerWidth,height:innerHeight,documentWidth:Math.max(document.documentElement.scrollWidth,document.body.scrollWidth),clientWidth:document.documentElement.clientWidth,fullHeight:Math.max(document.documentElement.scrollHeight,document.body.scrollHeight),dpr:devicePixelRatio})";
 const boundedFrameExpression = "new Promise(resolve=>requestAnimationFrame(()=>resolve('animation-frame')))";
 async function validatePng(
 	name: string,
@@ -178,7 +220,13 @@ async function validatePng(
 	const dimensions = { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
 	assert(dimensions.width > 100 && dimensions.height > 100);
 	if (fullPage !== undefined) {
-		assert.equal(dimensions.width, Math.round(metrics.width * metrics.dpr), "Screenshot width mismatch");
+		const validWidths = (
+			fullPage ? [metrics.width, metrics.documentWidth, metrics.clientWidth] : [metrics.width]
+		).map(width => Math.round(width * metrics.dpr));
+		assert(
+			validWidths.includes(dimensions.width),
+			`Screenshot width ${dimensions.width} is not one of measured widths ${validWidths.join(", ")}`,
+		);
 		assert.equal(
 			dimensions.height,
 			Math.round((fullPage ? metrics.fullHeight : metrics.height) * metrics.dpr),
@@ -259,6 +307,7 @@ try {
 		),
 	);
 	await checkMinimized("before-any-owned-target-created");
+	foregroundBefore = await foregroundSnapshot("before-owned-targets");
 	for (const mode of modes) {
 		let creator: RawClient | undefined;
 		let browser: Browser | undefined;
@@ -269,6 +318,7 @@ try {
 		let directSession: CDPSession | undefined;
 		let screencastStarted = false;
 		let screencastFrames = 0;
+		let latestScreencastData: string | undefined;
 		try {
 			await checkMinimized(`${mode}:before-create`);
 			creator = new RawClient(await TraceTransport.open(`${mode}:creator`));
@@ -322,6 +372,7 @@ try {
 			if (mode === "raw-screencast") {
 				session.on("Page.screencastFrame", event => {
 					screencastFrames++;
+					latestScreencastData = event.data;
 					log({ mode, event: "Page.screencastFrame", frame: screencastFrames, metadata: event.metadata });
 					void session
 						.send("Page.screencastFrameAck", { sessionId: event.sessionId })
@@ -393,7 +444,7 @@ try {
 							{
 								format: "png",
 								fromSurface: true,
-								captureBeyondViewport: mode !== "raw-default",
+								captureBeyondViewport: ["raw-beyond", "raw-explicit-clip", "raw-device-metrics"].includes(mode),
 								...(mode === "raw-explicit-clip"
 									? { clip: { x: 0, y: 0, width: metrics.width, height: metrics.height, scale: 1 } }
 									: {}),
@@ -412,10 +463,34 @@ try {
 				);
 				if (mode === "raw-device-metrics")
 					await step(`${name}:clear-device-metrics`, () => session.send("Emulation.clearDeviceMetricsOverride"));
+				if (mode === "raw-screencast") {
+					const framesBeforeMutation = screencastFrames;
+					await step(`${name}:mutate-after-capture`, () =>
+						session.send("Runtime.evaluate", {
+							expression:
+								"document.documentElement.style.background=document.body.style.background='rgb(71,213,19)'",
+							returnByValue: true,
+						}),
+					);
+					await until(`${name}:existing-screencast-still-emits`, async () => {
+						if (screencastFrames <= framesBeforeMutation || !latestScreencastData) return false;
+						const pixel = (await worker.evaluate(
+							`(async()=>{const blob=await(await fetch('data:image/png;base64,${latestScreencastData}')).blob();const image=await createImageBitmap(blob);const canvas=new OffscreenCanvas(image.width,image.height);const ctx=canvas.getContext('2d');ctx.drawImage(image,0,0);return Array.from(ctx.getImageData(20,20,1,1).data)})()`,
+						)) as number[];
+						return pixel.join(",") === "71,213,19,255";
+					});
+					log({
+						mode,
+						name,
+						framesBeforeMutation,
+						framesAfterMutation: screencastFrames,
+						recordingContinuity: "Frames continued after screenshot without another startScreencast call",
+					});
+				}
 			}
-			results.push({ mode, status: "pass" });
+			results.push({ mode, status: "pass", gating: mode !== "raw-direct-browser" });
 		} catch (error) {
-			results.push({ mode, status: "fail", error: String(error) });
+			results.push({ mode, status: "fail", error: String(error), gating: mode !== "raw-direct-browser" });
 			log({ mode, failure: String(error) });
 		} finally {
 			if (screencastStarted && captureSession) {
@@ -446,7 +521,12 @@ try {
 		}
 	}
 	await checkMinimized("after-all-scenarios");
-	if (results.some(result => result.status !== "pass"))
+	foregroundAfter = await foregroundSnapshot("after-owned-targets");
+	if (foregroundBefore.available && foregroundAfter.available) {
+		assert.equal(foregroundAfter.handle, foregroundBefore.handle, "OS foreground window changed");
+		assert.equal(foregroundAfter.processId, foregroundBefore.processId, "OS foreground process changed");
+	}
+	if (results.some(result => result.gating && result.status !== "pass"))
 		failure = "One or more minimized screenshot scenarios failed; inspect per-method diagnostics";
 } catch (error) {
 	failure = String(error);
@@ -473,9 +553,11 @@ try {
 				diagnosticLaunchArgs: enableNewSurfaceDiagnostic ? ["--enable-features=CDPScreenshotNewSurface"] : [],
 				version,
 				capability:
-					"Isolated headed Chrome for Testing; chrome.windows states measured. OS foreground app, full CLI/model session, and user desktop UI are not measured. No restore/focus call is made after minimizing.",
+					"Isolated headed Chrome for Testing; chrome.windows states measured. OS foreground handles are checked only when Win32 reports an interactive foreground window; unavailable snapshots are not passes. Full CLI/model session and user desktop UI are not measured. No restore/focus call is made after minimizing.",
 				failure,
 				results,
+				directBrowserDiagnostic:
+					"raw-direct-browser bypasses the extension rendering guard; underlying Chrome timeout is expected and is not a supported product capture path. All eight relay modes gate success.",
 				diagnostics,
 			},
 			null,

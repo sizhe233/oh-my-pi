@@ -11,6 +11,8 @@ on:
          - scripts/fork-browser-relay-e2e.ts
          - scripts/fork-browser-minimized-e2e.ts
          - packages/coding-agent/src/tools/browser/screenshot.ts
+         - packages/browser-relay/extension/**
+         - packages/browser-relay/test/screenshot-capture.test.ts
 
 permissions:
    contents: read
@@ -30,10 +32,6 @@ jobs:
                - mode: minimized
                  script: scripts/fork-browser-minimized-e2e.ts
                  headless: "false"
-               - mode: minimized-new-surface-diagnostic
-                 script: scripts/fork-browser-minimized-e2e.ts
-                 headless: "false"
-                 enableNewSurface: "true"
       steps:
          - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
            with:
@@ -43,6 +41,13 @@ jobs:
               bun-version: 1.4.2
          - name: Install frozen dependencies without lifecycle scripts
            run: bun install --frozen-lockfile --ignore-scripts
+         - name: Check render-guard regression contracts and extension types
+           shell: pwsh
+           run: |
+              bun test --timeout=120000 packages/browser-relay/test/screenshot-capture.test.ts
+              if ($LASTEXITCODE -ne 0) { throw 'Screenshot render guard tests failed' }
+              bun --cwd=packages/browser-relay run check:types
+              if ($LASTEXITCODE -ne 0) { throw 'Extension typecheck failed' }
          - name: Rebuild and verify the actual embedded extension
            shell: pwsh
            run: |
@@ -71,7 +76,7 @@ jobs:
          - name: Exercise real extension and emit explicit coverage
            env:
               OMP_E2E_HEADLESS: ${{ matrix.headless }}
-              OMP_E2E_ENABLE_NEW_SURFACE: ${{ matrix.enableNewSurface || 'false' }}
+              OMP_E2E_ENABLE_NEW_SURFACE: "false"
               OMP_E2E_SOURCE_SHA: ${{ github.sha }}
            run: bun ${{ matrix.script }}
          - name: Preserve screenshots, logs and coverage even on failure

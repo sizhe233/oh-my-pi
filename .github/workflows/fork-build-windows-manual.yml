@@ -10,6 +10,7 @@ on:
     paths:
       - packages/coding-agent/src/tools/browser/screenshot.ts
       - packages/coding-agent/src/tools/browser/screenshot-capture.ts
+      - packages/browser-relay/extension/**
   workflow_dispatch:
     inputs:
       source_sha:

@@ -69,6 +69,7 @@ declare const chrome: {
 		update(groupId: number, updateProperties: { title?: string; color?: string; collapsed?: boolean }): Promise<unknown>;
 	};
 	windows: {
+		get(windowId: number): Promise<ChromeWindow>;
 		update(windowId: number, updateInfo: { focused?: boolean }): Promise<unknown>;
 		getAll(queryOptions: { windowTypes?: Array<"normal" | "popup" | "panel" | "app" | "devtools"> }): Promise<ChromeWindow[]>;
 	};
