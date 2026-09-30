@@ -33,6 +33,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 | F3 | Fork CI：停用上游 workflow，只保留手动构建；Windows 安装脚本 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml`、`scripts/fork-install-windows.ps1` |
 | F4 | 最小化窗口：建标签指定窗口、截图等帧有上限 | 见变更记录 | `packages/browser-relay/extension/background.ts`（`tabWindowId`）、`packages/browser-relay/extension/chrome.d.ts`、`screenshot.ts`（`waitForRenderFrame`）、`relay/extension-assets/*` |
 | F5 | 会话崩溃残留回收、`app.target` 同名复用报错、扩展重连降噪 | 见变更记录 | `relay/owned-targets.ts`（`relayTargetScope`、`closeRelayTarget`、`closeRelayOwnedTarget`）、`relay/bridge.ts`（`ompCreated`、`OMP.closeOwnedTarget`）、`relay/protocol.ts`（hello `ownedTabIds`）、`orphan-registry.ts`（`runtimeDir`、可注入关闭函数）、`registry.ts`（relay 连接时回收）、`tab-supervisor.ts`（`attachTarget`、`sharedScopeOf`、`closeTargetById`）、`packages/browser-relay/extension/background.ts`（`ompCreatedTabIds`、`relayListening`、单一重连定时器）、`relay/extension-assets/*` |
+| F6 | 多个浏览器实例连 relay 时，新建标签只发给有标签（有窗口）的实例 | 见变更记录 | `relay/bridge.ts`（`#instanceForNewTab`） |
 
 上表中 `tab-*.ts`、`attach.ts`、`screenshot.ts`、`relay/*` 均位于 `packages/coding-agent/src/tools/browser/`。
 
@@ -50,8 +51,9 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 8. 同名标签已打开时，`browser.open({ app: { target } })` 的 `target` 与该标签打开时的不同（包括原标签没给 `target`），直接报错 `Tab "<name>" is already open…; pass a distinct name…`，不静默复用别的标签；同名同 `target` 再次打开仍复用。
 9. 会话进程被强杀后，它新建的自有标签在其 PID 已死且记录超过 15 秒后，由下一个连接 relay 的 omp 进程（任一会话首次 `browser.open`）关闭；借用的用户标签从不记录、从不关闭；relay 只关闭扩展在本次浏览器会话里建过（`ownedTabIds`）且当前无人驱动的标签，浏览器重启后复用的标签 id 不会被误关。
 10. 没有 relay 监听时，扩展先用 `fetch` 探测端口再拨 WebSocket，`chrome://extensions` 不再累积 `ERR_CONNECTION_REFUSED`；重连间隔上限 30 秒且只有一条定时器链，relay 起来后扩展仍在一个 alarm 周期（约 30 秒）内连上。
+11. 多个装了扩展的浏览器实例同时连着 relay 时，新建标签发给最后握手且有标签的实例；最后握手的实例没有任何标签（如 `--no-startup-window` 启动的后台 Chrome）时，改发给其他有标签的实例，不报 `No current window`。
 
-回归测试位于 `packages/coding-agent/test/tools/`：`browser-relay-bridge.test.ts`（分组、互斥、交接、ban、`OMP.closeOwnedTarget` 只关自建且无人驱动的标签）、`browser-attach.test.ts`（`resolveAttachTarget`、同名标签不同 `app.target` 报错）、`browser-op-tracking.test.ts`（永不触发动画帧时截图仍完成）。
+回归测试位于 `packages/coding-agent/test/tools/`：`browser-relay-bridge.test.ts`（分组、互斥、交接、ban、`OMP.closeOwnedTarget` 只关自建且无人驱动的标签、新建标签不发给无窗口实例）、`browser-attach.test.ts`（`resolveAttachTarget`、同名标签不同 `app.target` 报错）、`browser-op-tracking.test.ts`（永不触发动画帧时截图仍完成）。
 
 ### 已知问题
 
@@ -154,6 +156,7 @@ Windows 用 `scripts/fork-install-windows.ps1`，同样**不要运行 `omp updat
 - 截图结果：打开返回的截图文件，确认是目标页面的真实画面。
 - 最小化场景（行为 7）：先设置 `AXMinimized` 为 true，再执行开标签和截图；结束后把窗口状态恢复到验收前的样子。
 - 借用标签只做只读操作（`app.target` 指向用户已打开的页面，不导航、不点击、不关闭）；验收时新建的标签必须在结束前全部关闭。
+- 验收前用 `lsof -nP -iTCP:9224 -sTCP:ESTABLISHED` 确认只有用户的 Chrome 连着 relay：其他装了扩展的 Chrome 实例（如 `~/.omp/browser-profiles/*` 下残留的后台 Chrome）也会握手，参与新建标签的路由。
 
 ## Fork 变更记录
 
@@ -175,3 +178,4 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 会话被强杀后遗留的自有标签，由下一个连接 relay 的 omp 进程回收：自建标签写入全局 relay 运行目录下的 PID 归属记录，扩展在 hello 里报告本次浏览器会话建过的标签，relay 只关闭其中无人驱动的。（F5）
 - 修复 relay 上关闭标签的兜底路径：relay 没有 browser target，`browser.target()` 直接抛错，导致 open 被放弃时的 `closeAbandonedOwnedTarget` 与强制回收时的 `closeOrphanTarget` 从未生效；改为直接向 relay 根会话发 `Target.closeTarget`。（F1、F5）
 - 扩展没有 relay 时先 `fetch` 探测再拨 WebSocket，不再在扩展错误列表里每 10 秒累积一条 `ERR_CONNECTION_REFUSED`；重连只保留一条定时器链，上限 30 秒；点击工具栏图标时立即重连。（F5）
+- 多个浏览器实例连着 relay 时，新建标签不再发给没有任何标签的实例：`~/.omp/browser-profiles/*` 下一个 `--no-startup-window` 后台 Chrome 也装了扩展，轮到它最后握手时 `browser.open()` 报 `No current window`。（F6）

@@ -1258,6 +1258,20 @@ describe("RelayBridge last-hello fallback and offline instance pruning", () => {
 		expect(bridge.listTargets().map(t => t.title)).toContain("Created");
 	});
 
+	it("creates new tabs in a browser that has windows, not a windowless one that said hello last", () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		const background = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1 })]);
+		// A `--no-startup-window` Chrome with the extension: connected, but no tabs.
+		connectInstance(bridge, background, "background", []);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		expect(chrome.rpcs("createTab")).toHaveLength(1);
+		expect(background.rpcs("createTab")).toHaveLength(0);
+	});
+
 	it("hides tabs of an instance whose socket went offline", () => {
 		const bridge = new RelayBridge({});
 		const chrome = new FakeExtSocket();

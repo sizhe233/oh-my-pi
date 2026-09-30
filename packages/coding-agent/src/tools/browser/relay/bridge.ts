@@ -279,6 +279,23 @@ export class RelayBridge {
 		return undefined;
 	}
 
+	/**
+	 * Browser for `Target.createTarget`: the last hello, unless that browser
+	 * has no tabs (a windowless background Chrome, e.g. `--no-startup-window`,
+	 * rejects `chrome.tabs.create` with "No current window") while another
+	 * connected browser has some. A normal window always holds a tab.
+	 */
+	#instanceForNewTab(): ExtInstance | undefined {
+		const withTabs = new Set<string>();
+		for (const tab of this.#tabs.values()) withTabs.add(tab.instanceId);
+		const last = this.#lastHello();
+		if (!last || withTabs.has(last.instanceId)) return last;
+		for (const inst of this.#instances.values()) {
+			if (inst.socket && withTabs.has(inst.instanceId)) return inst;
+		}
+		return last;
+	}
+
 	/** True after the first hello, and stays true: separates a reaped service worker from an absent extension. */
 	get extensionSeen(): boolean {
 		return this.#extensionSeen;
@@ -847,7 +864,7 @@ export class RelayBridge {
 			case "Target.createTarget": {
 				const url =
 					typeof msg.params?.url === "string" && msg.params.url.length > 0 ? msg.params.url : "about:blank";
-				const inst = this.#lastHello();
+				const inst = this.#instanceForNewTab();
 				if (!inst || !inst.socket) {
 					this.#replyError(conn, msg, "relay extension is not connected");
 					return;
