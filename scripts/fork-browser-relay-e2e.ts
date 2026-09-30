@@ -382,7 +382,11 @@ try {
 	const routed = await recovered.send<{ targetId: string }>("Target.createTarget", {
 		url: "data:text/html,<title>routed-to-second</title>",
 	});
-	assert((await tabs(second.worker)).some(t => t.url.includes("routed-to-second")));
+	// createTab resolves before navigation commits; observe the actual tab's
+	// committed URL rather than treating pending navigation as wrong routing.
+	await until("created tab committed in second browser", async () =>
+		(await tabs(second.worker)).some(t => t.url.includes("routed-to-second")),
+	);
 	assert(!(await tabs(first.worker)).some(t => t.url.includes("routed-to-second")));
 	assert((await tabs(second.worker)).find(t => t.id === secondUser.id)?.active);
 	await recovered.send("Target.closeTarget", { targetId: routed.targetId });
@@ -399,7 +403,7 @@ try {
 		url: "data:text/html,<title>windowless-fallback</title>",
 	});
 	assert.equal((await tabs(empty.worker)).length, 0);
-	assert(
+	await until("fallback tab committed in a populated browser", async () =>
 		[...(await tabs(first.worker)), ...(await tabs(second.worker))].some(t => t.url.includes("windowless-fallback")),
 	);
 	await recovered.send("Target.closeTarget", { targetId: fallback.targetId });
