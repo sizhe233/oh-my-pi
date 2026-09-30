@@ -53,6 +53,13 @@ export type ExtToRelayMessage =
 			 * latest-wins socket replacement.
 			 */
 			instanceId?: string;
+			/**
+			 * Tabs the extension created through `createTab` in the current browser
+			 * session (`chrome.storage.session`, so a browser restart that reuses tab
+			 * ids clears it). The relay's orphan reaper closes only these. Absent on
+			 * older extensions.
+			 */
+			ownedTabIds?: number[];
 	  }
 	| { t: "cdpEvent"; tabId: number; sessionId?: string; method: string; params?: Record<string, unknown> }
 	| { t: "detached"; tabId: number; reason: string; relayInitiated?: boolean }

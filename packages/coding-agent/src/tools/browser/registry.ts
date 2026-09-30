@@ -17,6 +17,7 @@ import {
 } from "./launch";
 import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
+import { closeRelayOwnedTarget, relayTargetScope } from "./relay/owned-targets";
 import type { RelayKind } from "./relay/kind";
 import { waitForRelayExtension } from "./relay/probe";
 import { ensureSharedBrowser } from "./shared-daemon";
@@ -247,6 +248,12 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			defaultViewport: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		// Close tabs omp created for sessions that died without cleanup (crash,
+		// TerminateProcess). Fire-and-forget so a slow reap never delays the open.
+		const wsEndpoint = browser.wsEndpoint();
+		void reapOrphanSharedTargets(browser, relayTargetScope(cdpUrl), targetId =>
+			closeRelayOwnedTarget(wsEndpoint, targetId),
+		);
 		return {
 			key: browserKey(kind),
 			kind,

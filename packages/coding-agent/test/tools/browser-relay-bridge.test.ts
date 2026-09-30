@@ -1274,3 +1274,101 @@ describe("RelayBridge last-hello fallback and offline instance pruning", () => {
 		expect(bridge.listTargets().map(t => t.title)).toEqual(["Chrome tab", "Edge tab"]);
 	});
 });
+
+describe("RelayBridge orphan reaper close (OMP.closeOwnedTarget)", () => {
+	function helloWithOwned(
+		bridge: RelayBridge,
+		socket: FakeExtSocket,
+		tabs: TabSnapshot[],
+		ownedTabIds: number[],
+	): void {
+		bridge.extConnected(socket);
+		bridge.extMessage(
+			socket,
+			JSON.stringify({
+				t: "hello",
+				userAgent: "test",
+				browserVersion: "Chrome/151.0.0.0",
+				tabs,
+				attachedTabIds: [],
+				ownedTabIds,
+			}),
+		);
+	}
+
+	function reap(bridge: RelayBridge, cdp: FakeCdpSocket, connId: number, tabId: number): number {
+		const id = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id, method: "OMP.closeOwnedTarget", params: { targetId: `PAGE${ANON}.${tabId}` } }),
+		);
+		return id;
+	}
+
+	it("closes only omp-created tabs nobody drives; user tabs and live-driven tabs are reported stale", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 }), tab({ tabId: 3 })], [2, 3]);
+		// A live session still drives created tab 3.
+		const live = new FakeCdpSocket();
+		await claimTab(bridge, ext, live, bridge.cdpConnected(live), 3);
+
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		const userTab = reap(bridge, reaper, reaperConn, 1);
+		const drivenTab = reap(bridge, reaper, reaperConn, 3);
+		const orphan = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(ext.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([2]);
+		ack(bridge, ext, "removeTab");
+		await flush();
+
+		const resultOf = (id: number) => reaper.messages.find(message => message.id === id)?.result;
+		expect(resultOf(userTab)).toEqual({ closed: false });
+		expect(resultOf(drivenTab)).toEqual({ closed: false });
+		expect(resultOf(orphan)).toEqual({ closed: true });
+	});
+
+	it("errors (record retained) while the target's browser is disconnected", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 2 })], [2]);
+		bridge.extClosed(ext);
+
+		const reaper = new FakeCdpSocket();
+		const id = reap(bridge, reaper, bridge.cdpConnected(reaper), 2);
+		await flush();
+		const reply = reaper.messages.find(message => message.id === id);
+		expect(reply && "error" in reply).toBe(true);
+		expect(ext.rpcs("removeTab")).toEqual([]);
+	});
+
+	it("keeps createTarget ownership across a legacy hello without ownedTabIds, and drops it on one that omits the tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const creator = new FakeCdpSocket();
+		const creatorConn = bridge.cdpConnected(creator);
+		bridge.cdpMessage(creatorConn, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		bridge.cdpClosed(creatorConn);
+
+		// Service-worker restart on an extension build that does not report ownership.
+		const legacy = new FakeExtSocket();
+		connect(bridge, legacy, [tab({ tabId: 9 })]);
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		reap(bridge, reaper, reaperConn, 9);
+		await flush();
+		expect(legacy.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+
+		// A browser restart reusing tab id 9 reports an empty owned set: never close it.
+		const restarted = new FakeExtSocket();
+		helloWithOwned(bridge, restarted, [tab({ tabId: 9 })], []);
+		const id = reap(bridge, reaper, reaperConn, 9);
+		await flush();
+		expect(restarted.rpcs("removeTab")).toEqual([]);
+		expect(reaper.messages.find(message => message.id === id)?.result).toEqual({ closed: false });
+	});
+});

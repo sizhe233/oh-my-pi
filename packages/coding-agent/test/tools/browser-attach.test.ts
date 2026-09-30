@@ -22,7 +22,7 @@ import {
 	normalizeConnectedCdpUrl,
 	releaseBrowser,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
-import { acquireTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import { acquireTab, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
 import { chromiumAvailable } from "./chromium-probe";
@@ -510,6 +510,47 @@ describe("pickElectronTarget", () => {
 				targetPage.off("request", onRequest);
 				await targetPage.setRequestInterception(false);
 				if (attached && !attempted) await releaseBrowser(attached, { kill: false });
+			}
+		},
+		30_000,
+	);
+
+	test.skipIf(!CHROMIUM_AVAILABLE)(
+		"rejects reusing a same-name tab for a different app.target instead of driving the wrong page",
+		async () => {
+			const launched = sharedHeadless;
+			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
+			const endpoint = new URL(launched.browser.wsEndpoint());
+			const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+			const targetTitle = `adopt-me-${suffix}`;
+			const targetPage = await launched.browser.newPage();
+			await targetPage.goto(`data:text/html,<title>${targetTitle}</title>`);
+			const plain = `reuse-plain-${suffix}`;
+			const adopted = `reuse-adopted-${suffix}`;
+			const opened: string[] = [];
+			try {
+				const attached = await acquireBrowser(
+					{ kind: "connected", cdpUrl: `http://${endpoint.host}` },
+					{ cwd: process.cwd() },
+				);
+				await acquireTab(plain, attached, { timeoutMs: 15_000 });
+				opened.push(plain);
+				await expect(acquireTab(plain, attached, { target: targetTitle, timeoutMs: 15_000 })).rejects.toThrow(
+					/already open; pass a distinct name/,
+				);
+
+				const first = await acquireTab(adopted, attached, { target: targetTitle, timeoutMs: 15_000 });
+				opened.push(adopted);
+				const again = await acquireTab(adopted, attached, { target: targetTitle, timeoutMs: 15_000 });
+				expect(again.created).toBe(false);
+				expect(again.tab).toBe(first.tab);
+				const probe = await targetPage.createCDPSession();
+				const { targetInfo } = await probe.send("Target.getTargetInfo");
+				await probe.detach();
+				expect(first.tab.targetId).toBe(targetInfo.targetId);
+			} finally {
+				for (const name of opened) await releaseTab(name, { kill: false });
+				await targetPage.close();
 			}
 		},
 		30_000,
