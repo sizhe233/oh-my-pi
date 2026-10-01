@@ -1,0 +1,114 @@
+name: Fork stable upstream sync
+
+# Only this workflow's import job can push, and it never runs imported project code.
+# PR creation/review/merge stays with the owner's existing GitHub connection.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional official stable vMAJOR.MINOR.PATCH tag (latest when blank)
+        required: false
+        type: string
+  push:
+    branches: [main, 'chore/automate-upstream-*']
+    paths:
+      - .github/workflows/fork-sync-upstream.yml
+      - scripts/fork-sync-upstream.py
+      - scripts/test_fork_sync_upstream.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-stable-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  validate-importer:
+    name: Verify importer safety contracts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Exercise local Git fixtures without credentials or network
+        run: python3 scripts/test_fork_sync_upstream.py
+
+  import:
+    name: Import stable upstream into a sync branch
+    needs: validate-importer
+    if: github.ref == 'refs/heads/main' && github.repository == 'sizhe233/oh-my-pi'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      candidate_sha: ${{ steps.sync.outputs.candidate_sha }}
+      sync_branch: ${{ steps.sync.outputs.sync_branch }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Import an exact official stable release without executing its code
+        id: sync
+        env:
+          GH_SYNC_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 scripts/fork-sync-upstream.py
+
+  macos:
+    name: Validate imported macOS package
+    needs: import
+    if: needs.import.outputs.changed == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fork-build-manual.yml
+    with:
+      source_sha: ${{ needs.import.outputs.candidate_sha }}
+
+  windows:
+    name: Validate imported Windows package
+    needs: import
+    if: needs.import.outputs.changed == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fork-build-windows-manual.yml
+    with:
+      source_sha: ${{ needs.import.outputs.candidate_sha }}
+
+  real-extension:
+    name: Validate imported Windows extension
+    needs: import
+    if: needs.import.outputs.changed == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fork-browser-relay-e2e.yml
+    with:
+      source_sha: ${{ needs.import.outputs.candidate_sha }}
+
+  validation-summary:
+    name: Report validated sync candidate
+    needs: [import, macos, windows, real-extension]
+    if: needs.import.outputs.changed == 'true'
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: Record exact source identity for the merge reviewer
+        env:
+          CANDIDATE_SHA: ${{ needs.import.outputs.candidate_sha }}
+          UPSTREAM_SHA: ${{ needs.import.outputs.upstream_sha }}
+          RELEASE_TAG: ${{ needs.import.outputs.release_tag }}
+          SYNC_BRANCH: ${{ needs.import.outputs.sync_branch }}
+        run: |
+          printf 'All read-only validation jobs passed.\n\nCandidate: `%s`\n\nUpstream: `%s`\n\nRelease: `%s`\n\nBranch: `%s`\n' \
+            "$CANDIDATE_SHA" "$UPSTREAM_SHA" "$RELEASE_TAG" "$SYNC_BRANCH" >> "$GITHUB_STEP_SUMMARY"
+          echo 'The owner connection may now create and merge the PR after verifying this exact candidate and unchanged main base.' >> "$GITHUB_STEP_SUMMARY"
