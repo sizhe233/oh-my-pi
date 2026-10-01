@@ -4,13 +4,10 @@ name: Fork Windows x64 build (manual)
 # Build the baseline addon on Linux (the Bazel MSVC cross toolchain does not run
 # on Windows), then smoke the resulting executable on hosted Windows x64.
 on:
-  # Narrow automatic rebuild for the authorized minimized-screenshot repair.
+  # Bounded validation of this official sync, then same-commit builds after PR #9 merges.
   push:
-    branches: [sync/upstream-20260930]
-    paths:
-      - packages/coding-agent/src/tools/browser/screenshot.ts
-      - packages/coding-agent/src/tools/browser/screenshot-capture.ts
-      - packages/browser-relay/extension/**
+    branches: [main, sync/upstream-20260930]
+    paths: [.github/workflows/fork-build-windows-manual.yml]
   workflow_dispatch:
     inputs:
       source_sha:
@@ -23,6 +20,12 @@ permissions:
 
 jobs:
   cross-build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.ref == 'refs/heads/main' &&
+      startsWith(github.event.head_commit.message, 'Merge PR #9: chore: sync official upstream through 6e4ac4a1a7 (@sizhe233)')) ||
+      (github.ref == 'refs/heads/sync/upstream-20260930' &&
+      startsWith(github.event.head_commit.message, 'test(fork): validate official sync 6e4ac4a1a7'))
     name: Build Windows x64 baseline addon and CLI from source
     runs-on: ubuntu-22.04
     timeout-minutes: 180
@@ -74,22 +77,15 @@ jobs:
           set -euo pipefail
           bun --cwd=packages/coding-agent run check:types
           bun --cwd=packages/browser-relay run check:types
-      - name: Run browser relay contracts on Linux
+      - name: Run complete browser regression suite and image/clipboard contracts on Linux
         working-directory: packages/coding-agent
         shell: bash
         run: |
           set -euo pipefail
           bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
-            test/tools/browser-relay-bridge.test.ts \
-            test/tools/browser-relay-daemon.test.ts \
-            test/tools/browser-relay-server.test.ts \
-            test/tools/browser-relay-probe.test.ts \
-            test/tools/browser-relay-kind.test.ts \
-            test/tools/browser-attach.test.ts \
-            test/tools/browser-op-tracking.test.ts \
-            test/tools/browser-screenshot-plus.test.ts \
-            test/tools/browser-tab-worker-startup.test.ts \
-            test/tools/browser-launch-cwd.test.ts
+            test/tools/browser-*.test.ts \
+            test/utils/image-resize.test.ts \
+            test/utils/clipboard.test.ts
       - name: Cross-compile Windows x64 release CLI with baseline addon
         run: bun scripts/ci-release-build-binaries.ts --targets win32-x64
       - name: Record same-commit cross-build checksums
@@ -174,6 +170,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           bun --cwd=packages/coding-agent test --timeout=120000 `
             test/tools/browser-relay-bridge.test.ts `
+            test/tools/browser-orphan-registry.test.ts `
+            test/tools/browser-tern-kind.test.ts `
+            test/utils/image-resize.test.ts `
+            test/utils/clipboard.test.ts `
             test/tools/browser-relay-server.test.ts `
             test/tools/browser-relay-kind.test.ts `
             test/tools/browser-op-tracking.test.ts `

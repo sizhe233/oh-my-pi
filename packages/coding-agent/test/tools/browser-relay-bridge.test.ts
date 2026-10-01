@@ -1,11 +1,22 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import {
+	reapOrphanSharedTargets,
+	type SharedTargetScope,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
+import { closeRelayOwnedTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
 import type {
 	RelayRpcRequest,
 	RelayToExtMessage,
 	TabSnapshot,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
+import { startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import type { Browser } from "puppeteer-core";
 
 /** Same derivation as the bridge: target ids embed this per-instance code. */
 function instanceCode(instanceId: string): string {
@@ -1357,7 +1368,7 @@ describe("RelayBridge orphan reaper close (OMP.closeOwnedTarget)", () => {
 		expect(ext.rpcs("removeTab")).toEqual([]);
 	});
 
-	it("keeps createTarget ownership across a legacy hello without ownedTabIds, and drops it on one that omits the tab", async () => {
+	it("keeps createTarget ownership across a legacy hello without ownedTabIds", async () => {
 		const bridge = new RelayBridge({});
 		const ext = new FakeExtSocket();
 		connect(bridge, ext, []);
@@ -1373,16 +1384,113 @@ describe("RelayBridge orphan reaper close (OMP.closeOwnedTarget)", () => {
 		connect(bridge, legacy, [tab({ tabId: 9 })]);
 		const reaper = new FakeCdpSocket();
 		const reaperConn = bridge.cdpConnected(reaper);
-		reap(bridge, reaper, reaperConn, 9);
-		await flush();
-		expect(legacy.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
-
-		// A browser restart reusing tab id 9 reports an empty owned set: never close it.
-		const restarted = new FakeExtSocket();
-		helloWithOwned(bridge, restarted, [tab({ tabId: 9 })], []);
 		const id = reap(bridge, reaper, reaperConn, 9);
 		await flush();
-		expect(restarted.rpcs("removeTab")).toEqual([]);
-		expect(reaper.messages.find(message => message.id === id)?.result).toEqual({ closed: false });
+		expect(legacy.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+		ack(bridge, legacy, "removeTab");
+		await flush();
+		expect(reaper.messages.find(message => message.id === id)?.result).toEqual({ closed: true });
+	});
+
+	describe("durable orphan reaper integration", () => {
+		interface ReaperFixture {
+			bridge: RelayBridge;
+			ownershipFile: string;
+			targetId: string;
+			reap(): Promise<number>;
+		}
+
+		async function withOrphanRecord(run: (fixture: ReaperFixture) => Promise<void>): Promise<void> {
+			const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-orphan-"));
+			const relay = startRelayServer({ port: await findFreeCdpPort(), group: false });
+			try {
+				// Reap a real exited process so the production PID probe runs, with no global mocks.
+				const owner = Bun.spawn([process.execPath, "-e", "process.exit(0)"], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				expect(await owner.exited).toBe(0);
+				const scope: SharedTargetScope = {
+					projectDir: runtimeDir,
+					runtimeDir,
+					daemonName: "omp.browser.relay-test",
+				};
+				const targetId = `PAGE${ANON}.9`;
+				const ownershipFile = path.join(runtimeDir, `${scope.daemonName}.targets`, `${owner.pid}.json`);
+				// Far outside the production 15-second grace window; no sleeps or clock mutation.
+				await Bun.write(ownershipFile, JSON.stringify({ pid: owner.pid, updatedAt: 0, targets: [targetId] }));
+				const browser = {
+					target: () => {
+						throw new Error("Relay cleanup must not use the nonexistent browser target");
+					},
+				} as unknown as Browser;
+				await run({
+					bridge: relay.bridge,
+					ownershipFile,
+					targetId,
+					reap: () =>
+						reapOrphanSharedTargets(browser, scope, id =>
+							closeRelayOwnedTarget(`ws://127.0.0.1:${relay.port}/cdp`, id),
+						),
+				});
+			} finally {
+				relay.stop();
+				await fs.rm(runtimeDir, { recursive: true, force: true });
+			}
+		}
+
+		/** Fake extension that really removes the advertised target if the bridge asks it to. */
+		class RemovingExtSocket extends FakeExtSocket {
+			constructor(readonly bridge: RelayBridge) {
+				super();
+			}
+			override send(text: string): void {
+				super.send(text);
+				const message = JSON.parse(text) as RelayToExtMessage;
+				if (message.t !== "rpc" || message.op !== "removeTab") return;
+				this.bridge.extMessage(this, JSON.stringify({ t: "tabRemoved", tabId: message.tabId }));
+				ack(this.bridge, this, "removeTab");
+			}
+		}
+
+		it("consumes a dead owner's stale record without closing a user tab that reuses its target id after reconnect", async () => {
+			await withOrphanRecord(async ({ bridge, ownershipFile, targetId, reap }) => {
+				const previous = new FakeExtSocket();
+				helloWithOwned(bridge, previous, [tab({ tabId: 9 })], [9]);
+				expect(bridge.listTargets().map(target => target.id)).toEqual([targetId]);
+				bridge.extClosed(previous);
+
+				// Synthetic forced collision: emulate a browser restart with the SAME instance/tab id.
+				// This proves the composed protocol/registry guard, not real Chrome restart behavior.
+				const restarted = new RemovingExtSocket(bridge);
+				const userTab = tab({ tabId: 9, title: "User tab after restart", url: "https://user.example/" });
+				helloWithOwned(bridge, restarted, [userTab], []);
+				expect(bridge.listTargets()).toEqual([
+					{ id: targetId, type: "page", title: userTab.title, url: userTab.url },
+				]);
+
+				// The count is resolved registry entries, including stale records, not tabs closed.
+				expect(await reap()).toBe(1);
+				expect(previous.rpcs("removeTab")).toEqual([]);
+				expect(restarted.rpcs("removeTab")).toEqual([]);
+				expect(bridge.listTargets()).toEqual([
+					{ id: targetId, type: "page", title: userTab.title, url: userTab.url },
+				]);
+				expect(await Bun.file(ownershipFile).exists()).toBe(false);
+			});
+		});
+
+		it("closes a current owned unclaimed tab through the same reaper and consumes its dead owner's record", async () => {
+			await withOrphanRecord(async ({ bridge, ownershipFile, targetId, reap }) => {
+				const extension = new RemovingExtSocket(bridge);
+				helloWithOwned(bridge, extension, [tab({ tabId: 9 })], [9]);
+				expect(bridge.listTargets().map(target => target.id)).toEqual([targetId]);
+
+				expect(await reap()).toBe(1);
+				expect(extension.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+				expect(bridge.listTargets()).toEqual([]);
+				expect(await Bun.file(ownershipFile).exists()).toBe(false);
+			});
+		});
 	});
 });

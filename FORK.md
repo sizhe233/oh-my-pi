@@ -30,7 +30,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 |---|---|---|---|
 | F1 | Relay 自有标签（移植上游未合并的 [PR #12101](https://github.com/can1357/oh-my-pi/pull/12101)，作者 Koichi Kimura） | `eb8634a408` `e85e9bdca0` `d462f9cff9` | `attach.ts`（`resolveAttachTarget`）、`tab-supervisor.ts`（`ownsTarget`、`closeAbandonedOwnedTarget`）、`tab-worker.ts`、`tab-protocol.ts`、`relay/bridge.ts`（非真实 detach 不再 ban） |
 | F2 | 会话隔离：后台建页、claim 互斥、按会话分组、后台截图 | `89e1fb1ec4` | `packages/browser-relay/extension/background.ts`、`relay/bridge.ts`（`#claimTab`、`provisionalClaimConnId`、`#drainGroupQueue`）、`tab-supervisor.ts`（`buildInitPayload`、`groupLabelForTab`）、`tab-worker.ts`（`#claimRelayTarget`、`preparePageForScreenshot`）、`relay/extension-assets/*` |
-| F3 | Fork CI：停用上游 workflow，手动构建及独立 Windows 真实扩展集成验证；Windows 安装脚本 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml`、`fork-browser-relay-e2e.yml`、`scripts/fork-browser-relay-e2e.ts`、`scripts/fork-install-windows.ps1` |
+| F3 | Fork CI：停用上游 workflow，手动构建、本次官方同步验证与 PR #9 合并后的一次性双平台构建及独立 Windows 真实扩展集成验证；Windows 安装脚本 | `91c86591b0` … `95617c163b` | `.github/workflows/*.upstream-disabled`、`fork-build-manual.yml`、`fork-build-windows-manual.yml`、`fork-browser-relay-e2e.yml`、`scripts/fork-browser-relay-e2e.ts`、`scripts/fork-install-windows.ps1` |
 | F4 | 最小化窗口：指定建页窗口、等帧上限、截图期间保持渲染且不恢复窗口 | 见变更记录 | `packages/browser-relay/extension/background.ts`（`tabWindowId`）、`packages/browser-relay/extension/screenshot-capture.ts`、`packages/browser-relay/extension/chrome.d.ts`、`screenshot.ts`（`waitForRenderFrame`）、`relay/bridge.ts`（CDP 超时方法名）、`scripts/fork-browser-minimized-e2e.ts`、`relay/extension-assets/*` |
 | F5 | 会话崩溃残留回收、`app.target` 同名复用报错、扩展重连降噪 | 见变更记录 | `relay/owned-targets.ts`（`relayTargetScope`、`closeRelayTarget`、`closeRelayOwnedTarget`）、`relay/bridge.ts`（`ompCreated`、`OMP.closeOwnedTarget`）、`relay/protocol.ts`（hello `ownedTabIds`）、`orphan-registry.ts`（`runtimeDir`、可注入关闭函数）、`registry.ts`（relay 连接时回收）、`tab-supervisor.ts`（`attachTarget`、`sharedScopeOf`、`closeTargetById`）、`packages/browser-relay/extension/background.ts`（`ompCreatedTabIds`、`relayListening`、单一重连定时器）、`relay/extension-assets/*` |
 | F6 | 多个浏览器实例连 relay 时，新建标签只发给有标签（有窗口）的实例 | 见变更记录 | `relay/bridge.ts`（`#instanceForNewTab`） |
@@ -72,8 +72,8 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 - 继承的上游 workflow 已改名为 `.yml.upstream-disabled`，不会运行。以下 fork workflow 均不发布 release，也不改动本机安装：
   - `fork-build-manual.yml`：GitHub 托管的 `macos-15` arm64 runner，产物名 `omp-fork-darwin-arm64-<sha>`。
   - `fork-build-windows-manual.yml`：Windows x64 baseline（`win32-x64`，不是 32 位 x86）。native addon 和 CLI 在 Linux 上交叉编译，再到托管的 Windows x64 runner 上验证二进制、测试和内嵌扩展。
-    当前同步分支对截图捕获实现或扩展源码的修改也触发同一完整 Windows 构建，用于本次最小化截图修复的同 SHA 验证；其他分支仍保持手动触发。
-  - `fork-browser-relay-e2e.yml`：独立 `windows-2025` 真实扩展集成验证，不依赖原生二进制重编译。Bun 固定为 1.4.2，Chrome for Testing 版本取冻结依赖中的 Puppeteer revision；重建扩展并校验与 CLI 内嵌资源一致。可手动运行；此外仅在 `sync/upstream-20260930` 分支且修改该 workflow 或测试脚本时自动运行。产物 `omp-windows-real-extension-<sha>` 保存覆盖 JSON、截图及日志。此任务成功只说明被执行的断言成功，未覆盖的完整 CLI/桌面验收仍待完成。
+    本次先验证同步分支的官方更新（消息前缀 `test(fork): validate official sync 6e4ac4a1a7`），再在 PR #9 合并到 `main` 后构建更新包（消息前缀 `Merge PR #9: chore: sync official upstream through 6e4ac4a1a7 (@sizhe233)`）。两平台均以 `github.sha` 校验来源；其他提交不自动运行构建任务，后续仍可手动触发；此前截图修复的同步分支自动构建已结束。
+  - `fork-browser-relay-e2e.yml`：独立 `windows-2025` 真实扩展集成验证，不依赖原生二进制重编译。Bun 固定为 1.4.2，Chrome for Testing 版本取冻结依赖中的 Puppeteer revision；重建扩展并校验与 CLI 内嵌资源一致。可手动运行；本次与上面的同步提交验证 / PR #9 合并构建同时运行，以同样的提交消息前缀限定范围。产物 `omp-windows-real-extension-<sha>` 保存覆盖 JSON、截图及日志。此任务成功只说明被执行的断言成功，未覆盖的完整 CLI/桌面验收仍待完成。
 - 触发方式：`gh workflow run <workflow> --repo sizhe233/oh-my-pi --ref <分支> -f source_sha=<该分支头的完整 SHA>`。`source_sha` 必须等于运行时检出的提交。
 - 每次构建都从干净 checkout 编译 native addon、扩展和 CLI，检查生成的扩展资源没有漂移，运行浏览器测试、类型检查、worker smoke、外部 cwd 与显式 `--cwd`，并上传 `SHA256SUMS.txt` 和 `build.json`。
 - macOS 构建约 30 分钟，其中 native addon 编译约 29–31 分钟，属正常耗时。用 `gh run watch <run id> --repo sizhe233/oh-my-pi --exit-status` 等待；失败时先用 `gh run view <run id> --log-failed` 看原因，不要盲目重跑。
@@ -188,3 +188,9 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 修复 relay 上关闭标签的兜底路径：relay 没有 browser target，`browser.target()` 直接抛错，导致 open 被放弃时的 `closeAbandonedOwnedTarget` 与强制回收时的 `closeOrphanTarget` 从未生效；改为直接向 relay 根会话发 `Target.closeTarget`。（F1、F5）
 - 扩展没有 relay 时先 `fetch` 探测再拨 WebSocket，不再在扩展错误列表里每 10 秒累积一条 `ERR_CONNECTION_REFUSED`；重连只保留一条定时器链，上限 30 秒；点击工具栏图标时立即重连。（F5）
 - 多个浏览器实例连着 relay 时，新建标签不再发给没有任何标签的实例：`~/.omp/browser-profiles/*` 下一个 `--no-startup-window` 后台 Chrome 也装了扩展，轮到它最后握手时 `browser.open()` 报 `No current window`。（F6）
+
+### 2026-10-01
+
+- 将官方 `can1357/oh-my-pi` 从 `2b023d1b80` 同步至 `6e4ac4a1a7a07b0f48217f479441e15ab7cd7dea`（2026-10-01 11:11 UTC，新增 331 个提交，版本 18.4.8），保留所有 fork 浏览器行为；此次固定该 SHA，后续官方提交留给下一批同步。
+- 先对本次官方同步分支跑双平台构建，再从 PR #9 合并后的同一 `main` SHA 构建 macOS arm64 与 Windows x64 更新包；保留手动构建，不增加普通推送的自动编译，也不发布 Release。macOS 额外检查 native addon 没有直接链接 Swift / FoundationModels，以保留旧 macOS 的启动兼容性。（F3）
+- 补充孤儿回收组合回归：实际 reaper 经 `closeRelayOwnedTarget` 进入 RelayBridge，人工设置重连后同 ID、空归属，验证用户标签保留且旧记录被消费；另有自有且无人驱动标签的正向回收对照。这是合成协议边界测试，不宣称真实 Chrome 曾复用该 ID。（F5）
