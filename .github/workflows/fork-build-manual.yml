@@ -1,17 +1,19 @@
-name: Fork browser build (manual)
+name: Fork macOS arm64 build
 
-# This fork does not run unreviewed PR code or publish releases automatically.
+# Default-branch builds and explicitly imported, exact-SHA sync candidates only.
 on:
-  # Bounded validation of this official sync, then same-commit builds after PR #9 merges.
   push:
-    branches: [main, sync/upstream-20260930]
-    paths:
-      - .github/workflows/fork-build-manual.yml
-      - packages/coding-agent/test/tools/browser-freeze-settle.test.ts
+    branches: [main, 'sync/upstream-*', 'chore/automate-upstream-*']
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit SHA at the selected ref (main or a sync/upstream-* branch)
+        description: Exact 40-character source SHA (defaults to the selected ref)
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact imported candidate SHA, independent of the caller workflow SHA
         required: true
         type: string
 
@@ -20,12 +22,6 @@ permissions:
 
 jobs:
   macos-arm64:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.ref == 'refs/heads/main' &&
-      startsWith(github.event.head_commit.message, 'Merge PR #9: chore: sync official upstream through 6e4ac4a1a7 (@sizhe233)')) ||
-      (github.ref == 'refs/heads/sync/upstream-20260930' &&
-      startsWith(github.event.head_commit.message, 'test(fork): validate official sync 6e4ac4a1a7'))
     name: Build and smoke macOS arm64 CLI and relay extension
     # Hosted macos-15 is Apple Silicon; the first step also asserts uname -m.
     runs-on: macos-15
@@ -35,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
       - name: Verify trusted source and Apple Silicon host
         shell: bash
@@ -44,8 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$SOURCE_SHA" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(uname -m)" = arm64
           xcodebuild -version
           bazelisk --version
@@ -138,7 +133,7 @@ jobs:
       - name: Record provenance and checksums
         shell: bash
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -149,7 +144,7 @@ jobs:
           bun -e 'await Bun.write("packages/coding-agent/binaries/build.json", JSON.stringify({sourceSha:Bun.env.SOURCE_SHA,runId:Bun.env.RUN_ID,platform:process.platform,arch:process.arch,bun:Bun.version,checksums:await Bun.file("packages/coding-agent/binaries/SHA256SUMS.txt").text(),result:"passed"}, null, 2) + "\n")'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: omp-fork-darwin-arm64-${{ github.sha }}
+          name: omp-fork-darwin-arm64-${{ inputs.source_sha || github.sha }}
           path: |
             packages/coding-agent/binaries/omp-darwin-arm64
             packages/coding-agent/binaries/SHA256SUMS.txt
@@ -157,3 +152,4 @@ jobs:
             packages/browser-relay/dist/omp-browser-relay-extension.zip
           if-no-files-found: error
           retention-days: 14
+

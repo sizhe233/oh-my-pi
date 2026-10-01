@@ -1,25 +1,27 @@
 name: Fork Windows real-extension integration
 
-# Bounded real-extension validation of the latest official sync and final main merge.
-# This does not turn on upstream CI or rebuild release binaries.
+# Default-branch builds and explicitly imported, exact-SHA sync candidates only.
 on:
-   workflow_dispatch:
-   push:
-      branches: [main, sync/upstream-20260930]
-      paths:
-         - .github/workflows/fork-browser-relay-e2e.yml
+  push:
+    branches: [main, 'sync/upstream-*', 'chore/automate-upstream-*']
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character source SHA (defaults to the selected ref)
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact imported candidate SHA, independent of the caller workflow SHA
+        required: true
+        type: string
 
 permissions:
-   contents: read
+  contents: read
 
 jobs:
    real-extension:
-      if: >-
-         github.event_name == 'workflow_dispatch' ||
-         (github.ref == 'refs/heads/main' &&
-         startsWith(github.event.head_commit.message, 'Merge PR #9: chore: sync official upstream through 6e4ac4a1a7 (@sizhe233)')) ||
-         (github.ref == 'refs/heads/sync/upstream-20260930' &&
-         startsWith(github.event.head_commit.message, 'test(fork): validate official sync 6e4ac4a1a7'))
       name: Real extension and relay on Windows (${{ matrix.mode }})
       runs-on: windows-2025
       timeout-minutes: 20
@@ -36,8 +38,15 @@ jobs:
       steps:
          - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
            with:
-              ref: ${{ github.sha }}
+              ref: ${{ inputs.source_sha || github.sha }}
               persist-credentials: false
+         - name: Verify exact source commit
+           shell: pwsh
+           env:
+              SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+           run: |
+              if ($env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid source SHA' }
+              if ((git rev-parse HEAD).Trim() -cne $env:SOURCE_SHA) { throw 'Source SHA mismatch' }
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
            with:
               bun-version: 1.4.2
@@ -79,13 +88,14 @@ jobs:
            env:
               OMP_E2E_HEADLESS: ${{ matrix.headless }}
               OMP_E2E_ENABLE_NEW_SURFACE: "false"
-              OMP_E2E_SOURCE_SHA: ${{ github.sha }}
+              OMP_E2E_SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
            run: bun ${{ matrix.script }}
          - name: Preserve screenshots, logs and coverage even on failure
            if: always()
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
-              name: omp-windows-real-extension-${{ matrix.mode }}-${{ github.sha }}
+              name: omp-windows-real-extension-${{ matrix.mode }}-${{ inputs.source_sha || github.sha }}
               path: ${{ runner.temp }}/omp-e2e-report
               if-no-files-found: warn
               retention-days: 14
+

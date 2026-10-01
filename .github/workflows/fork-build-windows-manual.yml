@@ -1,19 +1,19 @@
-name: Fork Windows x64 build (manual)
+name: Fork Windows x64 build
 
-# The repository supports win32-x64-baseline, not 32-bit win32-x86.
-# Build the baseline addon on Linux (the Bazel MSVC cross toolchain does not run
-# on Windows), then smoke the resulting executable on hosted Windows x64.
+# Default-branch builds and explicitly imported, exact-SHA sync candidates only.
 on:
-  # Bounded validation of this official sync, then same-commit builds after PR #9 merges.
   push:
-    branches: [main, sync/upstream-20260930]
-    paths:
-      - .github/workflows/fork-build-windows-manual.yml
-      - packages/coding-agent/test/tools/browser-freeze-settle.test.ts
+    branches: [main, 'sync/upstream-*', 'chore/automate-upstream-*']
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit SHA at the selected ref (main or a sync/upstream-* branch)
+        description: Exact 40-character source SHA (defaults to the selected ref)
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact imported candidate SHA, independent of the caller workflow SHA
         required: true
         type: string
 
@@ -22,12 +22,6 @@ permissions:
 
 jobs:
   cross-build:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.ref == 'refs/heads/main' &&
-      startsWith(github.event.head_commit.message, 'Merge PR #9: chore: sync official upstream through 6e4ac4a1a7 (@sizhe233)')) ||
-      (github.ref == 'refs/heads/sync/upstream-20260930' &&
-      startsWith(github.event.head_commit.message, 'test(fork): validate official sync 6e4ac4a1a7'))
     name: Build Windows x64 baseline addon and CLI from source
     runs-on: ubuntu-22.04
     timeout-minutes: 180
@@ -36,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
       - name: Verify the trusted x64 source commit
         shell: bash
@@ -45,8 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$SOURCE_SHA" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(uname -m)" = x86_64
           bazelisk --version
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -93,7 +86,7 @@ jobs:
       - name: Record same-commit cross-build checksums
         shell: bash
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -106,7 +99,7 @@ jobs:
           bun -e 'await Bun.write("packages/coding-agent/binaries/build.json", JSON.stringify({sourceSha:Bun.env.SOURCE_SHA,runId:Bun.env.RUN_ID,target:"win32-x64-baseline",buildHost:"linux-x64",bun:Bun.version,checksums:await Bun.file("packages/coding-agent/binaries/SHA256SUMS.txt").text(),result:"built"}, null, 2) + "\n")'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: omp-fork-windows-x64-build-${{ github.sha }}
+          name: omp-fork-windows-x64-build-${{ inputs.source_sha || github.sha }}
           path: |
             packages/coding-agent/binaries/omp-windows-x64.exe
             packages/coding-agent/binaries/SHA256SUMS.txt
@@ -124,21 +117,21 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: omp-fork-windows-x64-build-${{ github.sha }}
+          name: omp-fork-windows-x64-build-${{ inputs.source_sha || github.sha }}
           path: ${{ runner.temp }}/windows-build
       - name: Verify Windows architecture, source SHA and downloaded hashes
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'Windows x64 host required' }
-          if ((git rev-parse HEAD).Trim() -ne '${{ github.sha }}') { throw 'Checkout SHA mismatch' }
+          if ((git rev-parse HEAD).Trim() -ne '${{ inputs.source_sha || github.sha }}') { throw 'Checkout SHA mismatch' }
           $root = Join-Path $env:RUNNER_TEMP 'windows-build'
           $files = @{
             'omp-windows-x64.exe' = Join-Path $root 'coding-agent/binaries/omp-windows-x64.exe'
@@ -148,7 +141,7 @@ jobs:
           $manifestPath = Join-Path $root 'coding-agent/binaries/SHA256SUMS.txt'
           $provenancePath = Join-Path $root 'coding-agent/binaries/build.json'
           $provenance = Get-Content -Raw -LiteralPath $provenancePath | ConvertFrom-Json
-          if ($provenance.sourceSha -ne '${{ github.sha }}' -or $provenance.target -ne 'win32-x64-baseline') { throw 'Artifact provenance mismatch' }
+          if ($provenance.sourceSha -ne '${{ inputs.source_sha || github.sha }}' -or $provenance.target -ne 'win32-x64-baseline') { throw 'Artifact provenance mismatch' }
           $lines = @(Get-Content -LiteralPath $manifestPath)
           if ($lines.Count -ne 3) { throw 'Expected three asset hashes' }
           foreach ($line in $lines) {
@@ -280,7 +273,7 @@ jobs:
           Write-Host "installer ok: $version"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: omp-fork-windows-x64-${{ github.sha }}
+          name: omp-fork-windows-x64-${{ inputs.source_sha || github.sha }}
           path: |
             ${{ runner.temp }}/windows-build/coding-agent/binaries/omp-windows-x64.exe
             ${{ runner.temp }}/windows-build/coding-agent/binaries/SHA256SUMS.txt
@@ -289,3 +282,4 @@ jobs:
             ${{ runner.temp }}/windows-build/browser-relay/dist/omp-browser-relay-extension.zip
           if-no-files-found: error
           retention-days: 14
+
