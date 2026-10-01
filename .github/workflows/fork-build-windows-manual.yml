@@ -7,7 +7,9 @@ on:
   # Bounded validation of this official sync, then same-commit builds after PR #9 merges.
   push:
     branches: [main, sync/upstream-20260930]
-    paths: [.github/workflows/fork-build-windows-manual.yml]
+    paths:
+      - .github/workflows/fork-build-windows-manual.yml
+      - packages/coding-agent/test/tools/browser-freeze-settle.test.ts
   workflow_dispatch:
     inputs:
       source_sha:

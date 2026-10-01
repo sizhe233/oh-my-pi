@@ -194,3 +194,5 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 将官方 `can1357/oh-my-pi` 从 `2b023d1b80` 同步至 `6e4ac4a1a7a07b0f48217f479441e15ab7cd7dea`（2026-10-01 11:11 UTC，新增 331 个提交，版本 18.4.8），保留所有 fork 浏览器行为；此次固定该 SHA，后续官方提交留给下一批同步。
 - 先对本次官方同步分支跑双平台构建，再从 PR #9 合并后的同一 `main` SHA 构建 macOS arm64 与 Windows x64 更新包；保留手动构建，不增加普通推送的自动编译，也不发布 Release。macOS 额外检查 native addon 没有直接链接 Swift / FoundationModels，以保留旧 macOS 的启动兼容性。（F3）
 - 补充孤儿回收组合回归：实际 reaper 经 `closeRelayOwnedTarget` 进入 RelayBridge，人工设置重连后同 ID、空归属，验证用户标签保留且旧记录被消费；另有自有且无人驱动标签的正向回收对照。这是合成协议边界测试，不宣称真实 Chrome 曾复用该 ID。（F5）
+
+- 完整浏览器测试串行运行时，修复 idle-close 测试遗留的 cmux 原型 spy，避免后续生命周期测试误读上一用例的连接次数；保留原断言，产品源码不变。（F3）
