@@ -13,6 +13,16 @@
  */
 import type { ExtToRelayMessage, RelayToExtMessage, TabSnapshot } from "../../coding-agent/src/tools/browser/relay/protocol";
 
+import { ScreenshotCapture } from "./screenshot-capture";
+
+const screenshotCapture = new ScreenshotCapture(
+	(target, method, params) => chrome.debugger.sendCommand(target, method, params),
+	async tabId => {
+		const tab = await chrome.tabs.get(tabId);
+		return (await chrome.windows.get(tab.windowId)).state === "minimized";
+	},
+);
+
 const DEFAULT_PORT = 9224;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
@@ -229,7 +239,7 @@ async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<un
 				throw error;
 			}
 		case "send":
-			return await chrome.debugger.sendCommand(
+			return await screenshotCapture.send(
 				msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId },
 				msg.method,
 				msg.params,
@@ -343,11 +353,17 @@ async function connect(): Promise<void> {
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
 	if (source.tabId === undefined) return;
+	const target = { tabId: source.tabId, sessionId: source.sessionId };
+	if (screenshotCapture.handleEvent(target, method, params)) return;
+	if (method === "Target.detachedFromTarget" && typeof params?.sessionId === "string") {
+		screenshotCapture.detach({ tabId: source.tabId, sessionId: params.sessionId });
+	}
 	post({ t: "cdpEvent", tabId: source.tabId, sessionId: source.sessionId, method, params });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
 	if (source.tabId === undefined) return;
+	screenshotCapture.detach({ tabId: source.tabId });
 	const relayInitiated = relayInitiatedDetachTabs.delete(source.tabId);
 	post({ t: "detached", tabId: source.tabId, reason, relayInitiated });
 });
@@ -363,6 +379,7 @@ chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+	screenshotCapture.detach({ tabId });
 	void markCreatedTab(tabId, false);
 	post({ t: "tabRemoved", tabId });
 });

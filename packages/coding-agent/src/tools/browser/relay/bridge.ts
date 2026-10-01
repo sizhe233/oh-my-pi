@@ -1446,7 +1446,9 @@ export class RelayBridge {
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 		const timer = setTimeout(() => {
 			this.#pendingRpc.delete(`${inst.instanceId}:${id}`);
-			reject(new Error(`extension rpc '${req.op}' timed out after ${timeoutMs}ms`));
+			// Attribute stalls without logging page URLs, evaluated code or image data.
+			const operation = req.op === "send" ? `${req.op} ${req.method}` : req.op;
+			reject(new Error(`extension rpc '${operation}' timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
 		this.#pendingRpc.set(`${inst.instanceId}:${id}`, { resolve, reject, timer });
 		inst.socket.send(JSON.stringify({ t: "rpc", id, ...req } satisfies RelayToExtMessage));

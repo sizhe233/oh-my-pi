@@ -2,6 +2,12 @@ name: Fork browser build (manual)
 
 # This fork does not run unreviewed PR code or publish releases automatically.
 on:
+  # Bounded validation of this official sync, then same-commit builds after PR #9 merges.
+  push:
+    branches: [main, sync/upstream-20260930]
+    paths:
+      - .github/workflows/fork-build-manual.yml
+      - packages/coding-agent/test/tools/browser-freeze-settle.test.ts
   workflow_dispatch:
     inputs:
       source_sha:
@@ -14,6 +20,12 @@ permissions:
 
 jobs:
   macos-arm64:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.ref == 'refs/heads/main' &&
+      startsWith(github.event.head_commit.message, 'Merge PR #9: chore: sync official upstream through 6e4ac4a1a7 (@sizhe233)')) ||
+      (github.ref == 'refs/heads/sync/upstream-20260930' &&
+      startsWith(github.event.head_commit.message, 'test(fork): validate official sync 6e4ac4a1a7'))
     name: Build and smoke macOS arm64 CLI and relay extension
     # Hosted macos-15 is Apple Silicon; the first step also asserts uname -m.
     runs-on: macos-15
@@ -23,11 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Verify trusted source and Apple Silicon host
         shell: bash
         env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -56,26 +69,26 @@ jobs:
           test ! -e packages/natives/native/pi_natives.darwin-arm64.node
           bun scripts/bazel-natives.ts darwin-arm64 --dest packages/natives/native -- --jobs=2
           test -s packages/natives/native/pi_natives.darwin-arm64.node
+      - name: Verify the native addon does not link Swift or FoundationModels directly
+        run: |
+          set -euo pipefail
+          if otool -L packages/natives/native/pi_natives.darwin-arm64.node | grep -E 'libswift|FoundationModels'; then
+            echo "::error::Native addon must load the optional Apple FM bridge dynamically for older macOS"
+            exit 1
+          fi
       - name: Check CLI and extension types
         run: |
           set -euo pipefail
           bun --cwd=packages/coding-agent run check:types
           bun --cwd=packages/browser-relay run check:types
-      - name: Exercise browser relay contracts
+      - name: Run complete browser regression suite and image/clipboard contracts
         working-directory: packages/coding-agent
         run: |
           set -euo pipefail
           bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
-            test/tools/browser-relay-bridge.test.ts \
-            test/tools/browser-relay-daemon.test.ts \
-            test/tools/browser-relay-server.test.ts \
-            test/tools/browser-relay-probe.test.ts \
-            test/tools/browser-relay-kind.test.ts \
-            test/tools/browser-attach.test.ts \
-            test/tools/browser-op-tracking.test.ts \
-            test/tools/browser-screenshot-plus.test.ts \
-            test/tools/browser-tab-worker-startup.test.ts \
-            test/tools/browser-launch-cwd.test.ts
+            test/tools/browser-*.test.ts \
+            test/utils/image-resize.test.ts \
+            test/utils/clipboard.test.ts
       - name: Compile one release CLI from the same SHA
         run: bun scripts/ci-release-build-binaries.ts --targets darwin-arm64
       - name: Smoke compiled workers and caller directory handling

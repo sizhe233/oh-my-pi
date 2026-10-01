@@ -22,6 +22,7 @@ import {
 	getProjectDir,
 	getProjectAgentDir,
 	isEnoent,
+	isRecord,
 	logger,
 	MAIN_CONFIG_FILENAMES,
 	procmgr,
@@ -364,10 +365,6 @@ function stringArrayFromUnknown(value: unknown): string[] {
 	if (typeof value === "string") return [value];
 	if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
 	return [];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
@@ -1759,6 +1756,36 @@ export class Settings {
 		if (this.getProjectModelRole(role)) return "project";
 		if (this.getGlobalModelRole(role)) return "global";
 		return "default";
+	}
+
+	/**
+	 * Raw `modelPresets` entry for `name` from the highest-precedence layer that
+	 * defines it (runtime override → config overlay → project → global), whole —
+	 * same-name entries are NOT deep-merged across layers. A `null` entry on a
+	 * tombstoning layer (runtime, overlay) hides the preset; a `null` anywhere
+	 * else counts as unset. Falls back to the parent chain like the model-role
+	 * layer helpers.
+	 */
+	getOwnedModelPreset(
+		name: string,
+	): { entry: unknown; source: "runtime" | "overlay" | "project" | "global" } | undefined {
+		const layers = [
+			{ layer: this.#overrides, source: "runtime", tombstone: true },
+			{ layer: this.#configOverlay, source: "overlay", tombstone: true },
+			{ layer: projectLayerForMerge(this.#project), source: "project", tombstone: false },
+			{ layer: this.#global, source: "global", tombstone: false },
+		] as const;
+		for (const { layer, source, tombstone } of layers) {
+			const presets = getByPath(layer, ["modelPresets"]);
+			if (!isRecord(presets) || !Object.hasOwn(presets, name)) continue;
+			const entry = presets[name];
+			if (entry === null || entry === undefined) {
+				if (tombstone) return undefined;
+				continue;
+			}
+			return { entry, source };
+		}
+		return this.#parent?.getOwnedModelPreset(name);
 	}
 
 	/**

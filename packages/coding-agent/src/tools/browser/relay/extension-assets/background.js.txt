@@ -1,4 +1,102 @@
+// extension/screenshot-capture.ts
+class ScreenshotCapture {
+  sendCommand;
+  isMinimized;
+  #states = new Map;
+  constructor(sendCommand, isMinimized) {
+    this.sendCommand = sendCommand;
+    this.isMinimized = isMinimized;
+  }
+  #key(target) {
+    return `${target.tabId}:${target.sessionId ?? ""}`;
+  }
+  send(target, method, params) {
+    if (method !== "Page.captureScreenshot" && method !== "Page.startScreencast" && method !== "Page.stopScreencast") {
+      return this.sendCommand(target, method, params);
+    }
+    const key = this.#key(target);
+    let state = this.#states.get(key);
+    if (!state) {
+      state = { target, queue: Promise.resolve(), temporaryActive: false, detached: false };
+      this.#states.set(key, state);
+    }
+    const current = state;
+    const result = current.queue.then(() => this.#run(current, method, params));
+    current.queue = result.catch(() => {});
+    return result;
+  }
+  async#stopTemporary(state) {
+    if (!state.temporaryActive || state.detached)
+      return;
+    await this.sendCommand(state.target, "Page.stopScreencast");
+    state.temporaryActive = false;
+  }
+  async#run(state, method, params) {
+    if (state.detached)
+      throw new Error("Screenshot target detached");
+    await this.#stopTemporary(state);
+    if (state.detached)
+      throw new Error("Screenshot target detached");
+    if (method === "Page.startScreencast") {
+      const previousOwner = state.owner;
+      state.owner = "recording";
+      try {
+        return await this.sendCommand(state.target, method, params);
+      } catch (error) {
+        state.owner = previousOwner;
+        throw error;
+      }
+    }
+    if (method === "Page.stopScreencast") {
+      const result = await this.sendCommand(state.target, method, params);
+      if (state.owner === "recording")
+        state.owner = undefined;
+      return result;
+    }
+    if (state.owner === "recording" || !await this.isMinimized(state.target.tabId)) {
+      if (state.detached)
+        throw new Error("Screenshot target detached");
+      return await this.sendCommand(state.target, method, params);
+    }
+    if (state.detached)
+      throw new Error("Screenshot target detached");
+    state.owner = "temporary";
+    state.temporaryActive = true;
+    try {
+      await this.sendCommand(state.target, "Page.startScreencast", { format: "png", everyNthFrame: 1 });
+      if (state.detached)
+        throw new Error("Screenshot target detached");
+      return await this.sendCommand(state.target, method, params);
+    } finally {
+      await this.#stopTemporary(state);
+    }
+  }
+  handleEvent(target, method, params) {
+    if (method !== "Page.screencastFrame" || this.#states.get(this.#key(target))?.owner !== "temporary") {
+      return false;
+    }
+    if (typeof params?.sessionId === "number") {
+      this.sendCommand(target, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+    }
+    return true;
+  }
+  detach(target) {
+    for (const [key, state] of this.#states) {
+      if (state.target.tabId !== target.tabId)
+        continue;
+      if (target.sessionId !== undefined && state.target.sessionId !== target.sessionId)
+        continue;
+      state.detached = true;
+      this.#states.delete(key);
+    }
+  }
+}
+
 // extension/background.ts
+var screenshotCapture = new ScreenshotCapture((target, method, params) => chrome.debugger.sendCommand(target, method, params), async (tabId) => {
+  const tab = await chrome.tabs.get(tabId);
+  return (await chrome.windows.get(tab.windowId)).state === "minimized";
+});
 var DEFAULT_PORT = 9224;
 var PING_INTERVAL_MS = 20000;
 var RECONNECT_MIN_MS = 1000;
@@ -170,7 +268,7 @@ async function runRpc(msg) {
         throw error;
       }
     case "send":
-      return await chrome.debugger.sendCommand(msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId }, msg.method, msg.params);
+      return await screenshotCapture.send(msg.sessionId ? { tabId: msg.tabId, sessionId: msg.sessionId } : { tabId: msg.tabId }, msg.method, msg.params);
     case "createTab": {
       const tab = await chrome.tabs.create({ url: msg.url, active: false, windowId: await tabWindowId() });
       const snap = snapshot(tab);
@@ -276,11 +374,18 @@ async function connect() {
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (source.tabId === undefined)
     return;
+  const target = { tabId: source.tabId, sessionId: source.sessionId };
+  if (screenshotCapture.handleEvent(target, method, params))
+    return;
+  if (method === "Target.detachedFromTarget" && typeof params?.sessionId === "string") {
+    screenshotCapture.detach({ tabId: source.tabId, sessionId: params.sessionId });
+  }
   post({ t: "cdpEvent", tabId: source.tabId, sessionId: source.sessionId, method, params });
 });
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === undefined)
     return;
+  screenshotCapture.detach({ tabId: source.tabId });
   const relayInitiated = relayInitiatedDetachTabs.delete(source.tabId);
   post({ t: "detached", tabId: source.tabId, reason, relayInitiated });
 });
@@ -295,6 +400,7 @@ chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
     post({ t: "tabUpdated", tab: snap });
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
+  screenshotCapture.detach({ tabId });
   markCreatedTab(tabId, false);
   post({ t: "tabRemoved", tabId });
 });
