@@ -4,7 +4,7 @@ name: Fork stable upstream sync
 # PR creation/review/merge stays with the owner's existing GitHub connection.
 on:
   schedule:
-    - cron: '23 * * * *'
+    - cron: '24 * * * *'
   workflow_dispatch:
     inputs:
       release_tag:

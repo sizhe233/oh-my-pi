@@ -5,7 +5,7 @@ from `can1357/oh-my-pi`. It does not follow every upstream commit.
 
 ## Trust and merge boundary
 
-`Fork stable upstream sync` checks hourly at minute 23 UTC (GitHub may delay
+`Fork stable upstream sync` checks hourly at minute 24 UTC (GitHub may delay
 scheduled runs). A configuration merge to main also starts the first import.
 The importer uses the workflow and script from the exact trusted main SHA.
 Only its import job receives this repository's temporary `GITHUB_TOKEN` with
