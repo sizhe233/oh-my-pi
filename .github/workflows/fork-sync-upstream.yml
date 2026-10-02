@@ -13,10 +13,6 @@ on:
         type: string
   push:
     branches: [main, 'chore/automate-upstream-*']
-    paths:
-      - .github/workflows/fork-sync-upstream.yml
-      - scripts/fork-sync-upstream.py
-      - scripts/test_fork_sync_upstream.py
 
 permissions:
   contents: read
