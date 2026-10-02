@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [18.4.11] - 2026-10-02
+
+### Added
+
+- Added XDG-aware utility paths for skill descriptions and prediction state, with automatic adoption of legacy data when XDG locations are first resolved.
+
+### Fixed
+
+- Fixed machine-global daemon runtime paths so brokers such as text prediction use the shared XDG state location across profiles and custom agent directories.
+
 ## [18.4.10] - 2026-10-02
 
 ### Added

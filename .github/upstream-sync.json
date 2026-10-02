@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.4.10",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.4.10",
-  "releaseId": 401477136,
-  "publishedAt": "2026-10-02T01:35:53Z",
-  "upstreamSha": "cb0d5295e5edd48d000c1979e195186ec92aac79",
-  "baseSha": "416a5a0739dffe1361a6beac0a877ba1050552a3",
-  "mergeBaseSha": "d3a32f6c9e2db84a54741464099422b8f2b2ad51",
-  "branch": "sync/upstream-v18.4.10",
+  "releaseTag": "v18.4.11",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.4.11",
+  "releaseId": 401923829,
+  "publishedAt": "2026-10-02T15:12:46Z",
+  "upstreamSha": "c0b3937e81e6bb68137a1c8d8f7e0e55dee8b3e5",
+  "baseSha": "af2a860dab356ca17fc5956a0440cff7e5866418",
+  "mergeBaseSha": "cb0d5295e5edd48d000c1979e195186ec92aac79",
+  "branch": "sync/upstream-v18.4.11",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
   "upstreamWorkflowChanges": []
 }
