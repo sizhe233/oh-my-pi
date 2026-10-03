@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
@@ -42,6 +43,7 @@ class SyncFixture(unittest.TestCase):
         self.write(self.upstream, ".github/workflows/removed.yml", "keep this fork workflow\n")
         self.write(self.upstream, "packages/coding-agent/package.json", '{"version":"1.0.0"}\n')
         self.write(self.upstream, "shared.txt", "base\n")
+        self.write(self.upstream, "packages/coding-agent/test/tools/browser-fixture.test.ts", "base test\n")
         self.commit(self.upstream, "common ancestor")
         self.fork = self.root / "fork"
         self.run_git(self.root, "clone", str(self.upstream), str(self.fork))
@@ -126,6 +128,326 @@ class SyncFixture(unittest.TestCase):
         self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
         self.assertEqual(self.run_git(self.remote, "rev-parse", "main").stdout.strip(), self.base)
         self.assertNotIn("refs/heads/sync/", self.remote_refs())
+
+    def reviewed_conflict(self):
+        """Prepare different fork/upstream edits and review a combined UTF-8 result."""
+        self.write(self.work, "shared.txt", "fork change\n")
+        self.base = self.commit(self.work, "fork shared change")
+        self.write(self.upstream, "shared.txt", "upstream change\n")
+        self.upstream_sha = self.commit(self.upstream, "upstream shared change")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        self.run_git(self.work, "fetch", str(self.upstream), self.upstream_sha)
+        merge_base = self.run_git(self.work, "merge-base", self.base, self.upstream_sha).stdout.strip()
+        content = "reviewed fork + upstream change, café\r\n"
+        self.review_path = f"{SYNC.RESOLUTIONS}/v1.1.0.json"
+        self.review = {
+            "schemaVersion": 1, "releaseTag": "v1.1.0", "upstreamSha": self.upstream_sha,
+            "mergeBaseSha": merge_base,
+            "resolutions": [{
+                "path": "shared.txt",
+                "mergeBaseBlob": self.run_git(self.work, "rev-parse", f"{merge_base}:shared.txt").stdout.strip(),
+                "forkBlob": self.run_git(self.work, "rev-parse", f"{self.base}:shared.txt").stdout.strip(),
+                "upstreamBlob": self.run_git(self.work, "rev-parse", f"{self.upstream_sha}:shared.txt").stdout.strip(),
+                "content": content, "resolvedSha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }],
+        }
+        self.save_review()
+
+    def save_review(self):
+        self.write(self.work, self.review_path, json.dumps(self.review, indent=2) + "\n")
+        self.publish_fixture_main()
+
+    def publish_fixture_main(self):
+        self.base = self.commit(self.work, "review exact conflict inputs and result")
+        self.run_git(self.work, "push", "origin", "main")
+        os.environ["GITHUB_SHA"] = self.base
+
+    def test_reviewed_conflict_preserves_exact_bytes_history_and_replays_deterministically(self):
+        """Reviewed combined bytes are published with audit provenance and reproduce on retries."""
+        self.reviewed_conflict()
+        self.write(self.work, ".gitattributes", "shared.txt text eol=lf\n")
+        self.publish_fixture_main()
+        os.environ["GITHUB_STEP_SUMMARY"] = str(self.root / "summary.md")
+        output = self.invoke()
+        candidate = output["candidate_sha"]
+        entry = self.review["resolutions"][0]
+        self.assertEqual((self.work / "shared.txt").read_bytes(), entry["content"].encode("utf-8"))
+        content = subprocess.run(["git", "show", f"{candidate}:shared.txt"], cwd=self.work,
+                                 capture_output=True, check=True).stdout
+        self.assertEqual(hashlib.sha256(content).hexdigest(), entry["resolvedSha256"])
+        self.assertEqual(self.run_git(self.work, "show", "-s", "--format=%P", candidate).stdout.strip().split(),
+                         [self.base, self.upstream_sha])
+        self.assertEqual(self.run_git(self.work, "diff", "--name-only", self.base, candidate, "--", SYNC.WORKFLOWS).stdout, "")
+        manifest = json.loads(self.run_git(self.work, "show", f"{candidate}:{SYNC.MANIFEST}").stdout)
+        source_blob = self.run_git(self.work, "rev-parse", f"{self.base}:{self.review_path}").stdout.strip()
+        self.assertEqual(manifest["reviewedConflictResolutions"], {
+            "path": self.review_path, "blob": source_blob, "resolvedPaths": ["shared.txt"], "postMergeTestPaths": [],
+        })
+        summary = (self.root / "summary.md").read_text()
+        self.assertIn(source_blob, summary)
+        self.assertIn("shared.txt", summary)
+        self.checkout()
+        self.calls.clear()
+        self.assertEqual(self.invoke()["candidate_sha"], candidate)
+        self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
+
+    def test_reviewed_conflict_rejects_changed_fork_input_without_publishing(self):
+        """A later fork edit cannot be overwritten by an older reviewed resolution."""
+        self.reviewed_conflict()
+        self.write(self.work, "shared.txt", "new unreviewed fork change\n")
+        self.publish_fixture_main()
+        with self.assertRaisesRegex(ValueError, "input pin mismatch"):
+            self.invoke()
+        self.assert_no_push()
+        self.assertEqual((self.work / "shared.txt").read_text(), "new unreviewed fork change\n")
+
+    def test_reviewed_conflict_rejects_altered_release_and_merge_base_pins(self):
+        """Approval for one release or ancestor cannot be reused against another."""
+        self.reviewed_conflict()
+        for field in ("releaseTag", "upstreamSha", "mergeBaseSha"):
+            with self.subTest(field=field):
+                original = self.review[field]
+                self.review[field] = "v9.9.9" if field == "releaseTag" else "0" * 40
+                self.save_review()
+                with self.assertRaisesRegex(ValueError, "release or merge-base pin mismatch"):
+                    self.invoke()
+                self.assert_no_push()
+                self.review[field] = original
+
+    def test_reviewed_conflict_rejects_altered_input_pins_and_output_hash(self):
+        """Input blob identity and reviewed output bytes are both mandatory before writing."""
+        self.reviewed_conflict()
+        entry = self.review["resolutions"][0]
+        for field in ("mergeBaseBlob", "forkBlob", "upstreamBlob", "resolvedSha256"):
+            with self.subTest(field=field):
+                original = entry[field]
+                entry[field] = "0" * (64 if field == "resolvedSha256" else 40)
+                self.save_review()
+                with self.assertRaisesRegex(ValueError, "pin mismatch|hash mismatch"):
+                    self.invoke()
+                self.assert_no_push()
+                entry[field] = original
+
+    def test_reviewed_conflict_rejects_extra_conflicts_and_aborts(self):
+        """An unreviewed application conflict stops the whole merge, including reviewed paths."""
+        self.reviewed_conflict()
+        self.write(self.work, "extra.txt", "fork extra\n")
+        self.publish_fixture_main()
+        self.write(self.upstream, "extra.txt", "upstream extra\n")
+        self.upstream_sha = self.commit(self.upstream, "additional conflicting file")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        self.review["upstreamSha"] = self.upstream_sha
+        self.save_review()
+        with self.assertRaisesRegex(RuntimeError, "conflict set mismatch"):
+            self.invoke()
+        self.assert_no_push()
+        self.assertFalse((self.work / ".git/MERGE_HEAD").exists())
+        self.assertEqual((self.work / "shared.txt").read_text(), "fork change\n")
+
+    def test_reviewed_conflict_rejects_missing_conflicts(self):
+        """A resolution whose target no longer conflicts cannot overwrite an ordinary merge."""
+        self.reviewed_conflict()
+        self.write(self.upstream, "shared.txt", "fork change\n")
+        self.upstream_sha = self.commit(self.upstream, "upstream independently agrees with fork")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        self.review["upstreamSha"] = self.upstream_sha
+        self.review["resolutions"][0]["upstreamBlob"] = self.review["resolutions"][0]["forkBlob"]
+        self.save_review()
+        with self.assertRaisesRegex(RuntimeError, "conflict set mismatch"):
+            self.invoke()
+        self.assert_no_push()
+        self.assertFalse((self.work / ".git/MERGE_HEAD").exists())
+
+    def test_resolution_data_is_read_from_trusted_base_not_imported_tree(self):
+        """Upstream cannot replace trusted review contents during the merge."""
+        self.reviewed_conflict()
+        self.write(self.upstream, self.review_path, '{"unreviewed":"replacement"}\n')
+        self.upstream_sha = self.commit(self.upstream, "upstream attempts to replace review data")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        self.review["upstreamSha"] = self.upstream_sha
+        self.save_review()
+        with self.assertRaisesRegex(RuntimeError, "conflict set mismatch"):
+            self.invoke()
+        self.assert_no_push()
+        self.assertEqual(json.loads((self.work / self.review_path).read_text()), self.review)
+
+    def test_upstream_only_resolution_data_cannot_authorize_conflicts(self):
+        """A resolution introduced by upstream has no authority in the write-capable importer."""
+        self.reviewed_conflict()
+        self.write(self.upstream, self.review_path, json.dumps(self.review))
+        self.upstream_sha = self.commit(self.upstream, "upstream-only review data")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        (self.work / self.review_path).unlink()
+        self.publish_fixture_main()
+        with self.assertRaisesRegex(RuntimeError, "Manual conflict resolution required"):
+            self.invoke()
+        self.assert_no_push()
+
+    def test_reviewed_resolution_rejects_unsafe_and_reserved_paths(self):
+        """Review data cannot write outside the checkout or authorize workflow/policy changes."""
+        self.reviewed_conflict()
+        entry = self.review["resolutions"][0]
+        for path in ("../escape", "/tmp/escape", "packages/./escape", "packages//escape", "packages\\escape", ".git/config", SYNC.WORKFLOWS + "/ci.yml", SYNC.MANIFEST, self.review_path):
+            with self.subTest(path=path):
+                entry["path"] = path
+                self.save_review()
+                with self.assertRaisesRegex(ValueError, "Unsafe reviewed resolution path"):
+                    self.invoke()
+                self.assert_no_push()
+
+    def test_reviewed_resolution_rejects_executable_and_symlink_input_modes(self):
+        """Matching content hashes cannot authorize executable or symlink conflict targets."""
+        self.reviewed_conflict()
+        (self.work / "shared.txt").chmod(0o755)
+        self.publish_fixture_main()
+        with self.assertRaisesRegex(ValueError, "regular 100644 blob"):
+            self.invoke()
+        self.assert_no_push()
+        (self.work / "shared.txt").unlink()
+        target = self.root / "must-not-overwrite.txt"
+        target.write_text("untouched\n")
+        (self.work / "shared.txt").symlink_to(target)
+        self.publish_fixture_main()
+        with self.assertRaisesRegex(ValueError, "regular 100644 blob"):
+            self.invoke()
+        self.assert_no_push()
+        self.assertEqual(target.read_text(), "untouched\n")
+
+    def test_reviewed_resolution_rejects_duplicate_paths_and_unknown_fields(self):
+        """An ambiguous target or non-schema directive cannot expand a reviewed operation."""
+        self.reviewed_conflict()
+        self.review["resolutions"].append(dict(self.review["resolutions"][0]))
+        self.save_review()
+        with self.assertRaisesRegex(ValueError, "Duplicate reviewed resolution path"):
+            self.invoke()
+        self.assert_no_push()
+        self.review["resolutions"].pop()
+        self.review["resolutions"][0]["command"] = "do not execute"
+        self.save_review()
+        with self.assertRaisesRegex(ValueError, "Invalid reviewed resolution entry"):
+            self.invoke()
+        self.assert_no_push()
+
+    def test_reviewed_resolution_checks_checkout_symlinks_after_merge(self):
+        """Even matching regular Git blobs never authorize following a checkout symlink."""
+        self.reviewed_conflict()
+        target = self.root / "must-not-overwrite.txt"
+        target.write_text("untouched\n")
+
+        def replace_checkout(*args, check=True, env=None):
+            result = self.route_git(*args, check=check, env=env)
+            if "merge" in args and "--no-commit" in args:
+                (self.work / "shared.txt").unlink()
+                (self.work / "shared.txt").symlink_to(target)
+            return result
+
+        with patch.object(SYNC, "git", side_effect=replace_checkout):
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                self.invoke()
+        self.assertEqual(target.read_text(), "untouched\n")
+        self.assert_no_push()
+        self.assertFalse((self.work / ".git/MERGE_HEAD").exists())
+
+    def test_reviewed_resolution_data_must_be_regular_nonexecutable_blob(self):
+        """A review file itself cannot be executable or a symlink to another source."""
+        self.reviewed_conflict()
+        (self.work / self.review_path).chmod(0o755)
+        self.publish_fixture_main()
+        with self.assertRaisesRegex(ValueError, "regular 100644 blob"):
+            self.invoke()
+        self.assert_no_push()
+        (self.work / self.review_path).unlink()
+        (self.work / self.review_path).symlink_to(self.root / "outside-review.json")
+        self.publish_fixture_main()
+        with self.assertRaisesRegex(ValueError, "regular 100644 blob"):
+            self.invoke()
+        self.assert_no_push()
+
+    def reviewed_post_merge_tests(self):
+        self.reviewed_conflict()
+        paths = ["packages/coding-agent/test/tools/browser-fixture.test.ts",
+                 "packages/coding-agent/test/tools/browser-added.test.ts"]
+        for path in paths:
+            self.write(self.upstream, path, "upstream regression test\n")
+        self.upstream_sha = self.commit(self.upstream, "upstream browser test changes")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        self.review["upstreamSha"] = self.upstream_sha
+        self.review["postMergeTests"] = []
+        for path in paths:
+            content = "upstream regression test\nreviewed fork regression test\n"
+            self.review["postMergeTests"].append({
+                "path": path,
+                "mergedBlob": self.run_git(self.upstream, "rev-parse", f"HEAD:{path}").stdout.strip(),
+                "content": content,
+                "resolvedSha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            })
+        self.save_review()
+
+    def test_reviewed_post_merge_tests_preserve_pinned_automatic_merge_and_replay(self):
+        """Reviewed regression coverage may extend exact cleanly merged browser tests."""
+        self.reviewed_post_merge_tests()
+        os.environ["GITHUB_STEP_SUMMARY"] = str(self.root / "summary.md")
+        candidate = self.invoke()["candidate_sha"]
+        manifest = json.loads(self.run_git(self.work, "show", f"{candidate}:{SYNC.MANIFEST}").stdout)
+        self.assertEqual(manifest["reviewedConflictResolutions"]["postMergeTestPaths"],
+                         sorted(entry["path"] for entry in self.review["postMergeTests"]))
+        self.assertEqual(manifest["reviewedConflictResolutions"]["resolvedPaths"], ["shared.txt"])
+        summary = (self.root / "summary.md").read_text()
+        for entry in self.review["postMergeTests"]:
+            self.assertEqual(self.run_git(self.work, "show", f"{candidate}:{entry['path']}").stdout, entry["content"])
+            self.assertIn(entry["path"], summary)
+        self.checkout()
+        self.calls.clear()
+        self.assertEqual(self.invoke()["candidate_sha"], candidate)
+        self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
+
+    def test_reviewed_post_merge_tests_reject_changed_staged_blob_before_any_write(self):
+        """Test approval for different automatic merge bytes aborts every reviewed write."""
+        self.reviewed_post_merge_tests()
+        self.review["postMergeTests"][0]["mergedBlob"] = "0" * 40
+        self.save_review()
+        with self.assertRaisesRegex(RuntimeError, "staged blob or mode mismatch"):
+            self.invoke()
+        self.assert_no_push()
+        self.assertFalse((self.work / ".git/MERGE_HEAD").exists())
+        self.assertEqual((self.work / "shared.txt").read_text(), "fork change\n")
+
+    def test_reviewed_post_merge_tests_reject_unrelated_paths_and_duplicate_targets(self):
+        """The post-merge exception cannot edit production code or duplicate a test target."""
+        self.reviewed_post_merge_tests()
+        entry = self.review["postMergeTests"][0]
+        original_path = entry["path"]
+        entry["path"] = "packages/coding-agent/src/tools/browser/browser-fixture.test.ts"
+        self.save_review()
+        with self.assertRaisesRegex(ValueError, "post-merge test path"):
+            self.invoke()
+        self.assert_no_push()
+        entry["path"] = original_path
+        self.review["postMergeTests"].append(dict(entry))
+        self.save_review()
+        with self.assertRaisesRegex(ValueError, "post-merge test path"):
+            self.invoke()
+        self.assert_no_push()
+
+    def test_reviewed_post_merge_tests_reject_executable_mode_and_changed_output(self):
+        """Post-merge test edits require both regular stage-zero mode and exact reviewed output."""
+        self.reviewed_post_merge_tests()
+        entry = self.review["postMergeTests"][0]
+        original_content = entry["content"]
+        entry["content"] = "unreviewed replacement\n"
+        self.save_review()
+        with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+            self.invoke()
+        self.assert_no_push()
+        entry["content"] = original_content
+        (self.upstream / entry["path"]).chmod(0o755)
+        self.upstream_sha = self.commit(self.upstream, "upstream executable mode")
+        self.run_git(self.upstream, "tag", "-f", "v1.1.0")
+        self.review["upstreamSha"] = self.upstream_sha
+        self.save_review()
+        with self.assertRaisesRegex(RuntimeError, "staged blob or mode mismatch"):
+            self.invoke()
+        self.assert_no_push()
 
     def test_merge_preserves_history_fork_files_workflow_boundary_and_scoped_push(self):
         """Consumers get the exact two-parent source merge, without enabling upstream CI."""
