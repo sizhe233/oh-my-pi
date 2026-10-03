@@ -154,6 +154,7 @@ function snapshot(tab) {
     url: tab.url ?? tab.pendingUrl ?? "",
     title: tab.title ?? "",
     active: tab.active,
+    discarded: tab.discarded === true,
     windowId: tab.windowId,
     pinned: tab.pinned,
     groupId: tab.groupId
@@ -243,6 +244,7 @@ async function buildHello() {
     instanceId: await ensureInstanceId(),
     userAgent: navigator.userAgent,
     browserVersion: versionMatch?.[0] ?? "Chrome/unknown",
+    discardedTabsProtocol: 1,
     tabs: snapshots,
     attachedTabIds,
     ownedTabIds: snapshots.filter((snap) => created.has(snap.tabId)).map((snap) => snap.tabId)
@@ -398,6 +400,13 @@ chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
   const snap = snapshot(tab);
   if (snap)
     post({ t: "tabUpdated", tab: snap });
+});
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId).then((tab) => {
+    const snap = snapshot(tab);
+    if (snap)
+      post({ t: "tabUpdated", tab: snap });
+  }).catch(() => {});
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   screenshotCapture.detach({ tabId });
