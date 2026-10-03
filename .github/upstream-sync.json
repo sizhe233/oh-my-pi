@@ -1,28 +1,15 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.5.1",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.5.1",
-  "releaseId": 402504778,
-  "publishedAt": "2026-10-03T12:30:49Z",
-  "upstreamSha": "d0cc52397dc2a68d39cba49b0009b9e50ffd643e",
-  "baseSha": "94a0f1e2ddb8aef927487a15ec3197eb466adb99",
-  "mergeBaseSha": "9348320cc4a30a7195d36a1f05a6c11bcb701a17",
-  "branch": "sync/upstream-v18.5.1",
+  "releaseTag": "v18.6.0",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.6.0",
+  "releaseId": 402708733,
+  "publishedAt": "2026-10-03T22:06:50Z",
+  "upstreamSha": "89d2610993af69427574bde17791df63906ec4e5",
+  "baseSha": "dfa9c60f8ea51d4e18bbdf143b76b2718a24d8bb",
+  "mergeBaseSha": "d0cc52397dc2a68d39cba49b0009b9e50ffd643e",
+  "branch": "sync/upstream-v18.6.0",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
   "upstreamWorkflowChanges": [],
-  "reviewedConflictResolutions": {
-    "path": ".github/upstream-resolutions/v18.5.1.json",
-    "blob": "8a2ed80dc0523138aa511ce4ef12c026bb7c2a49",
-    "resolvedPaths": [
-      "packages/coding-agent/src/tools/browser/attach.ts",
-      "packages/coding-agent/src/tools/browser/relay/bridge.ts",
-      "packages/coding-agent/src/tools/browser/tab-supervisor.ts",
-      "packages/coding-agent/test/tools/browser-relay-bridge.test.ts"
-    ],
-    "postMergeTestPaths": [
-      "packages/coding-agent/test/tools/browser-attach.test.ts",
-      "packages/coding-agent/test/tools/browser-shared-wedge.test.ts"
-    ]
-  }
+  "reviewedConflictResolutions": null
 }
