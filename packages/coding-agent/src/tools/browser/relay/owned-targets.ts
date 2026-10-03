@@ -62,25 +62,14 @@ async function sendRootCommand(
 }
 
 /**
- * Close a relay tab this process created. True when the relay confirms the
- * close or the target no longer exists; false on transport failure.
+ * Close a relay tab this process created. True only when the relay confirms
+ * the close. Discovery is filtered (including while an extension is offline),
+ * so an absent target cannot prove closure or justify forgetting ownership.
  */
 export async function closeRelayTarget(wsEndpoint: string, targetId: string): Promise<boolean> {
 	try {
 		const result = await sendRootCommand(wsEndpoint, "Target.closeTarget", { targetId });
-		if (result.success === true) return true;
-	} catch {
-		// Already closed (unknown target) or transport failure: confirm below.
-	}
-	try {
-		const { targetInfos } = await sendRootCommand(wsEndpoint, "Target.getTargets", {});
-		return (
-			Array.isArray(targetInfos) &&
-			!targetInfos.some(
-				(info: unknown) =>
-					typeof info === "object" && info !== null && "targetId" in info && info.targetId === targetId,
-			)
-		);
+		return result.success === true;
 	} catch {
 		return false;
 	}
