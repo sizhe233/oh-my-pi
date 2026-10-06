@@ -500,6 +500,214 @@ describe("RelayBridge tab grouping", () => {
 	});
 });
 
+describe("RelayBridge child targets", () => {
+	async function armAutoAttach(
+		bridge: RelayBridge,
+		ext: FakeExtSocket,
+		connId: number,
+		sessionId: string,
+		outcome: "ok" | "fail" = "ok",
+	): Promise<void> {
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		if (outcome === "ok") ack(bridge, ext, "send");
+		else nack(bridge, ext, "send", "Target.setAutoAttach failed");
+		await flush();
+	}
+
+	const ATTACH = {
+		method: "Target.attachedToTarget",
+		params: { sessionId: "CHILD1", targetInfo: { targetId: "FRAME1", type: "iframe" } },
+	};
+	const NAVIGATE = { sessionId: "CHILD1", method: "Page.frameNavigated", params: {} };
+	const DETACH = { method: "Target.detachedFromTarget", params: { sessionId: "CHILD1" } };
+
+	function emit(bridge: RelayBridge, ext: FakeExtSocket, ...events: object[]): void {
+		for (const event of events) bridge.extMessage(ext, JSON.stringify({ t: "cdpEvent", tabId: 1, ...event }));
+	}
+
+	function childTraffic(socket: FakeCdpSocket): Array<[unknown, unknown]> {
+		return socket.messages
+			.filter(
+				m => m.sessionId === "CHILD1" || (m.params as { sessionId?: string } | undefined)?.sessionId === "CHILD1",
+			)
+			.map(m => [m.method, m.sessionId]);
+	}
+
+	const lifecycleOn = (sessionId: string): Array<[string, string]> => [
+		["Target.attachedToTarget", sessionId],
+		["Page.frameNavigated", "CHILD1"],
+		["Target.detachedFromTarget", sessionId],
+	];
+
+	it("announces a real child target only to the page session that armed auto-attach", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const armed = await attachPage(bridge, ext, cdp, conn, 1);
+		await armAutoAttach(bridge, ext, conn, armed);
+		await attachPage(bridge, ext, cdp, conn, 1);
+		const otherCdp = new FakeCdpSocket();
+		await attachPage(bridge, ext, otherCdp, bridge.cdpConnected(otherCdp), 1);
+
+		emit(bridge, ext, ATTACH, NAVIGATE, DETACH);
+
+		expect(childTraffic(cdp)).toEqual(lifecycleOn(armed));
+		expect(childTraffic(otherCdp)).toEqual([]);
+	});
+
+	it("keeps a child on the first armed session of its connection, even after that session is released", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const first = await attachPage(bridge, ext, cdp, conn, 1);
+		await armAutoAttach(bridge, ext, conn, first);
+		const second = await attachPage(bridge, ext, cdp, conn, 1);
+		await armAutoAttach(bridge, ext, conn, second);
+
+		emit(bridge, ext, ATTACH);
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId: first } }),
+		);
+		await flush();
+		emit(bridge, ext, NAVIGATE, DETACH);
+
+		expect(childTraffic(cdp)).toEqual(lifecycleOn(first));
+	});
+
+	it("does not report children to a session whose Target.setAutoAttach failed", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		// Another connection already armed the tab, so Chrome will report children.
+		const otherCdp = new FakeCdpSocket();
+		const other = bridge.cdpConnected(otherCdp);
+		const otherSession = await attachPage(bridge, ext, otherCdp, other, 1);
+		await armAutoAttach(bridge, ext, other, otherSession);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const failed = await attachPage(bridge, ext, cdp, conn, 1);
+		await armAutoAttach(bridge, ext, conn, failed, "fail");
+
+		emit(bridge, ext, ATTACH, NAVIGATE, DETACH);
+
+		expect(childTraffic(cdp)).toEqual([]);
+		expect(childTraffic(otherCdp)).toEqual(lifecycleOn(otherSession));
+	});
+
+	it("keeps a borrowed tab claimed after its temporary claim session detaches without duplicating child events", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const owner = new FakeCdpSocket();
+		const ownerConn = bridge.cdpConnected(owner);
+		const pageSession = await attachPage(bridge, ext, owner, ownerConn, 1);
+		await armAutoAttach(bridge, ext, ownerConn, pageSession);
+		const claimSession = await attachPage(bridge, ext, owner, ownerConn, 1);
+		bridge.cdpMessage(
+			ownerConn,
+			JSON.stringify({ id: ++msgSeq, sessionId: claimSession, method: "OMP.claimTarget" }),
+		);
+		await flush();
+		emit(bridge, ext, ATTACH);
+		bridge.cdpMessage(
+			ownerConn,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId: claimSession } }),
+		);
+		await flush();
+
+		const other = new FakeCdpSocket();
+		const otherConn = bridge.cdpConnected(other);
+		const otherSession = await attachPage(bridge, ext, other, otherConn, 1);
+		const conflictId = ++msgSeq;
+		bridge.cdpMessage(
+			otherConn,
+			JSON.stringify({ id: conflictId, sessionId: otherSession, method: "OMP.claimTarget" }),
+		);
+		await flush();
+		emit(bridge, ext, NAVIGATE, DETACH);
+
+		expect(other.messages.find(message => message.id === conflictId)?.error).toMatchObject({
+			message: expect.stringContaining("already driven by another omp session"),
+		});
+		expect(childTraffic(owner)).toEqual(lifecycleOn(pageSession));
+		expect(childTraffic(other)).toEqual([]);
+	});
+
+	it("keeps an owned handoff protected from reaping and routes children after the temporary claim session closes", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const supervisor = new FakeCdpSocket();
+		const supervisorConn = bridge.cdpConnected(supervisor);
+		bridge.cdpMessage(supervisorConn, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 1 }) });
+		await flush();
+		const worker = new FakeCdpSocket();
+		const workerConn = bridge.cdpConnected(worker);
+		const pageSession = await attachPage(bridge, ext, worker, workerConn, 1);
+		await armAutoAttach(bridge, ext, workerConn, pageSession);
+		const claimSession = await attachPage(bridge, ext, worker, workerConn, 1);
+		const handoffId = ++msgSeq;
+		bridge.cdpMessage(
+			workerConn,
+			JSON.stringify({
+				id: handoffId,
+				sessionId: claimSession,
+				method: "OMP.claimTarget",
+				params: { ownsTarget: true },
+			}),
+		);
+		await flush();
+		expect(worker.messages.find(message => message.id === handoffId)?.result).toEqual({});
+		emit(bridge, ext, ATTACH);
+		bridge.cdpMessage(
+			workerConn,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId: claimSession } }),
+		);
+		await flush();
+		bridge.cdpClosed(supervisorConn);
+
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		const closeOwned = () => {
+			const id = ++msgSeq;
+			bridge.cdpMessage(
+				reaperConn,
+				JSON.stringify({ id, method: "OMP.closeOwnedTarget", params: { targetId: `PAGE${ANON}.1` } }),
+			);
+			return id;
+		};
+		const whileHeld = closeOwned();
+		await flush();
+		expect(reaper.messages.find(message => message.id === whileHeld)?.result).toEqual({ closed: false });
+		expect(ext.rpcs("removeTab")).toEqual([]);
+		emit(bridge, ext, NAVIGATE, DETACH);
+		expect(childTraffic(worker)).toEqual(lifecycleOn(pageSession));
+
+		bridge.cdpClosed(workerConn);
+		ack(bridge, ext, "detach");
+		await flush();
+		const afterRelease = closeOwned();
+		expect(ext.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([1]);
+		ack(bridge, ext, "removeTab");
+		await flush();
+		expect(reaper.messages.find(message => message.id === afterRelease)?.result).toEqual({ closed: true });
+	});
+});
+
 describe("RelayBridge Runtime sessions", () => {
 	it("virtualizes Runtime enable state for each pseudo-session", async () => {
 		const bridge = new RelayBridge({});

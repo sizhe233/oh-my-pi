@@ -1,15 +1,28 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { applyIgnoreHttpsErrors, resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
-import { buildHeadlessLaunchArgs } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
-import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import {
+	buildHeadlessLaunchArgs,
+	launchHeadlessBrowser,
+	removeUserDataDir,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import {
+	forgetSharedTarget,
+	recordSharedTarget,
+	type SharedTargetScope,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
+import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import * as relayOwnedTargets from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
+import { acquireTab, getTab, releaseAllTabs, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
-import type { Page } from "puppeteer-core";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import type { Page, Target } from "puppeteer-core";
+import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -30,8 +43,8 @@ function browserHost(cwd: string = process.cwd()) {
 		}),
 	};
 	const prelude = createBrowserPrelude(session);
-	return (parameters: unknown) =>
-		prelude.invoke(parameters, { session, toolCallId: `browser-open-options-${crypto.randomUUID()}` });
+	return (parameters: unknown, signal?: AbortSignal) =>
+		prelude.invoke(parameters, { session, toolCallId: `browser-open-options-${crypto.randomUUID()}`, signal });
 }
 
 function returnedValue(result: { details?: unknown }): unknown {
@@ -93,6 +106,118 @@ describe("browser open options CDP helpers", () => {
 });
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
+	it.each([
+		["failure", false],
+		["failure", true],
+		["cancellation", false],
+		["cancellation", true],
+	] as const)(
+		"rolls back a relay open after %s, closing only its owned target (ownsTarget=%s)",
+		async (outcome, ownsTarget) => {
+			// Real Chromium and workers exercise attach-mode ownership through post-init
+			// navigation. The relay-kind handle selects the fork's fresh/adopted paths;
+			// this deliberately does not claim extension, focus, or tab-group coverage.
+			const launched = await launchHeadlessBrowser({ headless: true });
+			const browser = launched.browser;
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-open-rollback-"));
+			const scope: SharedTargetScope = { projectDir: root, runtimeDir: root, daemonName: "relay-open" };
+			const scopeSpy = spyOn(relayOwnedTargets, "relayTargetScope").mockReturnValue(scope);
+			const name = `relay-rollback-${crypto.randomUUID()}`;
+			const cdpUrl = `http://${new URL(browser.wsEndpoint()).host}`;
+			const handle: PuppeteerBrowserHandle = {
+				key: name,
+				kind: { kind: "relay", cdpUrl },
+				cdpUrl,
+				browser,
+				// The fixture keeps its observation connection through the open's rollback.
+				refCount: 1,
+				stealth: { browserSession: null, override: null },
+			};
+			const requested = Promise.withResolvers<void>();
+			const answer = Promise.withResolvers<void>();
+			const server = Bun.serve({
+				port: 0,
+				async fetch() {
+					requested.resolve();
+					await answer.promise;
+					return new Response("<title>late</title>", { headers: { "content-type": "text/html" } });
+				},
+			});
+			const url = server.url.href;
+			if (outcome === "failure") await server.stop(true);
+			const controller = new AbortController();
+			const ownershipFile = Bun.file(path.join(root, `${scope.daemonName}.targets`, `${process.pid}.json`));
+			const ownedTargets = async (): Promise<string[]> => {
+				// Join the registry's write chain before reading a fire-and-forget update.
+				const probe = `probe-${crypto.randomUUID()}`;
+				await recordSharedTarget(scope, probe);
+				const record: { targets: string[] } = await ownershipFile.json();
+				await forgetSharedTarget(scope, probe);
+				return record.targets.filter(id => id !== probe);
+			};
+			try {
+				const borrowed = await browser.newPage();
+				await borrowed.goto(`data:text/html,<title>${name}</title>`);
+				const client = await browser.target().createCDPSession();
+				const pageTargets = async () =>
+					(await client.send("Target.getTargets")).targetInfos
+						.filter(target => target.type === "page")
+						.map(target => target.targetId)
+						.sort();
+				const before = await pageTargets();
+				const created: Target[] = [];
+				browser.on("targetcreated", target => {
+					if (target.type() === "page") created.push(target);
+				});
+				const open = rejectionOf(
+					acquireTab(name, handle, {
+						url,
+						target: ownsTarget ? undefined : name,
+						signal: controller.signal,
+						timeoutMs: 15_000,
+					}),
+				);
+				if (outcome === "cancellation") {
+					await Promise.race([
+						requested.promise,
+						open.then(error => {
+							throw error;
+						}),
+					]);
+					const navigating = getTab(name);
+					if (!navigating) throw new Error("Expected the navigating relay tab to be registered");
+					expect(navigating.state).toBe("alive");
+					expect(await ownedTargets()).toEqual(ownsTarget ? [navigating.targetId] : []);
+					controller.abort();
+				}
+				const error = await open;
+				if (outcome === "cancellation") expect(error).toBeInstanceOf(ToolAbortError);
+				else expect(error).toMatchObject({ message: expect.stringContaining("net::ERR_CONNECTION_REFUSED") });
+				expect(getTab(name)).toBeUndefined();
+				expect(created).toHaveLength(ownsTarget ? 1 : 0);
+				expect(await pageTargets()).toEqual(before);
+				expect(borrowed.isClosed()).toBe(false);
+				expect(handle.refCount).toBe(1);
+				expect(await ownedTargets()).toEqual([]);
+				await client.detach();
+			} finally {
+				controller.abort();
+				answer.resolve();
+				try {
+					await releaseTab(name, { kill: false });
+					await ownedTargets();
+				} finally {
+					scopeSpy.mockRestore();
+					await server.stop(true);
+					await browser.close();
+					if (launched.userDataDir) await removeUserDataDir(launched.userDataDir);
+					await fs.rm(root, { recursive: true, force: true });
+				}
+			}
+		},
+		30_000,
+	);
+
 	it("applies open and runtime init scripts across navigations", async () => {
 		const invoke = browserHost();
 		const name = `init-${crypto.randomUUID()}`;
@@ -188,6 +313,145 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		}
 	});
 
+	it("keeps the tab on what loaded when the page outlasts the open timeout", async () => {
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				// The image never answers, so the page never fires `load`.
+				if (new URL(request.url).pathname === "/hang.png") return new Promise<Response>(() => {});
+				return new Response('<title>slow</title><p>partial</p><img src="/hang.png">', {
+					headers: { "content-type": "text/html" },
+				});
+			},
+		});
+		try {
+			const invoke = browserHost();
+			const name = `slow-${crypto.randomUUID()}`;
+			const open = () => rejectionOf(invoke({ action: "open", name, url: server.url.href, timeout: 3 }));
+			const keptTab = { message: expect.stringContaining(`browser.tab(${JSON.stringify(name)})`) };
+			// The first open creates the tab; the second reuses the one it kept.
+			expect(await open()).toMatchObject(keptTab);
+			expect(await open()).toMatchObject(keptTab);
+			expect(
+				returnedValue(
+					await invoke({
+						action: "run",
+						name,
+						code: "return { url: tab.url(), text: await tab.evaluate(() => document.body.innerText) };",
+					}),
+				),
+			).toEqual({ url: server.url.href, text: "partial" });
+		} finally {
+			server.stop(true);
+		}
+	}, 20_000);
+
+	it("closes the tab its open created when the navigation fails outright, but keeps a reused one", async () => {
+		const refused = Bun.serve({ port: 0, fetch: () => new Response("") });
+		const url = refused.url.href;
+		refused.stop(true);
+		const invoke = browserHost();
+		const tabNames = async () =>
+			(returnedValue(await invoke({ action: "tabs" })) as Array<{ name: string }>).map(tab => tab.name);
+		const name = `refused-${crypto.randomUUID()}`;
+		const keptNote = `browser.tab(${JSON.stringify(name)})`;
+
+		const fresh = await rejectionOf(invoke({ action: "open", name, url }));
+		expect(fresh).toMatchObject({ message: expect.stringContaining("net::ERR_CONNECTION_REFUSED") });
+		expect(fresh).not.toMatchObject({ message: expect.stringContaining(keptNote) });
+		expect(getTab(name)).toBeUndefined();
+		expect(await tabNames()).not.toContain(name);
+
+		await invoke({ action: "open", name, url: "data:text/html,<title>kept</title>" });
+		expect(await rejectionOf(invoke({ action: "open", name, url }))).toMatchObject({
+			message: expect.stringContaining(keptNote),
+		});
+		expect(getTab(name)?.state).toBe("alive");
+		expect(await tabNames()).toContain(name);
+	});
+
+	it("closes the tab its open created when the open is cancelled during navigation", async () => {
+		const requested = Promise.withResolvers<void>();
+		const answer = Promise.withResolvers<void>();
+		const server = Bun.serve({
+			port: 0,
+			async fetch() {
+				requested.resolve();
+				// Held until after the cancel, so the navigation is still pending then.
+				await answer.promise;
+				return new Response("<title>late</title>", { headers: { "content-type": "text/html" } });
+			},
+		});
+		try {
+			const invoke = browserHost();
+			const name = `cancelled-${crypto.randomUUID()}`;
+			const controller = new AbortController();
+			const open = rejectionOf(invoke({ action: "open", name, url: server.url.href }, controller.signal));
+			await requested.promise;
+			const cancelled = getTab(name);
+			expect(cancelled?.state).toBe("alive");
+			controller.abort();
+			expect(await open).toBeInstanceOf(ToolAbortError);
+			// A cancelled run may only unwind once the pending document answers.
+			answer.resolve();
+			// Opens of one name run in order, so this one starts after the
+			// cancelled open finished unwinding, and finds no tab to reuse.
+			const reopened = await invoke({ action: "open", name });
+			expect(reopened.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/^Opened tab /) })]);
+			expect(getTab(name)).not.toBe(cancelled);
+		} finally {
+			server.stop(true);
+		}
+	}, 20_000);
+
+	it("reports where a download was saved when another tab set a different downloads directory", async () => {
+		const payload = new TextEncoder().encode("download payload\n");
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				if (new URL(request.url).pathname === "/file") {
+					return new Response(payload, {
+						headers: {
+							"content-type": "application/octet-stream",
+							"content-disposition": 'attachment; filename="fixture.bin"',
+						},
+					});
+				}
+				return new Response('<a id="download" href="/file">download</a>', {
+					headers: { "content-type": "text/html" },
+				});
+			},
+		});
+		const first = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		const second = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
+		tempDirs.push(first, second);
+		try {
+			const invoke = browserHost();
+			const name = `download-${crypto.randomUUID()}`;
+			await invoke({ action: "open", name, url: server.url.href, downloads: first });
+			await invoke({
+				action: "open",
+				name: `download-${crypto.randomUUID()}`,
+				url: server.url.href,
+				downloads: second,
+			});
+			const download = returnedValue(
+				await invoke({
+					action: "run",
+					name,
+					code: [
+						"const pending = tab.waitForDownload({ timeout: 5000 });",
+						"await tab.evaluate(() => document.querySelector('#download').click());",
+						"return await pending;",
+					].join("\n"),
+				}),
+			) as { path: string };
+			expect(new Uint8Array(await Bun.file(download.path).arrayBuffer())).toEqual(payload);
+		} finally {
+			server.stop(true);
+		}
+	});
+
 	it("waits for a completed download and records its bytes", async () => {
 		const payload = new TextEncoder().encode("download payload\n");
 		const server = Bun.serve({
@@ -231,6 +495,48 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			expect(
 				returnedValue(await invoke({ action: "call", name, chain: [{ method: "downloads", args: [] }] })),
 			).toEqual([download]);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("tracks a download started right after waitForDownload on a tab opened without a downloads directory", async () => {
+		const payload = new TextEncoder().encode("download payload\n");
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				if (new URL(request.url).pathname === "/file") {
+					return new Response(payload, {
+						headers: {
+							"content-type": "application/octet-stream",
+							"content-disposition": 'attachment; filename="fixture.bin"',
+						},
+					});
+				}
+				return new Response('<a id="download" href="/file">download</a>', {
+					headers: { "content-type": "text/html" },
+				});
+			},
+		});
+		try {
+			const invoke = browserHost();
+			const name = `download-${crypto.randomUUID()}`;
+			await invoke({ action: "open", name, url: server.url.href });
+			const download = returnedValue(
+				await invoke({
+					action: "run",
+					name,
+					code: [
+						"const pending = tab.waitForDownload({ timeout: 3000 });",
+						"await tab.evaluate(() => document.querySelector('#download').click());",
+						"return await pending;",
+					].join("\n"),
+				}),
+			) as { path: string; bytes: number };
+			tempDirs.push(path.dirname(download.path));
+			expect(path.dirname(download.path)).toStartWith(path.join(os.tmpdir(), "omp-downloads-"));
+			expect(download.bytes).toBe(payload.byteLength);
+			expect(new Uint8Array(await Bun.file(download.path).arrayBuffer())).toEqual(payload);
 		} finally {
 			server.stop(true);
 		}
