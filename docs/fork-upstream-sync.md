@@ -184,3 +184,50 @@ The new relay and extension both require discarded-tabs protocol version 1.
 Files matching on disk do not prove that the running browser loaded them.
 User-computer installation and manual extension reload remain separate authorized
 actions; this synchronization only delivers verified packages.
+
+## Reviewed v18.6.3 compatibility changes (2026-10-06)
+
+The version-specific review data pins official commit
+`093275112f7adff207608673c0e33c7f3d16e27f`, merge base
+`2a2c6dcbbb558c0f8145f67f28b3370984f2bf60`, and all three input blobs for
+six overlapping files. This data authorizes only their reviewed combined bytes;
+the importer safety contracts, temporary-token boundary and workflow files are
+unchanged. The candidate still requires all read-only platform validations before
+its normal protected-main PR merge.
+
+- Keep fork claim exclusivity, session labels and provisional ownership handoff,
+  while satisfying the upstream relay forwarding success/failure contract used
+  by cross-origin iframe auto-attach and nested child-session routing.
+- Keep the exported global relay scope and default daemon name, while preserving
+  upstream per-port daemon identity so different relay ports do not replace each
+  other.
+- Keep ownership-only orphan recording, fresh background relay tabs, owned-target
+  focus emulation and cleanup, while preserving upstream post-initialization
+  navigation and back/forward-cache element invalidation.
+- Retain both the fork same-name/different-target regression and the upstream
+  refused-websocket error regression. Add pinned, observable composition tests
+  for temporary claim sessions, child routing and owned-versus-borrowed targets
+  during failed or cancelled open navigation.
+- Regenerate the embedded extension from the combined source. Its new debugger
+  ownership probe coexists with fork background creation, minimized screenshots,
+  session-owned IDs, group cleanup and reconnect handling.
+
+The v18.6.1 to v18.6.3 range includes 569 upstream commits and 599 changed files.
+There are no upstream `.github` or workflow changes in this range. v18.6.2 has a
+Git tag but no published stable release; its commits are included through the
+published v18.6.3 history. No upstream workflow is enabled by this review.
+
+Local checks use Bun 1.4.2, frozen dependencies and the official same-version
+Linux native addon only for preliminary tests. They do not substitute for the
+clean source-built macOS arm64 and Windows x64 candidates, compiled CLI smoke,
+installer checks, or Windows real-extension and minimized-window evidence.
+Cloud host socket restrictions prevent local Chromium/Unix-socket acceptance;
+those skipped or blocked checks must be reported and verified on the CI runners.
+
+Upgrade the CLI, native addon, relay and extension together. The upstream desktop
+adapter now rejects an outdated native addon rather than simulating missing new
+methods. Noninteractive session restore fails closed for unavailable models;
+SDK callers must account for the queued-message withdrawal rename, asynchronous
+`isoResolve`, and the snapcompact/TUI API changes. The macOS capture helper uses
+macOS 14+ APIs; that helper requirement is not a claim that the entire CLI now
+requires macOS 14. User-device installation and extension reload remain separate.
