@@ -255,3 +255,25 @@ branch was exercised. Rust core comparison/key tests do not depend on host
 locale installation; any unexecuted Cargo tests must still be disclosed. No
 workflow, token permission, release publishing, or device installation change
 is required for this compatibility repair.
+
+## Reviewed v18.7.0 compatibility changes (2026-10-06)
+
+The review pins official `e0fc1cf4ea354b445a359b37fa5eb58deaa85598`,
+merge base `093275112f7adff207608673c0e33c7f3d16e27f`, and the exact
+three-way inputs for `sort.rs`, the relay bridge, and its regression suite.
+This is prerequisite review data, not a claim that the release has been imported.
+
+- Retain fork tab ownership, claims, grouping, background/minimized behavior and
+  orphan protection while adopting upstream child-session replay and detach cleanup.
+- Exercise the combined path where an iframe predates the owning worker, a
+  temporary claim hands off, and repeated auto-attach must not duplicate events.
+- Adopt upstream's equivalent quaternary sort fix without losing the fork's
+  deterministic sort-key, explicit-filter and compiled-native smoke contracts.
+- Use upstream's new in-memory native archive/manifest embedding. Existing fork
+  builds request explicit native targets, so the aggregate target rename requires
+  no workflow change. Clean candidate and final-SHA package builds remain required.
+
+Upstream changes to `bazel-cache-warm.yml`, `bun-cache-warm.yml`, and `ci.yml`
+are deliberately excluded from the fork workflow tree and recorded by the importer.
+No permissions, publishing, branch protection, or user-computer installation changes
+are part of this review.
