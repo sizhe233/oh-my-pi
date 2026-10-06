@@ -34,6 +34,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 | F4 | 最小化窗口：指定建页窗口、等帧上限、截图期间保持渲染且不恢复窗口 | 见变更记录 | `packages/browser-relay/extension/background.ts`（`tabWindowId`）、`packages/browser-relay/extension/screenshot-capture.ts`、`packages/browser-relay/extension/chrome.d.ts`、`screenshot.ts`（`waitForRenderFrame`）、`relay/bridge.ts`（CDP 超时方法名）、`scripts/fork-browser-minimized-e2e.ts`、`relay/extension-assets/*` |
 | F5 | 会话崩溃残留回收、`app.target` 同名复用报错、扩展重连降噪 | 见变更记录 | `relay/owned-targets.ts`（`relayTargetScope`、`closeRelayTarget`、`closeRelayOwnedTarget`）、`relay/bridge.ts`（`ompCreated`、`OMP.closeOwnedTarget`）、`relay/protocol.ts`（hello `ownedTabIds`）、`orphan-registry.ts`（`runtimeDir`、可注入关闭函数）、`registry.ts`（relay 连接时回收）、`tab-supervisor.ts`（`attachTarget`、`sharedScopeOf`、`closeTargetById`）、`packages/browser-relay/extension/background.ts`（`ompCreatedTabIds`、`relayListening`、单一重连定时器）、`relay/extension-assets/*` |
 | F6 | 多个浏览器实例连 relay 时，新建标签只发给有标签（有窗口）的实例 | 见变更记录 | `relay/bridge.ts`（`#instanceForNewTab`） |
+| F7 | UTF-8 locale 下 native `sort -u` 保留标点/空白差异，显式 key/过滤模式语义不变 | 见 2026-10-06 兼容修复 | `crates/pi-builtins/src/sort.rs`、`packages/coding-agent/src/cli/smoke-native-sort.ts` |
 
 2026-10-06 的 v18.6.3 兼容审阅将 F1–F6 与上游导航、BFCache、子 target 路由及按端口 daemon 标识组合；不新增或删减 fork 行为，精确审阅输入与输出记录在 `.github/upstream-resolutions/v18.6.3.json`。
 
@@ -41,7 +42,7 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 
 ### 必须保持的行为
 
-v18.6.3 兼容验证另检查：打开过程导航失败或取消时只关闭本次新建的自有标签，借用标签保留；临时 claim session 关闭后互斥、所有权交接及上游子 frame 路由同时成立。以下 1–11 均继续有效。
+v18.6.3 兼容验证另检查：打开过程导航失败或取消时只关闭本次新建的自有标签，借用标签保留；临时 claim session 关闭后互斥、所有权交接及上游子 frame 路由同时成立。以下 1–11 均继续有效。另有 F7 native sort 契约：UTF-8 locale 的默认及显式 key 去重保留标点差异，`-d`/`-f`/`-n` 仍按用户选择合并等价 key，`-s` 保持相等 key 的输入顺序；由编译产物 `--smoke-test` 检查。
 
 合并上游或修改上述文件后，下列行为都必须仍然成立：
 
@@ -208,3 +209,9 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 为官方 v18.6.3 的六个冲突文件建立版本、merge base 与三方 blob 全固定的组合审阅数据；保留上游真实历史与完整 fork workflow 树，不修改导入器权限或放宽安全检查。（F1–F6）
 - 组合 fork 自有标签/claim/分组/回收与上游导航移出 worker init、BFCache 缓存失效、iframe 子会话路由及 relay daemon 按端口隔离；扩展从合并源码重新生成。（F1、F2、F4、F5）
 - 增加临时 claim session 与子 target 路由、导航失败/取消时自有与借用标签生命周期的可观察回归。协议测试不代替真实扩展和全窗口最小化 CI，更不代表已安装到用户电脑或已重载用户 Chrome 扩展。（F3）
+
+### 2026-10-06：native sort locale 兼容修复
+
+- 上游 issue [#14606](https://github.com/can1357/oh-my-pi/issues/14606) 报告 `LANG=en_US.UTF-8` 下 native `sort -u` 将四条仅标点不同的路径错误合并成一条；本次使用官方 18.6.3 Linux x64 addon 独立复现了连续两次输出 1（成功退出），两个按命令 C-locale 控制与 `/usr/bin/sort` 均输出 4。同步得到的 fork 源码包含相同 comparator。
+- 同上游修复 [PR #14610](https://github.com/can1357/oh-my-pi/pull/14610) 的生产策略一致：保留 ICU shifted collation，显式启用第 4 级 Quaternary 权重，使标点/空白差异不再被默认去重忽略。保留 locale 的字母/重音/大小写优先级、显式 key 唯一性及 `-d`/`-f`/`-n`/`-s` 行为；不改用户全局 locale，不声称所有 Unicode 字节差异或各 locale 都与 GNU 完全一致。
+- Rust 回归直接验证 comparator 与预计算 key 的非等价和相同排序方向，不依赖系统是否安装 locale；宿主集成另检查默认/显式 key 去重和过滤模式。现有 `--smoke-test` 增加连续调用、显式 key、过滤/数值/稳定排序及 C→locale 切换控制，验证实际编译产物使用的 native addon；所有 fork workflow 内容与权限保持不变。

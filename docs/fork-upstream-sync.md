@@ -231,3 +231,27 @@ SDK callers must account for the queued-message withdrawal rename, asynchronous
 `isoResolve`, and the snapcompact/TUI API changes. The macOS capture helper uses
 macOS 14+ APIs; that helper requirement is not a claim that the entire CLI now
 requires macOS 14. User-device installation and extension reload remain separate.
+
+## v18.6.3 native sort compatibility correction
+
+Post-sync validation reproduced upstream issue [#14606](https://github.com/can1357/oh-my-pi/issues/14606)
+with the official same-version Linux native addon: under `LANG=en_US.UTF-8`,
+with `LC_ALL` and `LC_COLLATE` unset, both calls to native `sort -u` retained one
+of four punctuation-distinct paths while exiting successfully. Per-command
+`LC_COLLATE=C`, `LC_ALL=C`, and the system sort retained all four.
+
+The fork correction matches the production strategy of upstream [PR #14610](https://github.com/can1357/oh-my-pi/pull/14610):
+it retains shifted locale collation and explicitly includes its quaternary
+punctuation/space weights. It does not add a whole-line byte
+fallback to unique key comparison, alter the caller's global locale, or claim
+complete GNU/Unicode equivalence. Canonically equivalent or locale-tailored
+strings may still compare equal. Explicit key selection, dictionary/case/numeric
+modes and stable ordering retain their existing contracts.
+
+The existing compiled CLI smoke entry now exercises these native contracts and
+reports whether real `en_US.UTF-8` collation or the host's unavailable-locale byte
+fallback was used. macOS/Windows release verification must confirm the locale
+branch was exercised. Rust core comparison/key tests do not depend on host
+locale installation; any unexecuted Cargo tests must still be disclosed. No
+workflow, token permission, release publishing, or device installation change
+is required for this compatibility repair.

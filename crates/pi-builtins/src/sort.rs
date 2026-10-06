@@ -2568,7 +2568,7 @@ use ext_sort::ext_sort;
 use foldhash::{HashMap, SharedSeed, fast::FoldHasher};
 use icu_collator::{
 	CollatorBorrowed,
-	options::{AlternateHandling, CollatorOptions},
+	options::{AlternateHandling, CollatorOptions, Strength},
 };
 use icu_decimal::provider::{Baked, DecimalSymbolsV1};
 use icu_locale_core::Locale;
@@ -3976,14 +3976,21 @@ fn shell_collator(host: &Host) -> Option<Arc<CollatorBorrowed<'static>>> {
 	if !utf8 || locale_failed_to_set(host) {
 		return None;
 	}
+	collator_for_locale(locale)
+}
+
+fn collator_for_locale(locale: Locale) -> Option<Arc<CollatorBorrowed<'static>>> {
 	COLLATORS
 		.lock()
 		.entry(locale)
 		.or_insert_with_key(|locale| {
 			// Shifted alternate handling makes spaces and punctuation matter only
-			// on ties, like glibc's collation (uucore's setting).
+			// on ties, like glibc's collation (uucore's setting). Those weights
+			// live at the quaternary level: the default tertiary strength drops
+			// them entirely, so sort -u incorrectly merges distinct path keys.
 			let mut options = CollatorOptions::default();
 			options.alternate_handling = Some(AlternateHandling::Shifted);
+			options.strength = Some(Strength::Quaternary);
 			CollatorBorrowed::try_new(locale.into(), options)
 				.ok()
 				.map(Arc::new)
@@ -6158,6 +6165,60 @@ mod tests {
 	#[cfg(not(unix))]
 	fn locale_installed(_locale: &str) -> bool {
 		true
+	}
+
+	// Both the default fast path's precomputed keys and the explicit-key
+	// comparator must distinguish punctuation without relying on installed
+	// OS locales. Otherwise -u silently drops distinct file names.
+	#[test]
+	fn shifted_collation_retains_punctuation_in_comparisons_and_sort_keys() {
+		let collator = collator_for_locale(Locale::try_from_str("en-US").unwrap()).unwrap();
+		let inputs = ["src/a-b.ts", "src/ab.ts", "src/a_b.ts", "src/a.b.ts", "src/a b.ts"];
+		let mut keys = Vec::new();
+		for input in inputs {
+			let mut key = Vec::new();
+			collator.write_sort_key_utf8_to(input.as_bytes(), &mut key).unwrap();
+			keys.push(key);
+		}
+		for (index, left) in inputs.iter().enumerate() {
+			for (other, right) in inputs.iter().enumerate().skip(index + 1) {
+				let compared = collator.compare_utf8(left.as_bytes(), right.as_bytes());
+				assert_ne!(compared, Ordering::Equal);
+				assert_eq!(keys[index].cmp(&keys[other]), compared);
+			}
+		}
+		assert_eq!(collator.compare_utf8(b"same", b"same"), Ordering::Equal);
+	}
+
+	// Exercise repeated invocations and both sorting paths, while keeping
+	// explicit key/filter equivalence instead of adding a whole-line tie-break.
+	#[test]
+	fn locale_unique_preserves_paths_and_respects_explicit_equivalence() {
+		if !locale_installed("en_US.UTF-8") {
+			eprintln!("skipping host-locale integration: en_US.UTF-8 not installed");
+			return;
+		}
+		let input = "src/a-b.ts\nsrc/ab.ts\nsrc/a_b.ts\nsrc/a.b.ts\nsrc/a-b.ts\n";
+		for _ in 0..2 {
+			for args in [&["-u"][..], &["-k1,1", "-u"]] {
+				let (code, out, err) = sort_in_locale("LC_ALL", "en_US.UTF-8", args, input);
+				assert_eq!(code, 0, "{err}");
+				let mut lines: Vec<_> = out.lines().collect();
+				lines.sort_unstable();
+				assert_eq!(lines, ["src/a-b.ts", "src/a.b.ts", "src/a_b.ts", "src/ab.ts"]);
+			}
+		}
+		for (args, input, expected) in [
+			(&["-k1,1", "-u"][..], "key first\nkey second\nother third\n", "key first\nother third\n"),
+			(&["-d", "-u"][..], "a-b\na_b\na.b\nab\n", "a-b\n"),
+			(&["-f", "-u"][..], "Alpha\nalpha\n", "Alpha\n"),
+			(&["-n", "-u"][..], "2 first\n2 second\n10 third\n", "2 first\n10 third\n"),
+			(&["-s", "-k1,1"][..], "key z\nkey a\nkey m\n", "key z\nkey a\nkey m\n"),
+		] {
+			let (code, out, err) = sort_in_locale("LC_ALL", "en_US.UTF-8", args, input);
+			assert_eq!(code, 0, "{err}");
+			assert_eq!(out, expected, "{args:?}");
+		}
 	}
 
 	// Failure mode: collation used uucore's single collator, built from the
