@@ -67,6 +67,7 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { pickTableChart } from "../auto-graph/planner";
 import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
 import { CollabController } from "../collab/controller";
@@ -204,9 +205,9 @@ import {
 	initTerminalTitleState,
 	popTerminalTitle,
 	pushTerminalTitle,
-	reportTernSessionFile,
+	reportTernSession,
 	setSessionTerminalTitle,
-	setTerminalSessionFileSource,
+	setTerminalSessionSource,
 	setTerminalTitlePullRequest,
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleStateEnabled,
@@ -218,6 +219,8 @@ import {
 	VibeSessionRegistry,
 } from "../vibe/runtime";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { setSvgFigureRendering } from "@oh-my-pi/pi-tui/chat/svg-figure";
+import { setTableCharts } from "@oh-my-pi/pi-tui/chat/table-chart";
 import { setTranscriptActionHandler } from "@oh-my-pi/pi-tui/chat/transcript-actions";
 import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
 import { ReadToolGroupComponent } from "@oh-my-pi/pi-tui/chat/read-tool-group";
@@ -361,8 +364,10 @@ import {
 	cfgTuiHyperlinks,
 	cfgTuiImeSafeCursor,
 	cfgTuiMaxInlineImages,
+	cfgTuiAutoGraph,
 	cfgTuiMouse,
 	cfgTuiRenderMermaid,
+	cfgTuiRenderSvg,
 	cfgTuiResizeScrollback,
 	cfgTuiTextSizing,
 	cfgTuiTight,
@@ -426,6 +431,8 @@ const cfgLiveUiSettings = combine({
 	"display.showTokenUsage": cfgDisplayShowTokenUsage,
 	"display.showTurnTime": cfgDisplayShowTurnTime,
 	"tui.renderMermaid": cfgTuiRenderMermaid,
+	"tui.renderSvg": cfgTuiRenderSvg,
+	"tui.autoGraph": cfgTuiAutoGraph,
 	"tui.textSizing": cfgTuiTextSizing,
 	"tui.tight": cfgTuiTight,
 	"tui.hyperlinks": cfgTuiHyperlinks,
@@ -1555,6 +1562,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	get assistantImagesVisible(): boolean {
 		return cfgTerminalShowImages.get(this.settings);
 	}
+	get tableChartsVisible(): boolean {
+		return this.#focusController.target === undefined;
+	}
 	resolveAssistantMessageLinks(texts: readonly string[]): Promise<ReadonlyMap<string, string>> {
 		const session = this.viewSession;
 		return resolveMarkdownLinkTargets(texts, {
@@ -1754,6 +1764,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		setTuiTight(cfgTuiTight.get(settings));
 		setMarkdownMermaidRendering(cfgTuiRenderMermaid.get(settings));
+		setSvgFigureRendering(cfgTuiRenderSvg.get(settings));
+		this.#applyAutoGraphSetting();
 		this.#applyTextSizingSetting();
 		// Keep generic pi-tui renderers aligned with the coding-agent setting.
 		applyHyperlinkSetting();
@@ -2217,7 +2229,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		initTerminalTitleState();
 		setTerminalTitleStateEnabled(cfgTuiTitleState.get(this.settings));
 		setTerminalTitleSpinnerStyle(cfgTuiTitleSpinner.get(this.settings));
-		setTerminalSessionFileSource(() => this.sessionManager.getSessionFile());
+		setTerminalSessionSource({
+			file: () => this.sessionManager.getSessionFile(),
+			cwd: () => this.sessionManager.getCwd(),
+		});
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		// Seeds the border, the status-line `vim` segment, and the cursor shape in one call.
 		// Deliberately here rather than beside #applyVimMode in the constructor: that runs before
@@ -2244,7 +2259,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#handleSessionAccentInputsChanged();
 			}),
 			// Fork and branch adopt a new session file without retitling.
-			this.session.registerSessionChangeCallback(reportTernSessionFile),
+			this.session.registerSessionChangeCallback(reportTernSession),
 		);
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
@@ -3382,6 +3397,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTextSizing(cfgTuiTextSizing.get(this.settings) && TERMINAL.supportsTextSizing);
 	}
 
+	/** Charts under assistant tables per `tui.autoGraph`; `smart` picks multi-series charts through the session's judge. */
+	#applyAutoGraphSetting(): void {
+		const mode = cfgTuiAutoGraph.get(this.settings);
+		setTableCharts(
+			mode,
+			mode === "smart" ? request => pickTableChart(request, this.session.tableChartJudge()) : undefined,
+		);
+	}
+
 	/**
 	 * Apply live UI side effects for settings changed through any path (`/settings`,
 	 * `cfg://`, `settings.set()`, on-disk reload). One coalesced {@link cfgLiveUiSettings}
@@ -3491,6 +3515,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (any("tui.renderMermaid")) {
 			setMarkdownMermaidRendering(cfgTuiRenderMermaid.get(this.settings));
+			rebuildChat = true;
+		}
+		if (any("tui.renderSvg")) {
+			setSvgFigureRendering(cfgTuiRenderSvg.get(this.settings));
+			rebuildChat = true;
+		}
+		if (any("tui.autoGraph")) {
+			this.#applyAutoGraphSetting();
 			rebuildChat = true;
 		}
 		if (any("tui.textSizing")) {

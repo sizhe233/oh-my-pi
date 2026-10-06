@@ -1,30 +1,28 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.6.3",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.6.3",
-  "releaseId": 404725465,
-  "publishedAt": "2026-10-06T13:17:27Z",
-  "upstreamSha": "093275112f7adff207608673c0e33c7f3d16e27f",
-  "baseSha": "7e5dcbb4bcf947e95e73c6e053781bd8c2822719",
-  "mergeBaseSha": "2a2c6dcbbb558c0f8145f67f28b3370984f2bf60",
-  "branch": "sync/upstream-v18.6.3",
+  "releaseTag": "v18.7.0",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.7.0",
+  "releaseId": 405098782,
+  "publishedAt": "2026-10-06T20:05:49Z",
+  "upstreamSha": "e0fc1cf4ea354b445a359b37fa5eb58deaa85598",
+  "baseSha": "daf878cb23f01553672790f2045273e862e62998",
+  "mergeBaseSha": "093275112f7adff207608673c0e33c7f3d16e27f",
+  "branch": "sync/upstream-v18.7.0",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
-  "upstreamWorkflowChanges": [],
+  "upstreamWorkflowChanges": [
+    "D\t.github/workflows/bazel-cache-warm.yml",
+    "A\t.github/workflows/bun-cache-warm.yml",
+    "M\t.github/workflows/ci.yml"
+  ],
   "reviewedConflictResolutions": {
-    "path": ".github/upstream-resolutions/v18.6.3.json",
-    "blob": "49ff0fdc49785062ca88ee93e86cf625e1564263",
+    "path": ".github/upstream-resolutions/v18.7.0.json",
+    "blob": "07b15ffb8a86789f827c43d290dc7399ad24aab2",
     "resolvedPaths": [
+      "crates/pi-builtins/src/sort.rs",
       "packages/coding-agent/src/tools/browser/relay/bridge.ts",
-      "packages/coding-agent/src/tools/browser/relay/daemon.ts",
-      "packages/coding-agent/src/tools/browser/relay/extension-assets/background.js.txt",
-      "packages/coding-agent/src/tools/browser/tab-supervisor.ts",
-      "packages/coding-agent/src/tools/browser/tab-worker.ts",
-      "packages/coding-agent/test/tools/browser-attach.test.ts"
-    ],
-    "postMergeTestPaths": [
-      "packages/coding-agent/test/tools/browser-open-options.test.ts",
       "packages/coding-agent/test/tools/browser-relay-bridge.test.ts"
-    ]
+    ],
+    "postMergeTestPaths": []
   }
 }

@@ -58,6 +58,7 @@ import {
 	applyStealthPatches,
 	applyViewport,
 	BROWSER_PROTOCOL_TIMEOUT_MS,
+	connectPuppeteer,
 	DEFAULT_VIEWPORT,
 	isPuppeteerHandle,
 	loadPuppeteerInWorker,
@@ -1487,7 +1488,7 @@ export class WorkerCore {
 			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
-			this.#browser = await puppeteer.connect({
+			this.#browser = await connectPuppeteer(puppeteer, {
 				browserWSEndpoint: payload.browserWSEndpoint,
 				defaultViewport: null,
 				protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
