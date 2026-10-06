@@ -35,9 +35,13 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 | F5 | 会话崩溃残留回收、`app.target` 同名复用报错、扩展重连降噪 | 见变更记录 | `relay/owned-targets.ts`（`relayTargetScope`、`closeRelayTarget`、`closeRelayOwnedTarget`）、`relay/bridge.ts`（`ompCreated`、`OMP.closeOwnedTarget`）、`relay/protocol.ts`（hello `ownedTabIds`）、`orphan-registry.ts`（`runtimeDir`、可注入关闭函数）、`registry.ts`（relay 连接时回收）、`tab-supervisor.ts`（`attachTarget`、`sharedScopeOf`、`closeTargetById`）、`packages/browser-relay/extension/background.ts`（`ompCreatedTabIds`、`relayListening`、单一重连定时器）、`relay/extension-assets/*` |
 | F6 | 多个浏览器实例连 relay 时，新建标签只发给有标签（有窗口）的实例 | 见变更记录 | `relay/bridge.ts`（`#instanceForNewTab`） |
 
+2026-10-06 的 v18.6.3 兼容审阅将 F1–F6 与上游导航、BFCache、子 target 路由及按端口 daemon 标识组合；不新增或删减 fork 行为，精确审阅输入与输出记录在 `.github/upstream-resolutions/v18.6.3.json`。
+
 上表中 `tab-*.ts`、`attach.ts`、`screenshot.ts`、`relay/*` 均位于 `packages/coding-agent/src/tools/browser/`。
 
 ### 必须保持的行为
+
+v18.6.3 兼容验证另检查：打开过程导航失败或取消时只关闭本次新建的自有标签，借用标签保留；临时 claim session 关闭后互斥、所有权交接及上游子 frame 路由同时成立。以下 1–11 均继续有效。
 
 合并上游或修改上述文件后，下列行为都必须仍然成立：
 
@@ -80,6 +84,8 @@ agent 规则见 `.omp/RULES.md`（omp 会将其作为常驻规则注入每次请
 - workflow 里直接调用 `bun test`，必须显式传 `--timeout`；`OMP_TEST_TIMEOUT` 只被 `scripts/ci-test-ts.ts` 读取。
 
 ## 定期同步上游
+
+当前正式稳定 release 的受保护 PR、隔离导入及双平台验证流程见 [fork-upstream-sync.md](docs/fork-upstream-sync.md)；下述是早期手动流程记录。v18.6.3 的六文件精确输入兼容审阅数据见 `.github/upstream-resolutions/v18.6.3.json`，通过候选验证后才能合并版本。
 
 频率：每周一次；上游有浏览器相关提交时尽快同步。当前还是手动流程，没有自动化。
 
@@ -196,3 +202,9 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 补充孤儿回收组合回归：实际 reaper 经 `closeRelayOwnedTarget` 进入 RelayBridge，人工设置重连后同 ID、空归属，验证用户标签保留且旧记录被消费；另有自有且无人驱动标签的正向回收对照。这是合成协议边界测试，不宣称真实 Chrome 曾复用该 ID。（F5）
 
 - 完整浏览器测试串行运行时，修复 idle-close 测试遗留的 cmux 原型 spy，避免后续生命周期测试误读上一用例的连接次数；保留原断言，产品源码不变。（F3）
+
+### 2026-10-06
+
+- 为官方 v18.6.3 的六个冲突文件建立版本、merge base 与三方 blob 全固定的组合审阅数据；保留上游真实历史与完整 fork workflow 树，不修改导入器权限或放宽安全检查。（F1–F6）
+- 组合 fork 自有标签/claim/分组/回收与上游导航移出 worker init、BFCache 缓存失效、iframe 子会话路由及 relay daemon 按端口隔离；扩展从合并源码重新生成。（F1、F2、F4、F5）
+- 增加临时 claim session 与子 target 路由、导航失败/取消时自有与借用标签生命周期的可观察回归。协议测试不代替真实扩展和全窗口最小化 CI，更不代表已安装到用户电脑或已重载用户 Chrome 扩展。（F3）
