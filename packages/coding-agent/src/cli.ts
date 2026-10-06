@@ -29,6 +29,7 @@ import {
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import type * as NativeSortSmoke from "./cli/smoke-native-sort";
 import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
@@ -135,6 +136,12 @@ async function showHelp(config: CliConfig<CommandMetadata>): Promise<void> {
  * tarball installs all exercise it on every CI run.
  */
 async function runSmokeTest(): Promise<void> {
+	// Keep the native addon out of ordinary CLI startup, like the worker-host bridge above.
+	const { smokeTestNativeSort }: typeof NativeSortSmoke = require("./cli/smoke-native-sort");
+	const sort = await smokeTestNativeSort();
+	process.stdout.write(
+		`native-sort smoke: ${sort.localeCollation ? "en_US.UTF-8 collation" : "host byte fallback"}\n`,
+	);
 	const { smokeTestSyncWorker, startServer } = await import("@oh-my-pi/omp-stats");
 	const { smokeTestTinyTitleWorker } = await import("./tiny/title-client");
 	const { smokeTestSttWorker } = await import("./stt/asr-client");
