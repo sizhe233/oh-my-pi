@@ -215,3 +215,11 @@ fork 专有变更记在这里，不写进上游拥有的 `packages/*/CHANGELOG.m
 - 上游 issue [#14606](https://github.com/can1357/oh-my-pi/issues/14606) 报告 `LANG=en_US.UTF-8` 下 native `sort -u` 将四条仅标点不同的路径错误合并成一条；本次使用官方 18.6.3 Linux x64 addon 独立复现了连续两次输出 1（成功退出），两个按命令 C-locale 控制与 `/usr/bin/sort` 均输出 4。同步得到的 fork 源码包含相同 comparator。
 - 同上游修复 [PR #14610](https://github.com/can1357/oh-my-pi/pull/14610) 的生产策略一致：保留 ICU shifted collation，显式启用第 4 级 Quaternary 权重，使标点/空白差异不再被默认去重忽略。保留 locale 的字母/重音/大小写优先级、显式 key 唯一性及 `-d`/`-f`/`-n`/`-s` 行为；不改用户全局 locale，不声称所有 Unicode 字节差异或各 locale 都与 GNU 完全一致。
 - Rust 回归直接验证 comparator 与预计算 key 的非等价和相同排序方向，不依赖系统是否安装 locale；宿主集成另检查默认/显式 key 去重和过滤模式。现有 `--smoke-test` 增加连续调用、显式 key、过滤/数值/稳定排序及 C→locale 切换控制，验证实际编译产物使用的 native addon；所有 fork workflow 内容与权限保持不变。
+
+### 2026-10-06 v18.7.0 兼容审阅
+
+- 为官方 `e0fc1cf4ea354b445a359b37fa5eb58deaa85598` 的稳定版同步预审三个冲突文件，精确输入和合并结果保存在 `.github/upstream-resolutions/v18.7.0.json`；本条记录本身不代表版本已同步或构建通过。
+- F1–F6 与上游已存在跨源 iframe 的子会话回放组合：保留 `ompCreated`、临时 claim 交接和孤儿回收保护，同时采用上游子会话 Map、后连接回放和按嵌套顺序 detach。新增组合回归检查 owning worker 连接前已出现的 iframe 只回放一次，临时 claim 关闭后自有标签仍受保护。原有测试和上游新测试均保留。
+- F7 的 quaternary 排序修复已由上游正式接纳；采用上游同义注释，保留 fork 的确定性比较/排序 key、显式过滤语义回归与编译二进制 smoke。
+- `gen:native` 移除和内存归档嵌入通过上游 release 编译脚本完整引入；fork CI 已使用明确的单平台 Bazel target，无须改用 `natives-all`。完整 fork workflow 树保持不变，上游三个 workflow 的变更仅保留在官方历史中。
+- 原有必须保持的行为 1–11 和 F7 均不变。必须在候选和最终 main SHA 分别完成 macOS arm64 / Windows x64 源码构建、编译产物及真实扩展验证后才交付；不涉及用户电脑安装。
