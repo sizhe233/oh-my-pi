@@ -12,6 +12,7 @@
  * error list by Chrome's network layer on every attempt, a refused fetch is not.
  */
 import type { ExtToRelayMessage, RelayToExtMessage, TabSnapshot } from "../../coding-agent/src/tools/browser/relay/protocol";
+import { ownedDebuggerTabs } from "./debugger-ownership";
 
 import { ScreenshotCapture } from "./screenshot-capture";
 
@@ -194,10 +195,10 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 		const snap = snapshot(tab);
 		if (snap) snapshots.push(snap);
 	}
-	const attachedTabIds: number[] = [];
-	for (const target of targets) {
-		if (target.attached && target.tabId !== undefined) attachedTabIds.push(target.tabId);
-	}
+	// `attached` is true for DevTools or another extension too; only our own attachment answers a command.
+	const attachedTabIds = await ownedDebuggerTabs(targets, tabId =>
+		chrome.debugger.sendCommand({ tabId }, "Target.getTargetInfo"),
+	);
 	const versionMatch = /Chrome\/[\d.]+/.exec(navigator.userAgent);
 	return {
 		t: "hello",
