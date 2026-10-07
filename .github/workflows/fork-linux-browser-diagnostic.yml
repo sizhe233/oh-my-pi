@@ -109,6 +109,69 @@ jobs:
               if stderr_path.exists(): print(stderr_path.read_text(errors='replace')[-65536:])
           # This step records diagnostic observations. The unmodified project probe and suite below are mandatory gates.
           PY
+      - name: Compare actual ptree process supervision without changing product code
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun -e "$(cat <<'JS'
+          import * as fs from "node:fs/promises";
+          import * as os from "node:os";
+          import * as path from "node:path";
+          import { ptree } from "./packages/utils/src/index";
+          import { ensureChromiumExecutable } from "./packages/coding-agent/src/tools/browser/launch";
+          import { findFreeCdpPort, waitForCdp, probeCdpResponse } from "./packages/coding-agent/src/tools/browser/attach";
+          const executable = await ensureChromiumExecutable();
+          const report = { sourceSha: Bun.env.SOURCE_SHA, workflowSha: Bun.env.GITHUB_SHA, runId: Bun.env.GITHUB_RUN_ID, bun: Bun.version, executable, variants: [] };
+          if (!executable) throw new Error("No system Chromium resolved for diagnostics");
+          for (const subreaper of [true, false]) {
+            const profile = await fs.mkdtemp(path.join(os.tmpdir(), "omp-ptree-diagnostic-"));
+            const port = await findFreeCdpPort();
+            const command = [executable, "--headless=new", "--no-sandbox", "--no-first-run", "--no-default-browser-check", "--user-data-dir=" + profile, "--remote-debugging-port=" + port, "about:blank"];
+            const result = { subreaper, command, readyWithinOriginalFiveSeconds: false, diagnosticReadyWithinThirtySeconds: false };
+            const started = performance.now();
+            let child;
+            try {
+              child = ptree.spawn(command, { stdin: "ignore", detached: true, subreaper });
+              result.pid = child.pid;
+              void child.exited.catch(() => undefined);
+              try {
+                await waitForCdp("http://127.0.0.1:" + port, 5000);
+                result.readyWithinOriginalFiveSeconds = true;
+              } catch (error) { result.originalProbeError = String(error); }
+              result.originalProbeElapsedMs = performance.now() - started;
+              result.exitCodeBeforeCleanup = child.exitCode;
+              result.stderrAtOriginalDeadline = child.peekStderr();
+              if (!result.readyWithinOriginalFiveSeconds) {
+                try { await waitForCdp("http://127.0.0.1:" + port, 25000); result.diagnosticReadyWithinThirtySeconds = true; }
+                catch (error) { result.diagnosticProbeError = String(error); }
+              } else { result.diagnosticReadyWithinThirtySeconds = true; }
+              result.totalElapsedMs = performance.now() - started;
+              if (result.diagnosticReadyWithinThirtySeconds) result.cdp = await probeCdpResponse("http://127.0.0.1:" + port + "/json/version", { timeoutMs: 2000 });
+            } catch (error) { result.error = String(error); }
+            finally {
+              if (child) {
+                result.stderrBeforeCleanup = child.peekStderr();
+                child.kill(undefined, -1);
+                try {
+                  const stopped = await child.wait({ allowAbort: true, allowNonZero: true });
+                  result.stderr = stopped.stderr;
+                  result.stdout = stopped.stdout.slice(-65536);
+                  result.stoppedExitCode = stopped.exitCode;
+                } catch (error) { result.cleanupError = String(error); }
+              }
+              await fs.rm(profile, { recursive: true, force: true });
+            }
+            report.variants.push(result);
+          }
+          await Bun.write(path.join(Bun.env.RUNNER_TEMP, "linux-browser-evidence", "ptree-probes.json"), JSON.stringify(report, null, 2) + "\n");
+          console.log(JSON.stringify(report, null, 2));
+          JS
+          )"
+      - name: Pin the official Chrome version selected by the frozen Puppeteer dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun -e 'import { Browser, install } from "@puppeteer/browsers"; import { PUPPETEER_REVISIONS } from "puppeteer-core"; import { appendFile } from "node:fs/promises"; const result = await install({ browser: Browser.CHROME, buildId: PUPPETEER_REVISIONS.chrome, cacheDir: Bun.env.RUNNER_TEMP + "/omp-frozen-cft" }); await appendFile(Bun.env.GITHUB_ENV, "PUPPETEER_EXECUTABLE_PATH=" + result.executablePath + "\n"); await Bun.write(Bun.env.RUNNER_TEMP + "/linux-browser-evidence/pinned-browser.json", JSON.stringify({ sourceSha: Bun.env.SOURCE_SHA, workflowSha: Bun.env.GITHUB_SHA, runId: Bun.env.GITHUB_RUN_ID, buildId: PUPPETEER_REVISIONS.chrome, executable: result.executablePath }, null, 2) + "\n"); console.log("Pinned Chrome for Testing: " + result.executablePath);'
       - name: Require the unmodified project Chromium launch probe
         shell: bash
         run: |
