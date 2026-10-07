@@ -1,0 +1,151 @@
+name: Fork frozen Linux browser validation
+
+on:
+  push:
+    branches: [diagnostic/fork-linux-v18.8.0]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-browser:
+    name: Diagnose and require complete frozen-source Linux browser coverage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      SOURCE_SHA: f0e6ef9865085a17f3907b8666eb43b573b7711e
+      OMP_TEST_TIMEOUT: "120"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: f0e6ef9865085a17f3907b8666eb43b573b7711e
+          persist-credentials: false
+      - name: Assert frozen source and initialize evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(uname -m)" = x86_64
+          mkdir -p "$RUNNER_TEMP/linux-browser-evidence"
+          printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/linux-browser-evidence/source-sha.txt"
+          git status --porcelain
+          free -h
+          df -h .
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: Install frozen dependencies and verify extension sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build exact frozen Linux native addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
+          bun scripts/bazel-natives.ts linux-x64-baseline --dest packages/natives/native -- --jobs=2
+          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
+          sha256sum packages/natives/native/pi_natives.linux-x64-baseline.node | tee "$RUNNER_TEMP/linux-browser-evidence/native-sha256.txt"
+      - name: Record actual Chromium resolution and live CDP diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          export EVIDENCE="$RUNNER_TEMP/linux-browser-evidence"
+          bun -e 'import { ensureChromiumExecutable } from "./packages/coding-agent/src/tools/browser/launch"; const executable = await ensureChromiumExecutable(); if (!executable) throw new Error("No Chromium executable resolved"); console.log(executable);' > "$EVIDENCE/chromium-path.txt"
+          export CHROME_PATH="$(cat "$EVIDENCE/chromium-path.txt")"
+          printf 'Resolved Chromium: %s\n' "$CHROME_PATH"
+          readlink -f "$CHROME_PATH"
+          file "$CHROME_PATH"
+          timeout 15s "$CHROME_PATH" --version 2>&1 | tee "$EVIDENCE/chromium-version.txt"
+          real="$(readlink -f "$CHROME_PATH")"
+          if test -f "$(dirname "$real")/chrome"; then
+            ldd "$(dirname "$real")/chrome" > "$EVIDENCE/chromium-libraries.txt" 2>&1 || true
+          else
+            ldd "$real" > "$EVIDENCE/chromium-libraries.txt" 2>&1 || true
+          fi
+          cat "$EVIDENCE/chromium-libraries.txt"
+          free -h
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, signal, socket, subprocess, tempfile, time, urllib.request
+          evidence = pathlib.Path(os.environ['EVIDENCE'])
+          executable = os.environ['CHROME_PATH']
+          profile = pathlib.Path(tempfile.mkdtemp(prefix='omp-frozen-chromium-probe-'))
+          listener = socket.socket(); listener.bind(('127.0.0.1', 0)); port = listener.getsockname()[1]; listener.close()
+          command = [executable, '--headless=new', '--no-sandbox', '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + str(profile), '--remote-debugging-port=' + str(port), 'about:blank']
+          result = {'sourceSha': os.environ['SOURCE_SHA'], 'workflowSha': os.environ['GITHUB_SHA'], 'runId': os.environ['GITHUB_RUN_ID'], 'executable': executable, 'command': command, 'ready': False}
+          started = time.monotonic()
+          process = None
+          try:
+              with (evidence / 'chromium-stdout.txt').open('wb') as stdout, (evidence / 'chromium-stderr.txt').open('wb') as stderr:
+                  process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+                  while time.monotonic() - started < 30:
+                      result['returncode'] = process.poll()
+                      if result['returncode'] is not None: break
+                      try:
+                          with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=0.5) as response:
+                              version = json.load(response)
+                          if version.get('webSocketDebuggerUrl'):
+                              result.update(ready=True, elapsedSeconds=time.monotonic()-started, version=version)
+                              break
+                      except Exception as error:
+                          result['lastCdpError'] = str(error)
+                      time.sleep(0.05)
+                  result['elapsedSeconds'] = time.monotonic() - started
+                  result['readyWithinOriginalFiveSeconds'] = result['ready'] and result['elapsedSeconds'] <= 5
+          finally:
+              if process is not None:
+                  try: os.killpg(process.pid, signal.SIGTERM)
+                  except ProcessLookupError: pass
+                  try: process.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(process.pid, signal.SIGKILL); process.wait(timeout=10)
+              shutil.rmtree(profile, ignore_errors=True)
+              (evidence / 'chromium-probe.json').write_text(json.dumps(result, indent=2) + '\n')
+              print(json.dumps(result, indent=2))
+              stderr_path = evidence / 'chromium-stderr.txt'
+              if stderr_path.exists(): print(stderr_path.read_text(errors='replace')[-65536:])
+          # This step records diagnostic observations. The unmodified project probe and suite below are mandatory gates.
+          PY
+      - name: Require the unmodified project Chromium launch probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun -e 'import { chromiumAvailable } from "./packages/coding-agent/test/tools/chromium-probe"; if (!(await chromiumAvailable())) throw new Error("Frozen-source Chromium probe failed; inspect captured executable, libraries and CDP stderr"); console.log("Frozen-source Chromium probe passed");'
+      - name: Run unchanged full suite and reject missing browser coverage
+        shell: bash
+        working-directory: packages/coding-agent
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
+            test/tools/browser-*.test.ts \
+            test/utils/image-resize.test.ts \
+            test/utils/clipboard.test.ts 2>&1 | tee "$RUNNER_TEMP/linux-browser-evidence/browser-tests.log"
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'linux-browser-evidence'
+          log = re.sub(r'\x1b\[[0-9;]*m', '', (evidence / 'browser-tests.log').read_text(errors='replace'))
+          counts = {kind: int(re.findall(r'^\s*(\d+) ' + kind + r'\s*$', log, re.M)[-1]) for kind in ['pass', 'skip', 'fail']}
+          expected_skips = {
+              '(skip) visible OMP-owned browser tabs > creates independent pages without pinning the resizable window viewport',
+              '(skip) browser video recording > records cursor-aware WebM and MP4 video, emits a changed-frame contact sheet, and names inactive-stop errors',
+              '(skip) browser interaction parity > copies and pastes the selection with the clipboard helpers on macOS',
+          }
+          skips = {line.strip() for line in log.splitlines() if line.strip().startswith('(skip)')}
+          result = {'sourceSha': os.environ['SOURCE_SHA'], 'runId': os.environ['GITHUB_RUN_ID'], 'counts': counts, 'skips': sorted(skips)}
+          (evidence / 'coverage.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          assert counts == {'pass': 520, 'skip': 3, 'fail': 0}, counts
+          assert skips == expected_skips, skips
+          PY
+      - name: Preserve diagnostic and coverage evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-frozen-linux-browser-${{ env.SOURCE_SHA }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-browser-evidence
+          if-no-files-found: error
+          retention-days: 14
