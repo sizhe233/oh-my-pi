@@ -1600,6 +1600,7 @@ async function buildInitPayload(
 		ownsTarget,
 		groupLabel: ownsTarget ? groupLabelForTab(name, opts.ownerSessionId) : undefined,
 		emulateFocus: ownsTarget === true,
+		userDriven,
 	};
 }
 
@@ -1699,6 +1700,7 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		// later graceful close leaks the Chrome tab omp created for this session.
 		ownsTarget: tab.ownsTarget,
 		groupLabel: tab.ownsTarget ? groupLabelForTab(tab.name, tab.ownerSessionId) : undefined,
+		userDriven: tab.kindTag === "connected" || tab.kindTag === "relay",
 	};
 	let worker = await spawnTabWorker();
 	try {
