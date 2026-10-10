@@ -99,6 +99,11 @@ export type WorkerInitPayload =
 			ownsTarget?: boolean;
 			/** Session tab name used to group omp-owned relay tabs. */
 			groupLabel?: string;
+			/**
+			 * The user drives this browser (connected, relay): downloads keep its one browser-wide folder and real file
+			 * names, since the user's own downloads land there too. Unset means an OMP-launched browser.
+			 */
+			userDriven?: boolean;
 	  };
 
 /** Result of one host tool requested by browser-run JavaScript. */
