@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as vm from "node:vm";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
 	reapOrphanSharedTargets,
@@ -48,6 +49,88 @@ class FakeExtSocket implements RelaySocket {
 	markAcked(id: number): void {
 		this.#acked.add(id);
 	}
+}
+
+/** Execute the shipped service worker in an isolated Chrome/WebSocket fixture. */
+async function createTabWithEmbeddedExtension(rpc: ExtRpc<"createTab">): Promise<{
+	created: Array<{ url: string; active: boolean; windowId?: number }>;
+	stored: Record<string, unknown>;
+	reply: Record<string, unknown>;
+}> {
+	const created: Array<{ url: string; active: boolean; windowId?: number }> = [];
+	const stored: Record<string, unknown> = {};
+	const connected = Promise.withResolvers<ExtensionSocket>();
+	const completed = Promise.withResolvers<Record<string, unknown>>();
+	class ExtensionSocket {
+		static OPEN = 1;
+		static CONNECTING = 0;
+		readyState = 1;
+		onmessage?: (event: { data: string }) => void;
+		constructor() {
+			connected.resolve(this);
+		}
+		send(text: string): void {
+			const message = JSON.parse(text) as Record<string, unknown>;
+			if (message.t === "rpcResult" && message.id === rpc.id) completed.resolve(message);
+		}
+		close(): void {}
+	}
+	const event = { addListener() {} };
+	const chrome = {
+		tabs: {
+			async create(options: { url: string; active: boolean; windowId?: number }) {
+				// Chrome cannot infer a current window when every window is minimized.
+				if (options.windowId !== 44) throw new Error("No current window");
+				created.push({ ...options });
+				return { id: 9, ...options, pinned: false, groupId: -1 };
+			},
+			onCreated: event,
+			onUpdated: event,
+			onActivated: event,
+			onRemoved: event,
+		},
+		windows: {
+			async getAll() {
+				return [{ id: 44, state: "minimized", focused: false }];
+			},
+		},
+		storage: {
+			local: {
+				async get(defaults: Record<string, unknown>) {
+					return defaults;
+				},
+			},
+			session: {
+				async get(defaults: Record<string, unknown>) {
+					return { ...defaults, ...stored };
+				},
+				async set(values: Record<string, unknown>) {
+					Object.assign(stored, values);
+				},
+			},
+			onChanged: event,
+		},
+		debugger: { onEvent: event, onDetach: event },
+		alarms: { create() {}, onAlarm: event },
+		action: { onClicked: event },
+		runtime: { onInstalled: event, onStartup: event },
+	};
+	const code = await Bun.file(
+		new URL("../../src/tools/browser/relay/extension-assets/background.js.txt", import.meta.url),
+	).text();
+	vm.runInNewContext(code, {
+		chrome,
+		WebSocket: ExtensionSocket,
+		AbortSignal,
+		fetch: async () => ({}),
+		setTimeout: () => 0,
+		clearTimeout() {},
+		setInterval: () => 0,
+		clearInterval() {},
+	});
+	const socket = await connected.promise;
+	socket.onmessage?.({ data: JSON.stringify(rpc) });
+	return { created, stored, reply: await completed.promise };
 }
 
 /** Downstream puppeteer-side socket capturing bridge emissions. */
@@ -418,6 +501,72 @@ describe("RelayBridge tab grouping", () => {
 		const released = claim(otherConn, otherSession);
 		await flush();
 		expect(other.messages.find(message => message.id === released)?.result).toEqual({});
+	});
+
+	it("creates a Target.createTarget background tab without selecting it", () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.createTarget",
+				params: { url: "https://example.com/", background: true },
+			}),
+		);
+		const [create] = ext.rpcs("createTab");
+		expect(create).toMatchObject({ url: "https://example.com/", active: false });
+	});
+
+	it.each([
+		{ params: { url: "https://example.com/" } },
+		{ params: { url: "https://example.com/", background: false } },
+	])("omits the active override for Target.createTarget $params", ({ params }) => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget", params }));
+		const [create] = ext.rpcs("createTab");
+		expect(create).toMatchObject({ url: "https://example.com/" });
+		expect(create).not.toHaveProperty("active");
+	});
+
+	it.each([
+		{ params: { url: "https://example.com/" } },
+		{ params: { url: "https://example.com/", background: true } },
+		{ params: { url: "https://example.com/", background: false } },
+	])("keeps a relay-created tab owned and unfocused in a minimized window for $params", async ({ params }) => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const id = ++msgSeq;
+		bridge.cdpMessage(connId, JSON.stringify({ id, method: "Target.createTarget", params }));
+		const [rpc] = ext.rpcs("createTab");
+		const result = await createTabWithEmbeddedExtension(rpc!);
+		expect(result.created).toEqual([{ url: "https://example.com/", active: false, windowId: 44 }]);
+		expect(result.stored.ompCreatedTabIds).toEqual([9]);
+		expect(result.reply).toMatchObject({ ok: true, result: { tab: { tabId: 9, active: false, windowId: 44 } } });
+		bridge.extMessage(ext, JSON.stringify(result.reply));
+		await flush();
+		expect(cdp.messages.find(message => message.id === id)?.result).toEqual({ targetId: `PAGE${ANON}.9` });
+	});
+
+	it("honors an explicit active extension RPC while recording the created tab's ownership", async () => {
+		const result = await createTabWithEmbeddedExtension({
+			t: "rpc",
+			id: ++msgSeq,
+			op: "createTab",
+			url: "https://example.com/",
+			active: true,
+		});
+		expect(result.created).toEqual([{ url: "https://example.com/", active: true, windowId: 44 }]);
+		expect(result.stored.ompCreatedTabIds).toEqual([9]);
+		expect(result.reply).toMatchObject({ ok: true, result: { tab: { tabId: 9, active: true, windowId: 44 } } });
 	});
 
 	it("never re-groups a tab the user pulled out of the omp group", async () => {
