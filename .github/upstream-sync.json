@@ -1,24 +1,17 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.8.8",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.8.8",
-  "releaseId": 409017635,
-  "publishedAt": "2026-10-10T15:02:52Z",
-  "upstreamSha": "1ca13863a82825bdce02908b3db9713e9b084290",
-  "baseSha": "ccaf812a18d0fe9945ef389fd0fe0a157bafb0dc",
-  "mergeBaseSha": "f261ed9faf16b61880b544f599876bface4ded0d",
-  "branch": "sync/upstream-v18.8.8",
+  "releaseTag": "v18.8.9",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.8.9",
+  "releaseId": 409088943,
+  "publishedAt": "2026-10-10T17:15:16Z",
+  "upstreamSha": "fa5ff4a3a977a28b93d025f4cf50f046e019f18c",
+  "baseSha": "eace0fb2627d2515e492f663e8fbf23264b9dca9",
+  "mergeBaseSha": "1ca13863a82825bdce02908b3db9713e9b084290",
+  "branch": "sync/upstream-v18.8.9",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
-  "upstreamWorkflowChanges": [],
-  "reviewedConflictResolutions": {
-    "path": ".github/upstream-resolutions/v18.8.8.json",
-    "blob": "f683bcebfad4cb892193c0bf562a93530b4542fb",
-    "resolvedPaths": [
-      "packages/browser-relay/extension/background.ts",
-      "packages/coding-agent/src/tools/browser/relay/extension-assets/background.js.txt",
-      "packages/coding-agent/test/tools/browser-relay-bridge.test.ts"
-    ],
-    "postMergeTestPaths": []
-  }
+  "upstreamWorkflowChanges": [
+    "M\t.github/workflows/ci.yml"
+  ],
+  "reviewedConflictResolutions": null
 }
