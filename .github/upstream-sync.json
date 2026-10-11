@@ -1,17 +1,26 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.8.9",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.8.9",
-  "releaseId": 409088943,
-  "publishedAt": "2026-10-10T17:15:16Z",
-  "upstreamSha": "fa5ff4a3a977a28b93d025f4cf50f046e019f18c",
-  "baseSha": "eace0fb2627d2515e492f663e8fbf23264b9dca9",
-  "mergeBaseSha": "1ca13863a82825bdce02908b3db9713e9b084290",
-  "branch": "sync/upstream-v18.8.9",
+  "releaseTag": "v18.9.1",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.9.1",
+  "releaseId": 409615402,
+  "publishedAt": "2026-10-11T11:10:18Z",
+  "upstreamSha": "a4d6f0adc63dda4ccdf4d25c26422219820f865b",
+  "baseSha": "2c47a94237d1fa71fd58f9768c99735bbd81ae30",
+  "mergeBaseSha": "fa5ff4a3a977a28b93d025f4cf50f046e019f18c",
+  "branch": "sync/upstream-v18.9.1",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
   "upstreamWorkflowChanges": [
     "M\t.github/workflows/ci.yml"
   ],
-  "reviewedConflictResolutions": null
+  "reviewedConflictResolutions": {
+    "path": ".github/upstream-resolutions/v18.9.1.json",
+    "blob": "38ad9100437416e63755a7d574bbd7dccc4f5bdf",
+    "resolvedPaths": [
+      "packages/coding-agent/src/tools/browser/tab-supervisor.ts"
+    ],
+    "postMergeTestPaths": [
+      "packages/coding-agent/test/tools/browser-shared-wedge.test.ts"
+    ]
+  }
 }
