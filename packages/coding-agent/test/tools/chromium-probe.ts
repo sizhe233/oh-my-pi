@@ -2,7 +2,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { findFreeCdpPort, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { type ChildProcess, type ExecResult, ptree, sanitizeText, truncate } from "@oh-my-pi/pi-utils";
+import { type ChildProcess, ptree, sanitizeText, truncate } from "@oh-my-pi/pi-utils";
+import type { ExecResult } from "@oh-my-pi/pi-utils/ptree";
 import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 
 import {
