@@ -38,6 +38,7 @@ import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
+import { connectedViewportFixture, reportViewportDiagnostic } from "./connected-viewport-diagnostics";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 let sharedHeadless: BrowserHandle | undefined;
@@ -626,32 +627,71 @@ describe("pickElectronTarget", () => {
 			const invoke = (parameters: unknown) =>
 				prelude.invoke(parameters, { session, toolCallId: "connected-viewport" });
 			const name = `connected-viewport-${crypto.randomUUID()}`;
+			// Passive diagnostics are confined to this owned, content-free fixture.
+			// Do not override native getters or wait for geometry to stabilize.
+			const phases: Array<{ phase: string; wallMs: number; monotonicMs: number }> = [];
+			const mark = (phase: string) => {
+				try {
+					phases.push({ phase, wallMs: Date.now(), monotonicMs: performance.now() });
+				} catch {
+					/* Best effort. */
+				}
+			};
+			let openViewport: unknown;
+			let runDiagnostics: unknown;
+			let targetId: string | undefined;
 			try {
 				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+				const fixture = connectedViewportFixture();
+				mark("before-open");
 				const opened = await invoke({
 					action: "open",
 					name,
-					url: "data:text/html,<title>Viewport</title>",
+					url: fixture,
 					app: { cdp_url: `http://127.0.0.1:${port}` },
 				});
+				mark("after-open");
+				openViewport = (opened.details as { viewport?: unknown } | undefined)?.viewport;
+				targetId = getTab(name)?.targetId;
+				mark("before-run");
 				const result = await invoke({
 					action: "run",
 					name,
-					code: `return {
-	observed: (await tab.observe()).viewport,
-	window: await tab.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio })),
-};`,
+					// Preserve the original observe -> evaluate order and number of CDP evaluations.
+					code: `const beforeObserveMs = Date.now();
+const observed = (await tab.observe()).viewport;
+const afterObserveMs = Date.now();
+const measured = await tab.evaluate(() => {
+  const window = { width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio };
+  let trace;
+  try { trace = globalThis.__ompConnectedViewportTrace; } catch { trace = { readErrors: 1 }; }
+  return { window, trace, wallMs: Date.now(), at: performance.now() };
+});
+return { observed, window: measured.window, diagnostic: {
+  beforeObserveMs, afterObserveMs, measured,
+} };`,
 				});
+				mark("after-run");
 				const details = result.details;
 				if (!details || typeof details !== "object" || !("value" in details))
 					throw new Error("run returned no value");
 				// `run` details carry the cell's return value untyped.
-				const { observed, window } = details.value as { observed: unknown; window: unknown };
+				const { observed, window, diagnostic } = details.value as {
+					observed: unknown;
+					window: unknown;
+					diagnostic: unknown;
+				};
+				runDiagnostics = { observed, window, diagnostic };
 				// The window's chrome eats into --window-size differently per OS, so pin only the forced
 				// pixel ratio; it differs from DEFAULT_VIEWPORT's 1.25, which main reported here.
 				expect(window).toMatchObject({ deviceScaleFactor: 2 });
 				expect(observed).toEqual(window);
 				expect(opened.details).toMatchObject({ viewport: window });
+			} catch (error) {
+				// Report only bounded fixture geometry and timing, never page content or screenshots.
+				// A test-side observer cannot tell whether ready used fresh data or its cached fallback.
+				reportViewportDiagnostic({ targetId, phases, openViewport, runDiagnostics });
+				throw error;
 			} finally {
 				await invoke({ action: "close", name }).catch(() => {});
 				child.kill();
