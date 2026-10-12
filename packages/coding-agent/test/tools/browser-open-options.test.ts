@@ -27,6 +27,10 @@ import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import type { Browser, Page, Target } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
+import {
+	createDownloadIsolationDiagnostics,
+	type DownloadIsolationDiagnostics,
+} from "./download-isolation-diagnostics";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const tempDirs: string[] = [];
@@ -769,6 +773,9 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 
 	it("saves each tab's downloads into its own downloads directory, also after another tab closes", async () => {
 		let served = 0;
+		let diagnostics: DownloadIsolationDiagnostics | undefined;
+		let phase = "setup";
+		let primaryFailure = false;
 		const gateReached = Promise.withResolvers<void>();
 		const gateOpened = Promise.withResolvers<void>();
 		const server = Bun.serve({
@@ -782,7 +789,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					return new Response("open");
 				}
 				if (url.pathname === "/file") {
-					return new Response(`tab ${tab}, download ${++served}\n`, {
+					const sequence = ++served;
+					try {
+						diagnostics?.recordRequest(sequence, tab);
+					} catch {}
+					return new Response(`tab ${tab}, download ${sequence}\n`, {
 						headers: {
 							"content-type": "application/octet-stream",
 							"content-disposition": 'attachment; filename="fixture.bin"',
@@ -798,6 +809,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		const second = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-download-test-"));
 		tempDirs.push(first, second);
 		try {
+			diagnostics = createDownloadIsolationDiagnostics({ first, second });
 			const invoke = browserHost();
 			const download = async (name: string, beforeClick = "") =>
 				returnedValue(
@@ -814,28 +826,53 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				) as { path: string };
 			const firstTab = `download-${crypto.randomUUID()}`;
 			const secondTab = `download-${crypto.randomUUID()}`;
+			phase = "open-first";
 			await invoke({ action: "open", name: firstTab, url: `${server.url.href}?tab=first`, downloads: first });
 
 			// `tab.title()` waits until the first tab's wait has pointed the browser's download folder at its own; the
 			// second tab then opens and points it at its own before the first tab's download starts.
 			const gate = JSON.stringify(`${server.url.href}gate`);
 			const firstDownload = download(firstTab, `await tab.title(); await fetch(${gate});`);
+			phase = "wait-first-gate";
 			await gateReached.promise;
+			phase = "open-second";
 			await invoke({ action: "open", name: secondTab, url: `${server.url.href}?tab=second`, downloads: second });
 			gateOpened.resolve();
-			expect((await firstDownload).path).toBe(path.join(first, "fixture.bin"));
+			phase = "first-download";
+			const firstResult = await firstDownload;
+			try {
+				diagnostics.recordCompletedPath(firstResult.path);
+			} catch {}
+			expect(firstResult.path).toBe(path.join(first, "fixture.bin"));
 			expect(await Bun.file(path.join(first, "fixture.bin")).text()).toBe("tab first, download 1\n");
+			phase = "first-complete-second-empty";
 			expect(await fs.readdir(second)).toEqual([]);
 
+			phase = "second-download";
 			expect((await download(secondTab)).path).toBe(path.join(second, "fixture.bin"));
 			expect(await Bun.file(path.join(second, "fixture.bin")).text()).toBe("tab second, download 2\n");
 
+			phase = "close-second";
 			await invoke({ action: "close", name: secondTab });
+			phase = "first-download-after-second-close";
 			expect((await download(firstTab)).path).toBe(path.join(first, "fixture.bin"));
 			expect(await Bun.file(path.join(first, "fixture.bin")).text()).toBe("tab first, download 3\n");
+		} catch (error) {
+			primaryFailure = true;
+			try {
+				console.error(`[browser-download-isolation] ${JSON.stringify(await diagnostics?.capture(phase))}`);
+			} catch {}
+			throw error;
 		} finally {
 			gateOpened.resolve();
-			server.stop(true);
+			try {
+				await server.stop(true);
+			} catch (cleanupError) {
+				if (!primaryFailure) throw cleanupError;
+				try {
+					console.error("[browser-download-isolation-cleanup] server-stop-failed; original failure retained");
+				} catch {}
+			}
 		}
 	}, 20_000);
 
