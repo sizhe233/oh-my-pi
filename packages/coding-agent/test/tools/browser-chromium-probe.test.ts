@@ -172,7 +172,10 @@ describe("Chromium test availability diagnostics", () => {
 			/initial CDP failure.*kill denied.*wait failed.*profile still locked/,
 		);
 		assert.equal(state.diagnostics[0]!.error.stage, "cdp");
-		assert.deepEqual(state.diagnostics[0]!.cleanupErrors.map(error => error.stage), ["kill", "wait", "remove"]);
+		assert.deepEqual(
+			state.diagnostics[0]!.cleanupErrors.map(error => error.stage),
+			["kill", "wait", "remove"],
+		);
 	});
 
 	it("does not hide a cleanup-only failure after CDP answered", async () => {
@@ -206,7 +209,10 @@ describe("Chromium test availability diagnostics", () => {
 			/original CDP failure.*exit status unavailable.*stderr unavailable/,
 		);
 		assert.equal(state.diagnostics[0]!.error.stage, "cdp");
-		assert.deepEqual(state.diagnostics[0]!.cleanupErrors.map(error => error.stage), ["exit-code", "stderr"]);
+		assert.deepEqual(
+			state.diagnostics[0]!.cleanupErrors.map(error => error.stage),
+			["exit-code", "stderr"],
+		);
 		assert.deepEqual(state.events.slice(-3), ["kill", "wait", "remove"]);
 	});
 
@@ -338,9 +344,13 @@ describe("Chromium failure-only runtime observation", () => {
 		const state = failingHarness();
 		state.host.captureFailure = async (context, signal) => {
 			state.events.push("snapshot");
-			return collectChromiumFailureSnapshot(context, signal, procReader({
-				read: async () => ({ text: "0: 0100007F:2406 00000000:0000 0A\n", bytes: 40, truncated: false }),
-			}));
+			return collectChromiumFailureSnapshot(
+				context,
+				signal,
+				procReader({
+					read: async () => ({ text: "0: 0100007F:2406 00000000:0000 0A\n", bytes: 40, truncated: false }),
+				}),
+			);
 		};
 		state.child.wait = async () => {
 			state.events.push("wait");
@@ -428,13 +438,16 @@ describe("Chromium failure-only runtime observation", () => {
 				return { text, bytes: Buffer.byteLength(text), truncated: false };
 			},
 			names: async directory => ({ names: directory === "/proc/100/task" ? ["105"] : [], truncated: false }),
-			readlink: async file => file === "/proc/101/exe" ? "/opt/google/chrome/chrome" : "/usr/bin/bun",
+			readlink: async file => (file === "/proc/101/exe" ? "/opt/google/chrome/chrome" : "/usr/bin/bun"),
 		});
 		const result = await collectChromiumFailureSnapshot(failureContext, new AbortController().signal, reader);
-		assert.deepEqual(result.processes.map(process => [process.pid, process.ppid, process.executableBasename]), [
-			[100, 1, "bun"],
-			[101, 100, "chrome"],
-		]);
+		assert.deepEqual(
+			result.processes.map(process => [process.pid, process.ppid, process.executableBasename]),
+			[
+				[100, 1, "bun"],
+				[101, 100, "chrome"],
+			],
+		);
 		assert.equal(result.listener.loopbackIpv4, true);
 		assert.equal(result.listener.wildcardIpv4, false);
 		assert.equal(result.selectedRealBasename, "google-chrome");
@@ -523,7 +536,7 @@ describe("Chromium failure-only runtime observation", () => {
 			}),
 		});
 		const result = await collectChromiumFailureSnapshot(failureContext, new AbortController().signal, reader);
-		assert.equal(result.tasksRead, CHROMIUM_DIAGNOSTIC_LIMITS.tasks);
+		assert.ok(result.tasksRead <= CHROMIUM_DIAGNOSTIC_LIMITS.tasks - CHROMIUM_DIAGNOSTIC_LIMITS.processes + 1);
 		assert.equal(result.processes.length, 1);
 		assert.equal(result.partial, true);
 		assert.ok(result.issues.includes("limit"));
@@ -625,6 +638,279 @@ describe("Chromium failure-only runtime observation", () => {
 		assert.equal(result.bytes, 128);
 		assert.equal(result.text.length, 128);
 		assert.equal(result.truncated, true);
+	});
+});
+
+describe("Chromium owned leader wait observations", () => {
+	it("distinguishes pipe writers, readers and other kernel waits without reading process content", async () => {
+		const symbols = ["do_epoll_wait", "pipe_write", "pipe_read", "futex_wait_queue", "folio_wait_bit_common"];
+		const reads: string[] = [];
+		const links: string[] = [];
+		const names: string[] = [];
+		const reader = procReader({
+			read: async (file, maximum) => {
+				reads.push(file);
+				let text = "";
+				const stat = /^\/proc\/(\d+)\/stat$/.exec(file);
+				const wait = /^\/proc\/(\d+)\/task\/\1\/wchan$/.exec(file);
+				if (file.startsWith("/proc/net/")) text = tcpHeader;
+				else if (stat) {
+					const pid = Number(stat[1]);
+					text = `${pid} (PRIVATE_COMM with ) parentheses) S ${pid === 100 ? 1 : 100} 0 0 0 0 0 0 0 3 0 12 7 0 0 0 0 0 0 123456\n`;
+				} else if (wait) {
+					assert.ok(maximum <= 128);
+					text = symbols[Number(wait[1]) - 100]!;
+				} else if (file === "/proc/100/task/100/children") text = "101 102 103 104";
+				return { text, bytes: Buffer.byteLength(text), truncated: false };
+			},
+			names: async directory => {
+				names.push(directory);
+				return { names: [directory.split("/")[2]!], truncated: false };
+			},
+			readlink: async file => {
+				links.push(file);
+				return "/PRIVATE_HOME/chrome";
+			},
+		});
+		const result = await collectChromiumFailureSnapshot(failureContext, new AbortController().signal, reader);
+		assert.deepEqual(
+			result.processes.map(process => process.leaderWait),
+			symbols.map(symbol => ({ status: "observed", symbol })),
+		);
+		assert.equal(result.processes[1]!.userCpuTicks, 12);
+		assert.equal(result.processes[1]!.systemCpuTicks, 7);
+		assert.equal(result.processes[1]!.majorFaults, 3);
+		assert.equal(result.processes[1]!.startTimeTicks, "123456");
+		assert.equal(result.tasksRead, 5);
+		assert.equal(result.partial, false);
+		assert.ok(
+			reads.every(file => /^\/proc\/(?:net\/tcp6?|10[0-4]\/(?:stat|task\/10[0-4]\/(?:children|wchan)))$/.test(file)),
+		);
+		assert.ok(links.every(file => /^\/proc\/10[0-4]\/exe$/.test(file)));
+		assert.ok(names.every(directory => /^\/proc\/10[0-4]\/task$/.test(directory)));
+		assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|parentheses|cmdline|environ|\/proc\/|fd/);
+	});
+
+	it("reports zero, denied, empty, truncated and malformed wait channels as distinct unknowns", async () => {
+		const cases = [
+			{ text: "0", reason: "zero" },
+			{ text: "", code: "EACCES", reason: "denied" },
+			{ text: "", code: "EPERM", reason: "denied" },
+			{ text: "", code: "ENOENT", reason: "unavailable" },
+			{ text: "", reason: "unavailable" },
+			{ text: "pipe_write", truncated: true, reason: "truncated" },
+			{ text: "pipe_write\n::error::PRIVATE_TOKEN", reason: "invalid" },
+		];
+		for (const example of cases) {
+			const base = procReader();
+			const result = await collectChromiumFailureSnapshot(
+				failureContext,
+				new AbortController().signal,
+				procReader({
+					read: async (file, maximum, signal) => {
+						if (!file.endsWith("/wchan")) return base.read(file, maximum, signal);
+						if (example.code) throw Object.assign(new Error("PRIVATE_ERROR"), { code: example.code });
+						return {
+							text: example.text,
+							bytes: Buffer.byteLength(example.text),
+							truncated: example.truncated ?? false,
+						};
+					},
+				}),
+			);
+			assert.deepEqual(result.processes[0]!.leaderWait, { status: "unknown", reason: example.reason });
+			assert.equal(result.partial, true);
+			assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|::error::/);
+		}
+	});
+
+	it("does not publish a wait channel or counters from a PID reused during the wait read", async () => {
+		let reused = false;
+		const base = procReader();
+		const result = await collectChromiumFailureSnapshot(
+			failureContext,
+			new AbortController().signal,
+			procReader({
+				read: async (file, maximum, signal) => {
+					if (file.endsWith("/wchan")) {
+						reused = true;
+						return { text: "pipe_write", bytes: 10, truncated: false };
+					}
+					if (file === "/proc/100/stat") {
+						const text = statFixture(100, 1, reused ? "200" : "100");
+						return { text, bytes: Buffer.byteLength(text), truncated: false };
+					}
+					return base.read(file, maximum, signal);
+				},
+			}),
+		);
+		assert.equal(reused, true);
+		assert.deepEqual(result.processes, []);
+		assert.ok(result.issues.includes("identity"));
+		assert.doesNotMatch(JSON.stringify(result), /pipe_write|userCpuTicks/);
+	});
+
+	it("keeps malformed counters unknown and rejects a truncated identity rather than reporting zeroes", async () => {
+		for (const truncated of [false, true]) {
+			const base = procReader();
+			const result = await collectChromiumFailureSnapshot(
+				failureContext,
+				new AbortController().signal,
+				procReader({
+					read: async (file, maximum, signal) => {
+						if (file === "/proc/100/stat") {
+							const text =
+								"100 (PRIVATE_COMM) S 1 0 0 0 0 0 0 0 -1 0 PRIVATE_COUNTER 9007199254740992 0 0 0 0 0 0 100\n";
+							return { text, bytes: Buffer.byteLength(text), truncated };
+						}
+						return base.read(file, maximum, signal);
+					},
+				}),
+			);
+			if (truncated) assert.deepEqual(result.processes, []);
+			else {
+				assert.equal(result.processes[0]!.majorFaults, null);
+				assert.equal(result.processes[0]!.userCpuTicks, null);
+				assert.equal(result.processes[0]!.systemCpuTicks, null);
+			}
+			assert.equal(result.partial, true);
+			assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|9007199254740992/);
+		}
+	});
+
+	it("reserves descendant leader slots when Bun has more tasks than the global sample can inspect", async () => {
+		const sampled = new Set<string>();
+		const waits: number[] = [];
+		const reader = procReader({
+			read: async file => {
+				let text = "";
+				const stat = /^\/proc\/(\d+)\/stat$/.exec(file);
+				const task = /^\/proc\/(\d+)\/task\/(\d+)\/(children|wchan)$/.exec(file);
+				if (file.startsWith("/proc/net/")) text = tcpHeader;
+				else if (stat) text = statFixture(Number(stat[1]), stat[1] === "100" ? 1 : 100);
+				else if (task) {
+					sampled.add(`${task[1]}/${task[2]}`);
+					if (task[3] === "wchan") {
+						waits.push(Number(task[1]));
+						text = task[1] === "100" ? "do_epoll_wait" : "pipe_write";
+					} else if (file === "/proc/100/task/100/children") {
+						text = Array.from({ length: 40 }, (_, index) => String(101 + index)).join(" ");
+					}
+				}
+				return { text, bytes: Buffer.byteLength(text), truncated: false };
+			},
+			names: async (_directory, maximum) => ({
+				names: Array.from({ length: maximum }, (_, index) => String(1000 + index)),
+				truncated: true,
+			}),
+		});
+		const result = await collectChromiumFailureSnapshot(failureContext, new AbortController().signal, reader);
+		assert.equal(result.processes.length, 16);
+		assert.deepEqual(
+			waits,
+			Array.from({ length: 16 }, (_, index) => 100 + index),
+		);
+		assert.equal(result.tasksRead, 32);
+		assert.equal(sampled.size, 32);
+		assert.equal(result.pathLookups, 16);
+		assert.ok(result.bytesRead <= 64 * 1024);
+		assert.equal(result.partial, true);
+		assert.deepEqual(result.listener, { port: 9222, loopbackIpv4: false, wildcardIpv4: false, ipv6Port: false });
+		assert.ok(result.issues.includes("limit"));
+	});
+
+	it("deduplicates leader and repeated task entries rather than spending extra task slots", async () => {
+		const base = procReader();
+		const children: string[] = [];
+		const result = await collectChromiumFailureSnapshot(
+			failureContext,
+			new AbortController().signal,
+			procReader({
+				read: async (file, maximum, signal) => {
+					if (file.endsWith("/children")) children.push(file);
+					return base.read(file, maximum, signal);
+				},
+				names: async () => ({
+					names: ["100", "100", "105", "105", "../PRIVATE_PATH", "9007199254740992"],
+					truncated: false,
+				}),
+			}),
+		);
+		assert.equal(result.tasksRead, 2);
+		assert.deepEqual(children, ["/proc/100/task/100/children", "/proc/100/task/105/children"]);
+		assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PATH|9007199254740992/);
+	});
+
+	it("still discovers leader-owned children when task directory access is denied", async () => {
+		const base = procReader();
+		const result = await collectChromiumFailureSnapshot(
+			failureContext,
+			new AbortController().signal,
+			procReader({
+				read: async (file, maximum, signal) => {
+					let text: string | undefined;
+					if (file === "/proc/100/task/100/children") text = "101";
+					else if (file === "/proc/101/stat") text = statFixture(101, 100);
+					else if (file.endsWith("/wchan")) text = "pipe_read";
+					return text === undefined
+						? base.read(file, maximum, signal)
+						: { text, bytes: Buffer.byteLength(text), truncated: false };
+				},
+				names: async () => {
+					throw Object.assign(new Error("PRIVATE_DIRECTORY"), { code: "EACCES" });
+				},
+			}),
+		);
+		assert.deepEqual(
+			result.processes.map(process => process.pid),
+			[100, 101],
+		);
+		assert.equal(result.tasksRead, 2);
+		assert.equal(result.partial, true);
+		assert.doesNotMatch(JSON.stringify(result), /PRIVATE_DIRECTORY/);
+	});
+
+	it("abandons a stalled wait read at the existing deadline and closes its late handle after cleanup", async () => {
+		const state = failingHarness();
+		Object.defineProperty(state.child, "pid", { value: 100 });
+		const base = procReader();
+		const opened = Promise.withResolvers<{
+			read: () => Promise<{ bytesRead: number }>;
+			close: () => Promise<void>;
+		}>();
+		const closed = Promise.withResolvers<void>();
+		const files = createChromiumProcReader({
+			open: () => opened.promise,
+			opendir: async () => {
+				throw new Error("unexpected directory read");
+			},
+			readlink: async () => "",
+			realpath: async () => "",
+		});
+		let waits = 0;
+		state.host.captureFailure = (context, signal) =>
+			collectChromiumFailureSnapshot(
+				context,
+				signal,
+				procReader({
+					read: (file, maximum, readSignal) => {
+						if (!file.endsWith("/wchan")) return base.read(file, maximum, readSignal);
+						waits++;
+						return files.read(file, maximum, readSignal);
+					},
+				}),
+			);
+		const started = Date.now();
+		await assert.rejects(state.probe.chromiumAvailable(), /original CDP timeout/);
+		assert.ok(Date.now() - started < 1500);
+		assert.equal(waits, 1);
+		assert.equal(state.diagnostics[0]!.runtime!.budgetMs, 200);
+		assert.equal(state.diagnostics[0]!.runtime!.outcome, "timed-out");
+		assert.deepEqual(state.events.slice(-3), ["kill", "wait", "remove"]);
+		const captured = JSON.stringify(state.diagnostics);
+		opened.resolve({ read: async () => ({ bytesRead: 0 }), close: async () => closed.resolve() });
+		await closed.promise;
+		assert.equal(JSON.stringify(state.diagnostics), captured);
 	});
 });
 

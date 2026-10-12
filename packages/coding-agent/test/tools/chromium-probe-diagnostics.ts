@@ -17,10 +17,19 @@ export interface ChromiumFailureContext {
 	failureAtMs: number;
 }
 
+type WaitChannel =
+	| { status: "observed"; symbol: string }
+	| { status: "unknown"; reason: "zero" | "denied" | "unavailable" | "truncated" | "invalid" | "limit" | "aborted" };
+
 interface ProcessSnapshot {
 	pid: number;
 	ppid: number;
 	state: string;
+	startTimeTicks: string;
+	userCpuTicks: number | null;
+	systemCpuTicks: number | null;
+	majorFaults: number | null;
+	leaderWait: WaitChannel;
 	executableBasename?: string;
 }
 
@@ -113,12 +122,14 @@ async function withinSignal<T>(pending: Promise<T>, signal: AbortSignal, late?: 
 }
 
 /** Fixed-size reads are intentional: procfs size metadata cannot bound a readFile(). */
-export function createChromiumProcReader(files: DiagnosticFiles = {
-	open: file => fs.open(file, "r"),
-	opendir: directory => fs.opendir(directory),
-	readlink: file => fs.readlink(file),
-	realpath: file => fs.realpath(file),
-}): ChromiumProcReader {
+export function createChromiumProcReader(
+	files: DiagnosticFiles = {
+		open: file => fs.open(file, "r"),
+		opendir: directory => fs.opendir(directory),
+		readlink: file => fs.readlink(file),
+		realpath: file => fs.realpath(file),
+	},
+): ChromiumProcReader {
 	const close = (resource: DiagnosticFile | DiagnosticDirectory) => {
 		try {
 			void resource.close().catch(() => {});
@@ -134,9 +145,11 @@ export function createChromiumProcReader(files: DiagnosticFiles = {
 				while (bytes < maxBytes) {
 					signal.throwIfAborted();
 					const pending = handle.read(buffer, bytes, maxBytes - bytes, bytes);
-					void pending.finally(() => {
-						if (signal.aborted) close(handle);
-					}).catch(() => {});
+					void pending
+						.finally(() => {
+							if (signal.aborted) close(handle);
+						})
+						.catch(() => {});
 					const result = await withinSignal(pending, signal);
 					if (result.bytesRead === 0) return { text: buffer.toString("utf8", 0, bytes), bytes, truncated: false };
 					bytes += result.bytesRead;
@@ -154,9 +167,11 @@ export function createChromiumProcReader(files: DiagnosticFiles = {
 				while (names.length < maxEntries) {
 					signal.throwIfAborted();
 					const pending = handle.read();
-					void pending.finally(() => {
-						if (signal.aborted) close(handle);
-					}).catch(() => {});
+					void pending
+						.finally(() => {
+							if (signal.aborted) close(handle);
+						})
+						.catch(() => {});
 					const entry = await withinSignal(pending, signal);
 					if (entry === null) return { names, truncated: false };
 					names.push(entry.name);
@@ -183,12 +198,27 @@ function basename(value: string): string {
 
 function parseStat(text: string) {
 	const end = text.lastIndexOf(")");
-	const fields = text.slice(end + 2).trim().split(/\s+/);
+	const fields = text
+		.slice(end + 2)
+		.trim()
+		.split(/\s+/);
 	const pid = Number(text.slice(0, text.indexOf(" ")));
 	const ppid = Number(fields[1]);
 	if (end < 0 || !Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || !/^\d+$/.test(fields[19] ?? ""))
 		throw new Error("Invalid process identity");
-	return { pid, ppid, state: /^[RSDZTWtXxKPI]$/.test(fields[0] ?? "") ? fields[0]! : "?", start: fields[19] };
+	const counter = (index: number) => {
+		const value = fields[index] ?? "";
+		return /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
+	};
+	return {
+		pid,
+		ppid,
+		state: /^[RSDZTWtXxKPI]$/.test(fields[0] ?? "") ? fields[0]! : "?",
+		start: fields[19],
+		userCpuTicks: counter(11),
+		systemCpuTicks: counter(12),
+		majorFaults: counter(9),
+	};
 }
 
 /** Observation only, after readiness already failed. Never launches or connects to a browser. */
@@ -226,6 +256,31 @@ export async function collectChromiumFailureSnapshot(
 		snapshot.bytesRead += result.bytes;
 		if (result.truncated) issue("limit");
 		return result;
+	};
+	const readStat = async (pid: number) => {
+		const result = await read(`/proc/${pid}/stat`, 1024);
+		if (result.truncated) throw new Error("Incomplete process identity");
+		return parseStat(result.text);
+	};
+	const observeWait = async (pid: number): Promise<WaitChannel> => {
+		if (snapshot.bytesRead >= CHROMIUM_DIAGNOSTIC_LIMITS.bytes) {
+			issue("limit");
+			return { status: "unknown", reason: "limit" };
+		}
+		try {
+			const result = await read(`/proc/${pid}/task/${pid}/wchan`, 128);
+			if (result.truncated) return { status: "unknown", reason: "truncated" };
+			const symbol = result.text.trim();
+			// Kernel symbol only: never expose comm, argv, environment, or arbitrary paths.
+			if (/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(symbol)) return { status: "observed", symbol };
+			issue("read");
+			return { status: "unknown", reason: symbol === "0" ? "zero" : symbol === "" ? "unavailable" : "invalid" };
+		} catch (error) {
+			issue(signal.aborted ? "aborted" : "read");
+			const denied =
+				error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM");
+			return { status: "unknown", reason: signal.aborted ? "aborted" : denied ? "denied" : "unavailable" };
+		}
 	};
 	const lookupPath = async (file: string, real: boolean) => {
 		// Linux symlink targets are at most PATH_MAX bytes. Reserve that capacity before each lookup.
@@ -274,6 +329,15 @@ export async function collectChromiumFailureSnapshot(
 		if (!Number.isInteger(context.port) || context.port < 1 || context.port > 65535) throw new Error("Invalid port");
 		const pending = [{ pid: context.rootPid, parent: null as number | null }];
 		const seen = new Set<number>();
+		const sampledTasks = new Set<string>();
+		let nonleaderTasks = 0;
+		const countTask = (pid: number, tid: number) => {
+			const key = `${pid}/${tid}`;
+			if (sampledTasks.has(key)) return false;
+			sampledTasks.add(key);
+			snapshot.tasksRead = sampledTasks.size;
+			return true;
+		};
 		// Inspect the exact target port first; there is no network request or grace period.
 		await observeListener("tcp");
 		await observeListener("tcp6");
@@ -288,7 +352,7 @@ export async function collectChromiumFailureSnapshot(
 			if (seen.has(current.pid)) continue;
 			seen.add(current.pid);
 			try {
-				const before = parseStat((await read(`/proc/${current.pid}/stat`, 1024)).text);
+				const before = await readStat(current.pid);
 				if (before.pid !== current.pid || (current.parent !== null && before.ppid !== current.parent)) {
 					issue("identity");
 					continue;
@@ -299,27 +363,60 @@ export async function collectChromiumFailureSnapshot(
 				} catch {
 					issue(signal.aborted ? "aborted" : "read");
 				}
-				const after = parseStat((await read(`/proc/${current.pid}/stat`, 1024)).text);
+				countTask(current.pid, current.pid);
+				const leaderWait = await observeWait(current.pid);
+				const after = await readStat(current.pid);
 				if (after.start !== before.start || after.ppid !== before.ppid || after.pid !== before.pid) {
 					issue("identity");
 					continue;
 				}
-				if (after.state === "?") issue("read");
-				snapshot.processes.push({ pid: after.pid, ppid: after.ppid, state: after.state, executableBasename });
+				if (
+					after.state === "?" ||
+					after.userCpuTicks === null ||
+					after.systemCpuTicks === null ||
+					after.majorFaults === null
+				)
+					issue("read");
+				snapshot.processes.push({
+					pid: after.pid,
+					ppid: after.ppid,
+					state: after.state,
+					startTimeTicks: after.start,
+					userCpuTicks: after.userCpuTicks,
+					systemCpuTicks: after.systemCpuTicks,
+					majorFaults: after.majorFaults,
+					leaderWait,
+					executableBasename,
+				});
+				// Reserve one task for every possible process leader. A busy Bun task directory
+				// must not consume the Chrome/cat leaders' wait-channel observations.
 				const remainingTasks = Math.min(
-					CHROMIUM_DIAGNOSTIC_LIMITS.tasks - snapshot.tasksRead,
+					CHROMIUM_DIAGNOSTIC_LIMITS.tasks - CHROMIUM_DIAGNOSTIC_LIMITS.processes - nonleaderTasks,
 					Math.floor((CHROMIUM_DIAGNOSTIC_LIMITS.bytes - snapshot.bytesRead) / 256),
 				);
-				if (remainingTasks <= 0) {
+				const taskIds = [current.pid];
+				if (remainingTasks > 0) {
+					try {
+						const tasks = await withinSignal(
+							reader.names(`/proc/${current.pid}/task`, remainingTasks, signal),
+							signal,
+						);
+						if (tasks.truncated) issue("limit");
+						snapshot.bytesRead += tasks.names.reduce((total, name) => total + Buffer.byteLength(name), 0);
+						for (const name of tasks.names) {
+							const tid = Number(name);
+							if (!/^\d+$/.test(name) || !Number.isSafeInteger(tid) || tid <= 0 || !countTask(current.pid, tid))
+								continue;
+							nonleaderTasks++;
+							taskIds.push(tid);
+						}
+					} catch {
+						issue(signal.aborted ? "aborted" : "read");
+					}
+				} else {
 					issue("limit");
-					continue;
 				}
-				const tasks = await withinSignal(reader.names(`/proc/${current.pid}/task`, remainingTasks, signal), signal);
-				if (tasks.truncated) issue("limit");
-				snapshot.tasksRead += tasks.names.length;
-				snapshot.bytesRead += tasks.names.reduce((total, name) => total + Buffer.byteLength(name), 0);
-				for (const task of tasks.names) {
-					if (!/^\d+$/.test(task)) continue;
+				for (const task of taskIds) {
 					let children: BoundedText;
 					try {
 						children = await read(`/proc/${current.pid}/task/${task}/children`, 4096);
