@@ -346,10 +346,11 @@ export class MCPAddWizard extends OverlayPanel {
 	/** Why the last OAuth attempt ended: the error (whole for native, fitted for ANSI) and a tip. */
 	#oauthFailure: { cancelled: boolean; message: string; ansiMessage: string; tip?: string } | null = null;
 	/**
-	 * Bumped when a connection test starts and whenever the user steps back, so
-	 * a test that settles after the user left its step doesn't move the wizard.
+	 * Bumped when an async attempt starts, the user steps back, or the wizard
+	 * closes, so a stale continuation doesn't move or reopen the wizard.
 	 */
 	#attempt = 0;
+	#cancelled = false;
 	#nativeStep: NativeWizardStep = { phase: PHASE_NAME, title: "", body: [], actions: {} };
 	/** Memoized native description; dropped whenever a step mounts or its body changes. */
 	#native: NativeNode | undefined;
@@ -373,6 +374,7 @@ export class MCPAddWizard extends OverlayPanel {
 	 * cancels the OAuth wait instead of stepping back through the form.
 	 */
 	#oauthAbort: AbortController | null = null;
+	#cancelHealthCheck: (() => void) | null = null;
 
 	constructor(
 		deps: MCPAddWizardDeps,
@@ -415,7 +417,17 @@ export class MCPAddWizard extends OverlayPanel {
 	}
 
 	#requestRender(): void {
+		if (this.#cancelled) return;
 		this.#onRenderCallback?.();
+	}
+
+	#cancel(): void {
+		if (this.#cancelled) return;
+		this.#cancelled = true;
+		this.#attempt++;
+		this.#cancelHealthCheck?.();
+		this.#oauthAbort?.abort("MCP OAuth flow cancelled by user");
+		this.#onCancelCallback();
 	}
 
 	/** Mount a step as the wizard body. Overlay chrome is unbounded, so no height budget applies. */
@@ -682,6 +694,7 @@ export class MCPAddWizard extends OverlayPanel {
 	 * arrows and pressing Enter; the footer's buttons run what their keys run.
 	 */
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (this.#cancelled) return;
 		if (event.type === "action") {
 			this.#runAction(event.act);
 			return;
@@ -700,13 +713,12 @@ export class MCPAddWizard extends OverlayPanel {
 	#runAction(act: string): void {
 		switch (act) {
 			case "cancel":
-				this.#oauthAbort?.abort("MCP OAuth flow cancelled by user");
-				this.#onCancelCallback();
+				this.#cancel();
 				return;
 			case "back":
 				if (this.#oauthAbort) this.#oauthAbort.abort("MCP OAuth flow cancelled by user");
 				else if (this.#inputField) this.#cancelInputStep();
-				else if (this.#currentStep === "name") this.#onCancelCallback();
+				else if (this.#currentStep === "name") this.#cancel();
 				else this.#goBack();
 				break;
 			case "next":
@@ -721,7 +733,7 @@ export class MCPAddWizard extends OverlayPanel {
 
 	#cancelInputStep(): void {
 		if (this.#currentStep === "name") {
-			this.#onCancelCallback();
+			this.#cancel();
 			return;
 		}
 		this.#goBack();
@@ -984,6 +996,7 @@ export class MCPAddWizard extends OverlayPanel {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#cancelled) return;
 		// While an OAuth callback is being awaited, Esc/Ctrl+C aborts the flow
 		// rather than stepping back through the form: the wizard advertises
 		// "(Press Esc to cancel)" during the wait, and stepping back would
@@ -996,7 +1009,7 @@ export class MCPAddWizard extends OverlayPanel {
 		// Handle Ctrl+C to cancel wizard immediately
 		if (keyData === "\x03") {
 			// Ctrl+C pressed - cancel wizard
-			this.#onCancelCallback();
+			this.#cancel();
 			return;
 		}
 
@@ -1014,7 +1027,7 @@ export class MCPAddWizard extends OverlayPanel {
 		if (matchesAppInterrupt(keyData)) {
 			if (this.#currentStep === "name") {
 				// Cancel wizard
-				this.#onCancelCallback();
+				this.#cancel();
 				return;
 			}
 			// Go back to previous step
@@ -1433,6 +1446,7 @@ export class MCPAddWizard extends OverlayPanel {
 	 * Test connection and automatically detect if auth is needed.
 	 */
 	async #testConnectionAndDetectAuth(): Promise<void> {
+		if (this.#cancelled) return;
 		const testConfig = this.#buildServerConfig();
 
 		if (!this.#onTestConnectionCallback) {
@@ -1467,6 +1481,7 @@ export class MCPAddWizard extends OverlayPanel {
 			}, delay);
 
 		try {
+			if (attempt !== this.#attempt) return;
 			// Try to connect - timeout is handled by the transport layer (5 seconds)
 			await this.#onTestConnectionCallback(testConfig);
 			if (attempt !== this.#attempt) return;
@@ -1502,6 +1517,7 @@ export class MCPAddWizard extends OverlayPanel {
 						// Ignore discovery failures and fallback to manual auth.
 					}
 				}
+				if (attempt !== this.#attempt) return;
 				if (oauth && !oauth.scopes && authResult.resourceMetadataUrl) {
 					// JSON-error-body path skips `discoverOAuthEndpoints` when the body
 					// already carries endpoints, so scopes advertised only in the
@@ -1631,6 +1647,7 @@ export class MCPAddWizard extends OverlayPanel {
 	}
 
 	async #launchOAuthFlow(): Promise<void> {
+		if (this.#cancelled) return;
 		if (!this.#onOAuthCallback) {
 			this.#asyncStep({
 				phase: PHASE_AUTH,
@@ -1657,6 +1674,10 @@ export class MCPAddWizard extends OverlayPanel {
 			return;
 		}
 
+		const attempt = ++this.#attempt;
+		const oauthAbort = new AbortController();
+		this.#oauthAbort = oauthAbort;
+
 		// Show "Authenticating..." message
 		const authBody = new Container();
 		authBody.addChild(new Text("Launching OAuth flow...", 0, 0));
@@ -1681,8 +1702,8 @@ export class MCPAddWizard extends OverlayPanel {
 		});
 		this.#requestRender();
 
-		this.#oauthAbort = new AbortController();
 		try {
+			if (attempt !== this.#attempt) return;
 			// Call OAuth handler
 			const oauthResourceIsFallback =
 				this.#state.oauthResourceIsFallback || (!this.#state.oauthResource && this.#state.transport !== "stdio");
@@ -1700,9 +1721,10 @@ export class MCPAddWizard extends OverlayPanel {
 					issuerUrl: this.#state.oauthIssuerUrl || undefined,
 					resource: oauthResource || undefined,
 					stripSameOriginResource: oauthResourceIsFallback,
-					abortSignal: this.#oauthAbort.signal,
+					abortSignal: oauthAbort.signal,
 				},
 			);
+			if (attempt !== this.#attempt) return;
 
 			// Store credential ID + any dynamically-registered client id. DCR client
 			// secrets stay embedded in the stored credential, never in mcp.json.
@@ -1743,6 +1765,8 @@ export class MCPAddWizard extends OverlayPanel {
 						spinnerIndex++;
 						this.#requestRender();
 					}, 80);
+			const stopSpinner = () => clearInterval(spinner);
+			oauthAbort.signal.addEventListener("abort", stopSpinner, { once: true });
 
 			let healthPassed = true;
 			let healthError = "";
@@ -1754,6 +1778,8 @@ export class MCPAddWizard extends OverlayPanel {
 						() => timeoutReject(new Error("Health check timed out after 10 seconds")),
 						10_000,
 					);
+					const cancelHealthCheck = () => timeoutReject(new Error("MCP wizard cancelled"));
+					this.#cancelHealthCheck = cancelHealthCheck;
 					try {
 						await Promise.race([
 							this.#onTestConnectionCallback(this.#buildServerConfigWithAuth(true)),
@@ -1761,6 +1787,7 @@ export class MCPAddWizard extends OverlayPanel {
 						]);
 					} finally {
 						clearTimeout(timer);
+						if (this.#cancelHealthCheck === cancelHealthCheck) this.#cancelHealthCheck = null;
 					}
 				} catch (error) {
 					healthPassed = false;
@@ -1770,6 +1797,8 @@ export class MCPAddWizard extends OverlayPanel {
 			}
 
 			clearInterval(spinner);
+			oauthAbort.signal.removeEventListener("abort", stopSpinner);
+			if (attempt !== this.#attempt) return;
 			if (healthPassed) {
 				healthText.setText(theme.fg("success", "✓ Health check passed"));
 				this.#setNativeBody([checks(statusRow("ok", "The server answers", "health"))]);
@@ -1787,6 +1816,7 @@ export class MCPAddWizard extends OverlayPanel {
 			// Move to scope selection after short delay
 			setTimeout(
 				() => {
+					if (attempt !== this.#attempt) return;
 					this.#currentStep = "scope";
 					this.#selectedIndex = 0;
 					this.#renderStep();
@@ -1795,6 +1825,7 @@ export class MCPAddWizard extends OverlayPanel {
 				healthPassed ? 1000 : 2000,
 			);
 		} catch (error) {
+			if (attempt !== this.#attempt) return;
 			// User cancellation has its own neutral heading + tip; everything else
 			// keeps the "OAuth authentication failed" framing so the existing tips
 			// stay meaningful. Name-matching avoids importing controller types.
@@ -1818,7 +1849,7 @@ export class MCPAddWizard extends OverlayPanel {
 			this.#renderStep();
 			this.#requestRender();
 		} finally {
-			this.#oauthAbort = null;
+			if (this.#oauthAbort === oauthAbort) this.#oauthAbort = null;
 		}
 	}
 

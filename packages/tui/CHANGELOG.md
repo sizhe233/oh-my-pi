@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Cancelling the MCP add wizard no longer starts a late sign-in flow or advances a dismissed wizard.
+
 ## [18.10.1] - 2026-10-12
 
 ### Added
