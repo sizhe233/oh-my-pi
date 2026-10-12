@@ -229,14 +229,14 @@ Each CONV symbol may be:
 Each FLAG symbol may be:
 
   append    append mode (makes sense only for output; conv=notrunc suggested)
-  direct    use direct I/O for data
+  direct    unsupported by this builtin
   directory  fail unless a directory
   dsync     use synchronized I/O for data
   sync      likewise, but also for metadata
   fullblock  accumulate full blocks of input (iflag only)
   nonblock  use non-blocking I/O
   noatime   do not update access time
-  nocache   Request to drop cache.  See also oflag=sync
+  nocache   unsupported by this builtin
   noctty    do not assign controlling terminal from file
   nofollow  do not follow symlinks";
 
@@ -476,6 +476,16 @@ fn parse_operands(host: &mut Host, operands: &[OsString]) -> Result<Settings, i3
 				}
 			},
 			_ => return Err(unrecognized(host)),
+		}
+	}
+
+	// Neither direct I/O nor cache advice is implemented by the copy engine.
+	// Reject these requests before opening either file or consuming standard input.
+	for (flags, kind) in [(input_flags, "input"), (output_flags, "output")] {
+		for (symbol, flag) in [("direct", O_DIRECT), ("nocache", O_NOCACHE)] {
+			if flags & flag != 0 {
+				return Err(host.usage_error(format_args!("unsupported {kind} flag: {}", symbol.quote()), 1));
+			}
 		}
 	}
 
@@ -2249,6 +2259,44 @@ mod tests {
 		assert_eq!(fs::read(root.join("g")).unwrap(), b"keep");
 		let outcome = run(&["of=missing", "conv=nocreat"], b"new", &root);
 		assert_eq!(outcome.err, "dd: failed to open 'missing': No such file or directory\n");
+	}
+
+	const UNSUPPORTED_IO_FLAGS: &[(&str, &str)] = &[
+		("iflag=direct", "input flag: 'direct'"),
+		("oflag=direct", "output flag: 'direct'"),
+		("iflag=nocache", "input flag: 'nocache'"),
+		("oflag=nocache", "output flag: 'nocache'"),
+	];
+
+	#[test]
+	fn unsupported_io_flags_do_not_create_or_truncate_output() {
+		let (_dir, root) = tempdir();
+		fs::write(root.join("f"), b"new data").unwrap();
+		for &(operand, diagnostic) in UNSUPPORTED_IO_FLAGS {
+			fs::write(root.join("g"), b"keep existing data").unwrap();
+			let outcome = run(&["if=f", "of=g", "status=none", operand], b"", &root);
+			assert_eq!(outcome.code, 1, "{operand}: {}", outcome.err);
+			assert!(outcome.err.contains(diagnostic), "{}", outcome.err);
+			assert_eq!(fs::read(root.join("g")).unwrap(), b"keep existing data", "{operand}");
+			assert!(outcome.out.is_empty(), "{operand}");
+
+			let outcome = run(&["if=f", operand, "of=missing", "status=none"], b"", &root);
+			assert_eq!(outcome.code, 1, "{operand}: {}", outcome.err);
+			assert!(outcome.err.contains(diagnostic), "{}", outcome.err);
+			assert!(!root.join("missing").exists(), "{operand}: output must not be created");
+		}
+	}
+
+	#[test]
+	fn unsupported_io_flags_are_reported_before_input_open_errors() {
+		let (_dir, root) = tempdir();
+		for &(operand, diagnostic) in UNSUPPORTED_IO_FLAGS {
+			let outcome = run(&["if=missing", "of=out", operand, "status=none"], b"", &root);
+			assert_eq!(outcome.code, 1);
+			// Platforms that already reject direct in FLAGS report an invalid flag.
+			assert!(outcome.err.contains(diagnostic), "{}", outcome.err);
+			assert!(!root.join("out").exists(), "{operand}: output must not be created");
+		}
 	}
 
 	#[test]

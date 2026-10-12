@@ -114,7 +114,7 @@ fn app() -> Command {
 			Arg::new(options::NO_DEREFERENCE)
 				.short('h')
 				.long(options::NO_DEREFERENCE)
-				.help("affect each symbolic link, rather than the referent")
+				.help("unsupported: fail without changing any file permissions")
 				.overrides_with(options::DEREFERENCE)
 				.action(ArgAction::SetTrue),
 		)
@@ -305,6 +305,13 @@ fn run(matches: &ArgMatches, host: &mut Host) -> i32 {
 	} else {
 		-1
 	};
+	// The VFS permission operation follows symlinks. A metadata check before
+	// it would still race with replacement of the final path component, so
+	// reject an explicit no-follow request before processing any operands.
+	if dereference == 0 {
+		host.error("--no-dereference is not supported by the builtin filesystem", 1);
+		return 1;
+	}
 	// Without -R, fts runs with FTS_COMFOLLOW | FTS_PHYSICAL whatever was given.
 	let traversal = if recurse { traversal } else { Traversal::CommandLine };
 	if recurse && traversal == Traversal::Physical {
@@ -782,6 +789,60 @@ mod tests {
 		assert_eq!(code, 1);
 		assert_eq!(err, "chmod: cannot operate on dangling symlink 'd/dl'\n");
 		assert_eq!(out, "'d/dl' could not be accessed\n");
+	}
+
+	#[test]
+	fn no_dereference_rejects_before_changing_any_operand() {
+		for flag in ["-h", "--no-dereference"] {
+			let dir = fixture();
+			std::os::unix::fs::symlink("f", dir.path().join("link")).unwrap();
+			std::os::unix::fs::symlink("d", dir.path().join("dirlink")).unwrap();
+			// Put an ordinary file first: rejecting a later symlink is too late.
+			let (code, _, err) = chmod(dir.path(), &[flag, "700", "f", "link", "dirlink"]);
+			assert_eq!(code, 1);
+			assert!(err.contains("--no-dereference is not supported"));
+			assert_eq!(mode(&dir.path().join("f")), 0o664);
+			assert_eq!(mode(&dir.path().join("d")), 0o2775);
+			assert_eq!(mode(&dir.path().join("d/x")), 0o666);
+		}
+	}
+
+	#[test]
+	fn recursive_no_dereference_rejects_before_traversing() {
+		for traversal in ["-H", "-L", "-P"] {
+			let dir = fixture();
+			std::os::unix::fs::symlink("d", dir.path().join("dirlink")).unwrap();
+			let (code, _, err) = chmod(dir.path(), &["-R", traversal, "-h", "700", "dirlink"]);
+			assert_eq!(code, 1);
+			assert!(err.contains("--no-dereference is not supported"));
+			assert_eq!(mode(&dir.path().join("d")), 0o2775);
+			assert_eq!(mode(&dir.path().join("d/x")), 0o666);
+		}
+	}
+
+	#[test]
+	fn last_dereference_option_controls_rejection() {
+		let dir = fixture();
+		std::os::unix::fs::symlink("f", dir.path().join("link")).unwrap();
+		let (code, _, err) = chmod(dir.path(), &["--dereference", "-h", "700", "link"]);
+		assert_eq!(code, 1);
+		assert!(err.contains("--no-dereference is not supported"));
+		assert_eq!(mode(&dir.path().join("f")), 0o664);
+		let (code, _, err) = chmod(dir.path(), &["-h", "--dereference", "700", "link"]);
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert_eq!(mode(&dir.path().join("f")), 0o700);
+	}
+
+	#[test]
+	fn default_recursive_chmod_follows_operand_but_skips_encountered_symlinks() {
+		let dir = fixture();
+		std::os::unix::fs::symlink("d", dir.path().join("dirlink")).unwrap();
+		std::os::unix::fs::symlink("../f", dir.path().join("d/link")).unwrap();
+		let (code, _, err) = chmod(dir.path(), &["-R", "700", "dirlink"]);
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert_eq!(mode(&dir.path().join("d")), 0o2700);
+		assert_eq!(mode(&dir.path().join("d/x")), 0o700);
+		assert_eq!(mode(&dir.path().join("f")), 0o664);
 	}
 
 	#[test]
