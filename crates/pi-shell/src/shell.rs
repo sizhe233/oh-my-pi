@@ -840,7 +840,7 @@ async fn create_session_for_run(
 	// implementations that run without spawning a process and resolve paths
 	// against the shell working directory. The whole set can be disabled
 	// (falling back to system binaries) via PI_DISABLE_UUTILS_BUILTINS; the
-	// destructive set (`rm`, `mv`, `cp`, `ln`) additionally honors
+	// destructive set (`rm`, `mv`, `cp`, `ln`, `dd`) additionally honors
 	// PI_DISABLE_UUTILS_DESTRUCTIVE, and `rm`/`mv` have their own switches.
 	if !env_flag(config, "PI_DISABLE_UUTILS_BUILTINS") {
 		let destructive_disabled = env_flag(config, "PI_DISABLE_UUTILS_DESTRUCTIVE");
@@ -848,11 +848,15 @@ async fn create_session_for_run(
 		let mv_disabled = destructive_disabled || env_flag(config, "PI_DISABLE_MV_BUILTIN");
 		for (name, registration) in pi_builtins::utility_builtins() {
 			let disabled = match name {
+				// Keep system env until the builtin preserves the exact child
+				// environment and fresh, platform-correct executable lookup.
+				// This requires an installed env, as before the builtin was added.
+				"env" => true,
 				"rm" => rm_disabled,
 				"mv" => mv_disabled,
-				// cp overwrites existing files, ln can clobber them via -f; gate
-				// both with the destructive set.
-				"cp" | "ln" => destructive_disabled,
+				// cp and dd (`of=`) overwrite existing files, ln can clobber them
+				// via -f; gate them with the destructive set.
+				"cp" | "ln" | "dd" => destructive_disabled,
 				_ => false,
 			};
 			if !disabled {
@@ -4562,8 +4566,8 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&tmp);
 	}
 
-	/// Every utility `pi-builtins` offers must actually be dispatchable in
-	/// process, under the name it is registered as.
+	/// Every utility selected for default embedded registration must be
+	/// dispatchable in process under its registered name.
 	///
 	/// The registry (`pi_builtins::utility_builtins`) maps a name to a
 	/// `Registration`, and each registration renders its help from its own
@@ -4573,7 +4577,7 @@ mod tests {
 	/// `PATH` emptied there is no binary to fall back on, so this also proves
 	/// the whole set resolves as builtins rather than as system commands.
 	#[tokio::test(flavor = "multi_thread")]
-	async fn every_utility_builtin_is_registered_under_its_own_name() {
+	async fn every_default_utility_builtin_is_registered_under_its_own_name() {
 		let tmp = std::env::temp_dir().join(format!("pi-utility-help-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&tmp);
 		std::fs::create_dir_all(&tmp).expect("temp dir");
@@ -4605,6 +4609,8 @@ mod tests {
 			"base64",
 			"basename",
 			"cat",
+			#[cfg(unix)]
+			"chmod",
 			"cksum",
 			"cmp",
 			"combine",
@@ -4612,15 +4618,22 @@ mod tests {
 			"cp",
 			"cut",
 			"date",
+			"dd",
+			"df",
 			"diff",
 			"dirname",
+			"du",
+			"env",
 			#[cfg(unix)]
 			"errno",
 			"fd",
 			"find",
+			"fold",
 			"grep",
 			"head",
 			"hostname",
+			#[cfg(unix)]
+			"id",
 			"ifne",
 			"isutf8",
 			"jq",
@@ -4630,13 +4643,16 @@ mod tests {
 			"mkdir",
 			"mktemp",
 			"mv",
+			"nl",
 			"nproc",
+			"od",
 			"paste",
 			"printenv",
 			"readlink",
 			"realpath",
 			"rg",
 			"rm",
+			"rmdir",
 			"sed",
 			"seq",
 			"sha1sum",
@@ -4656,6 +4672,7 @@ mod tests {
 			"ts",
 			"uname",
 			"uniq",
+			"uptime",
 			"wc",
 			"which",
 			"whoami",
@@ -4670,7 +4687,10 @@ mod tests {
 		names.sort_unstable();
 		assert_eq!(names, expected, "the utility builtin registry changed");
 
-		for name in names {
+		// env remains in the offered registry but is deliberately withheld by
+		// the embedding policy. Separate tests cover its default refusal and
+		// explicit registration; retain every other default dispatch check.
+		for name in names.into_iter().filter(|name| *name != "env") {
 			let exec = session
 				.shell
 				.run_string(format!("PATH= {name} --help > help.txt 2> err.txt"), &source_info, &params)
@@ -5922,6 +5942,150 @@ mod tests {
 			0,
 			"cancelled stdin read should report a non-zero (interrupted) status"
 		);
+	}
+
+	/// Preserve the offered env name/help wiring contract independently of
+	/// the deliberate omission from default embedded registration.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn withheld_env_help_dispatches_under_its_own_name() {
+		let dir = tempfile::tempdir().expect("env output fixture");
+		let config = ShellConfig {
+			session_env:   None,
+			snapshot_path: None,
+			minimizer:     None,
+			filesystem:    Fs::native(),
+		};
+		let mut session = create_session(&config).await.expect("create_session");
+		let (name, registration) = pi_builtins::utility_builtins()
+			.into_iter()
+			.find(|(name, _)| *name == "env")
+			.expect("env remains available for explicit registration");
+		session.shell.register_builtin(name, registration);
+		let output_path = dir.path().join("help");
+		let error_path = dir.path().join("error");
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
+		params.set_fd(
+			OpenFiles::STDERR_FD,
+			OpenFile::from(std::fs::File::create(&error_path).expect("error file")),
+		);
+		params.set_fd(
+			OpenFiles::STDOUT_FD,
+			OpenFile::from(std::fs::File::create(&output_path).expect("output file")),
+		);
+		let result = session
+			.shell
+			.run_string(
+				"PATH= env --help",
+				&SourceInfo::from("pi-shell:test"),
+				&params,
+			)
+			.await
+			.expect("explicit env command");
+		drop(params);
+		assert_eq!(exit_code(&result), 0);
+		let help = std::fs::read_to_string(output_path).expect("help output");
+		let error = std::fs::read_to_string(error_path).expect("error output");
+		assert!(help.contains("env"), "env --help describes the wrong utility: {help:.200?}");
+		assert!(error.is_empty(), "env --help wrote to stderr: {error:?}");
+	}
+
+	/// The incomplete env implementation must not be reachable as a builtin
+	/// in embedded sessions, including on hosts without a system env.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn env_builtin_is_withheld_from_embedded_sessions() {
+		let (result, _) = execute_captured("builtin env -i OMP_ENV_ONLY=1".to_string()).await;
+		assert_eq!(result.exit_code, Some(1));
+	}
+
+	/// These integration tests require the standard Linux/macOS binaries.
+	/// Missing dependencies fail the supported-platform gate rather than skip it.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn assert_system_env_test_dependencies(paths: &[&str]) {
+		for binary in paths {
+			assert!(
+				std::path::Path::new(binary).is_file(),
+				"system env integration requires {binary} on Linux/macOS"
+			);
+		}
+	}
+
+	/// The system wrapper removes both exported function definitions and the
+	/// shell-synthesized underscore entry when the caller requests env -i.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn system_env_clear_removes_synthesized_exports() {
+		assert_system_env_test_dependencies(&["/usr/bin/env"]);
+		let (result, output) = run_command_capture(
+			"PATH=/usr/bin:/bin; f() { :; }; export -f f; env -i /usr/bin/env",
+			None,
+			None,
+			CancelToken::default(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "");
+	}
+
+	/// Unsetting an exported function's environment entry must prevent a
+	/// child bash from importing it, even without clearing other variables.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn system_env_unset_prevents_function_import() {
+		assert_system_env_test_dependencies(&["/usr/bin/env", "/bin/bash"]);
+		let (result, output) = run_command_capture(
+			"PATH=/usr/bin:/bin; f() { :; }; export -f f; env -u BASH_FUNC_f%% \
+			 /bin/bash --noprofile --norc -c 'if declare -F f >/dev/null; then echo leaked; \
+			 else echo absent; fi'",
+			None,
+			None,
+			CancelToken::default(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "absent\n");
+	}
+
+	/// No-op env changes must not expose the invoking shell's hash table to
+	/// the operand command, or make its resolution differ from changed env.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn system_env_ignores_operand_hash_for_noop_changes() {
+		assert_system_env_test_dependencies(&["/usr/bin/env", "/bin/false"]);
+		for prefix in ["", "PATH=/usr/bin:/bin", "-u OMP_ENV_ABSENT", "OMP_ENV_CHANGED=x"] {
+			let (result, _) = run_command_capture(
+				&format!(
+					"PATH=/usr/bin:/bin; unset OMP_ENV_ABSENT OMP_ENV_CHANGED; \
+					 hash -p /bin/false omp-env-probe-missing; env {prefix} omp-env-probe-missing"
+				),
+				None,
+				None,
+				CancelToken::default(),
+			)
+			.await;
+			assert_eq!(result.exit_code, Some(127), "env prefix: {prefix}");
+		}
+	}
+
+	/// A missing or unexported PATH uses the system env's child lookup. Pin
+	/// the wrapper itself, since the invoking shell must locate env first.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn system_env_child_lookup_ignores_unexported_path() {
+		assert_system_env_test_dependencies(&["/usr/bin/env", "/bin/sh"]);
+		for setup in ["unset PATH", "PATH=/omp-env-absent; export -n PATH"] {
+			let (result, output) = run_command_capture(
+				&format!(
+					"{setup}; hash -p /usr/bin/env env; env -i sh -c 'printf default-found'"
+				),
+				None,
+				None,
+				CancelToken::default(),
+			)
+			.await;
+			assert_eq!(result.exit_code, Some(0), "PATH setup: {setup}");
+			assert_eq!(output, "default-found");
+		}
 	}
 
 	/// The disable env vars must actually gate registration: the global switch

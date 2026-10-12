@@ -29,6 +29,7 @@ import {
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import type * as NativeBuiltinsSmoke from "./cli/smoke-native-builtins";
 import type * as NativeSortSmoke from "./cli/smoke-native-sort";
 import {
 	BLOB_BROKER_WORKER_ARG,
@@ -142,6 +143,11 @@ async function runSmokeTest(): Promise<void> {
 	const sort = await smokeTestNativeSort();
 	process.stdout.write(
 		`native-sort smoke: ${sort.localeCollation ? "en_US.UTF-8 collation" : "host byte fallback"}\n`,
+	);
+	const { smokeTestNativeBuiltins }: typeof NativeBuiltinsSmoke = require("./cli/smoke-native-builtins");
+	const builtins = await smokeTestNativeBuiltins();
+	process.stdout.write(
+		`native-builtins smoke: chmod ${builtins.chmodNoDereference ? "no-follow rejection verified" : "not applicable (Windows)"}; dd unsupported flags rejected before I/O and supported copies verified; env builtin disabled; external env ${builtins.envExternalIsolation ? "Unix isolation verified" : "not tested (Windows)"}\n`,
 	);
 	const { smokeTestSyncWorker, startServer } = await import("@oh-my-pi/omp-stats");
 	const { smokeTestTinyTitleWorker } = await import("./tiny/title-client");

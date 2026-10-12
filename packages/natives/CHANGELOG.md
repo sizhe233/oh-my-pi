@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Native `chmod` rejects effective `-h`/`--no-dereference` requests before changing any files because symlink-safe permission changes are not yet supported.
+- Embedded shells use the external `env` command again while the native implementation's child-environment and executable-lookup behavior remains incomplete. A system `env` executable is required, as before 18.10.2.
+- Native `dd` rejects unsupported `direct` and `nocache` flags before opening its input or output operands rather than silently performing buffered I/O.
+
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added in-process `env`, `du`, `chmod`, `fold`, `rmdir`, `od`, `df`, `uptime`, `id`, and `dd` shell builtins matching GNU coreutils 9.x options, output, and exit codes (`chmod` and `id` on Unix only; `dd` is disabled with the destructive set by `PI_DISABLE_UUTILS_DESTRUCTIVE`).
+- Added an in-process `nl` shell builtin (ported from uutils coreutils 0.8.0, matching GNU `nl`), with header/body/footer numbering styles including `pBRE` regex styles, logical-page section delimiters, `-l` blank-line grouping, and `ln`/`rn`/`rz` number formats.
+
 ## [18.10.0] - 2026-10-12
 
 ### Added
