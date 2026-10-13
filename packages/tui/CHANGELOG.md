@@ -5,6 +5,16 @@
 ### Fixed
 
 - Cancelling the MCP add wizard no longer starts a late sign-in flow or advances a dismissed wizard.
+## [18.10.3] - 2026-10-12
+
+### Changed
+
+- Updated model picker to offer manual effort selection for unverified models instead of automatic mode
+
+### Fixed
+
+- Fixed the `snapcompact.shape` settings preview labelling variants `5x8-sent` and repeating the first variant's sample when the frame edge differs from the variant table (Claude and GPT on Cursor; `auto` on high-resolution Claude) ([#15448](https://github.com/can1357/oh-my-pi/pull/15448) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.10.2] - 2026-10-12
 
 ### Added

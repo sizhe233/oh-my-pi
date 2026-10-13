@@ -13,6 +13,7 @@ import { classifyModel } from "../src/compat/taxonomy";
 import { resolveCursorInput } from "../src/discovery/cursor";
 import { bareModelId, getLongestModelLikeIdSegment } from "../src/identity/id";
 import { buildModelReferenceIndex, resolveModelReference } from "../src/identity/reference";
+import { withoutUnverifiedThinking } from "../src/model-thinking";
 import { isOllamaCloudOutputCapped, OLLAMA_CLOUD_MAX_OUTPUT_TOKENS } from "../src/provider-models/ollama";
 import { providerEntry } from "../src/compat/providers";
 import type { Api, Model, ModelSpec } from "../src/types";
@@ -101,12 +102,13 @@ export function rebakeModelThinking(model: ModelSpec<Api>): void {
 	if (model.provider === "openrouter" && model.thinking?.requiresEffort === true) return;
 	const requiresProviderAuthoredEffort =
 		model.provider === "umans" && (model.thinking?.requiresEffort === true || model.id === "umans-kimi-k2.7");
-	const thinking = resolveModelPolicy({ ...model, thinking: undefined }).thinking;
+	// A previous bake may have promoted an unknown capability for opt-in use.
+	// Neutralize it before discarding the ladder, which carries that provenance.
+	const spec = withoutUnverifiedThinking(model);
+	const thinking = resolveModelPolicy({ ...spec, thinking: undefined }).thinking;
+	model.reasoning = spec.reasoning || thinking !== undefined;
 	if (thinking) {
 		model.thinking = requiresProviderAuthoredEffort ? { ...thinking, requiresEffort: true } : thinking;
-		// Mirror `buildModel`: an exact `thinking-efforts` rule upgrades a
-		// neutral discovery default, so the bundled row stays reasoning-capable.
-		model.reasoning = true;
 	} else {
 		delete model.thinking;
 	}

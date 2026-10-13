@@ -126,6 +126,7 @@ export class AgentLifecycleManager {
 			clearTimeout(adopted.timer);
 		}
 		this.#adopted.clear();
+		this.#holds.clear();
 		this.#revivals.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;
@@ -133,6 +134,8 @@ export class AgentLifecycleManager {
 
 	readonly #registry: AgentRegistry;
 	readonly #adopted = new Map<string, AdoptedAgent>();
+	/** Restore delivery leases belong to one registry generation, never just an id. */
+	readonly #holds = new Map<AgentRef, number>();
 	/**
 	 * In-flight park attempts, each bound to the ref it started from. A park is
 	 * cancelable until the live session is detached; after detach, ensureLive
@@ -196,6 +199,38 @@ export class AgentLifecycleManager {
 		return Boolean(
 			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected),
 		);
+	}
+
+	/**
+	 * Keep this exact generation available for pending owner-routed deliveries.
+	 * Does not revive it or prevent explicit release/kill. The idempotent release
+	 * restores the original idle TTL without replacing the adoption or its callbacks.
+	 */
+	hold(id: string, expected: AgentRef): () => void {
+		if (this.#disposed || this.#registry.get(id) !== expected || expected.status === "aborted") {
+			throw new Error(`Agent "${id}" changed before its delivery hold was acquired.`);
+		}
+		this.#holds.set(expected, (this.#holds.get(expected) ?? 0) + 1);
+		const adopted = this.#adopted.get(id);
+		if (adopted?.ref === expected) {
+			clearTimeout(adopted.timer);
+			adopted.timer = undefined;
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const count = this.#holds.get(expected) ?? 0;
+			if (count > 1) {
+				this.#holds.set(expected, count - 1);
+				return;
+			}
+			this.#holds.delete(expected);
+			const current = this.#adopted.get(id);
+			if (current?.ref === expected && this.#registry.get(id) === expected && expected.status === "idle") {
+				this.#armTimer(id, current);
+			}
+		};
 	}
 
 	/**
@@ -274,6 +309,7 @@ export class AgentLifecycleManager {
 		if (!ref || adopted.ref !== ref) return;
 		const session = ref.session;
 		if (!session) return;
+		if (this.#holds.has(ref)) return;
 
 		if (adopted.timer) {
 			clearTimeout(adopted.timer);
@@ -307,6 +343,7 @@ export class AgentLifecycleManager {
 				const live = this.#registry.get(id);
 				if (live !== ref || !live.session || live.session !== session) return;
 				if (this.#adopted.get(id)?.ref !== ref) return;
+				if (this.#holds.has(ref)) return;
 
 				// Preserve cost before detaching the only live source. The session usage
 				// index includes off-transcript model calls; remove completed task-result
@@ -540,6 +577,7 @@ export class AgentLifecycleManager {
 		);
 		this.#revivals.clear();
 		this.#parks.clear();
+		this.#holds.clear();
 		this.#persistedReviverFactory = undefined;
 		if (AgentLifecycleManager.#global === this) AgentLifecycleManager.#global = undefined;
 	}
@@ -587,6 +625,7 @@ export class AgentLifecycleManager {
 	}
 
 	#armTimer(id: string, adopted: AdoptedAgent): void {
+		if (this.#disposed || this.#holds.has(adopted.ref)) return;
 		if (adopted.idleTtlMs <= 0) return;
 		clearTimeout(adopted.timer);
 		const timer = setTimeout(() => {

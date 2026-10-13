@@ -66,6 +66,15 @@ function openrouterSpec(overrides: Partial<ModelSpec<"openrouter">> = {}): Model
 }
 
 describe("buildModel", () => {
+	it("drops a derived reasoning capability when the rebuilt deployment has no opt-in policy", () => {
+		const optIn = buildModel(responsesSpec({ id: "unknown-model", provider: "meta" }));
+		expect(optIn.thinking?.unverified).toBe(true);
+		const moved = buildModel({ ...optIn, provider: "custom", compat: undefined });
+
+		expect(moved.reasoning).toBe(false);
+		expect(moved.thinking).toBeUndefined();
+	});
+
 	describe("discovery backend policy", () => {
 		it("routes built-in and aliased llama discovery through the same persisted Qwen policy", () => {
 			const raw = responsesSpec({

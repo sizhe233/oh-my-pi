@@ -1,5 +1,5 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 
@@ -224,6 +224,10 @@ export interface AsyncJobReapResult {
 }
 
 export interface AsyncJobRegisterOptions {
+	/** Stage a cancellable job without a slot, then admit it under the running-job cap. */
+	waitForCapacity?: boolean;
+	/** Dependencies settled before admission; used only with `waitForCapacity`. */
+	beforeStart?: (signal: AbortSignal) => Promise<void>;
 	id?: string;
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
 	ownerId?: string;
@@ -284,6 +288,7 @@ export class AsyncJobManager {
 	readonly #consumedResultEvictionMs: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#deliveryQueueChanged = Promise.withResolvers<void>();
+	#capacityChanged = Promise.withResolvers<void>();
 	#disposed = false;
 
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
@@ -357,7 +362,7 @@ export class AsyncJobManager {
 			if (existing.status === "running" && !existing.queued) activeCount++;
 		}
 		const maxRunningJobs = this.#maxRunningJobs;
-		if (activeCount >= maxRunningJobs) {
+		if (!options?.waitForCapacity && activeCount >= maxRunningJobs) {
 			throw new Error(
 				`Background job limit reached (${maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -382,7 +387,7 @@ export class AsyncJobManager {
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
 			process: options?.process,
-			queued: options?.queued === true,
+			queued: options?.queued === true || options?.waitForCapacity === true,
 			...(options?.foreground ? { foreground: true } : {}),
 		};
 
@@ -401,6 +406,14 @@ export class AsyncJobManager {
 		};
 		job.promise = (async () => {
 			try {
+				if (options?.waitForCapacity) {
+					// Publish every staged identity before any admission can run. In
+					// particular, a restored parent's dependency scan must see its children.
+					await Promise.resolve();
+					abortController.signal.throwIfAborted();
+					await options.beforeStart?.(abortController.signal);
+					await this.#admitQueuedJob(job);
+				}
 				const outcome = await run({
 					jobId: id,
 					signal: abortController.signal,
@@ -430,12 +443,34 @@ export class AsyncJobManager {
 					this.#enqueueDelivery(id, errorText);
 				}
 			}
+			this.#notifyCapacityChanged();
 			if (this.#releasedForegroundJobs.has(id)) this.#discardForegroundJob(id);
 			else this.#scheduleEviction(id);
 		})();
 
 		this.#jobs.set(id, job);
 		return id;
+	}
+
+	async #admitQueuedJob(job: AsyncJob): Promise<void> {
+		const signal = job.abortController.signal;
+		for (;;) {
+			signal.throwIfAborted();
+			if (this.#disposed) throw new Error("Async job manager is disposed");
+			// Check and claim without an await: competing wakeups cannot take
+			// the same slot. Cancelled queued jobs never enter their run callback.
+			if (!this.atCapacity) {
+				job.queued = false;
+				return;
+			}
+			await untilAborted(signal, this.#capacityChanged.promise);
+		}
+	}
+
+	#notifyCapacityChanged(): void {
+		const changed = this.#capacityChanged;
+		this.#capacityChanged = Promise.withResolvers<void>();
+		changed.resolve();
 	}
 
 	/**
@@ -450,6 +485,7 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
+		this.#notifyCapacityChanged();
 		return true;
 	}
 
@@ -615,6 +651,7 @@ export class AsyncJobManager {
 			job.status = "cancelled";
 			job.abortController.abort(reason);
 		}
+		this.#notifyCapacityChanged();
 	}
 
 	/**
