@@ -124,9 +124,10 @@ describe("restoreSession (omp --restore)", () => {
 		const outcome = await restoreSession(session);
 
 		expect(outcome).toEqual({ turn: true, subagents: ["Cut"] });
+		// Restore publishes queued jobs before their runners necessarily start.
+		await manager.getJob("Cut")!.promise;
 		expect(followUp).toHaveBeenCalledTimes(1);
 		expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Cut", restore: true, message: "Cut task" });
-		await manager.getJob("Cut")!.promise;
 		await manager.drainDeliveries({ filter: { ownerId: MAIN_AGENT_ID } });
 		expect(delivered).toEqual(["Cut"]);
 	});
