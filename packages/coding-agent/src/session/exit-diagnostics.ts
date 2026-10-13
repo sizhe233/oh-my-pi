@@ -1,5 +1,6 @@
 import { createSyntheticToolResultMessage, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { isTerminalYieldResult } from "../task/yield-result";
 import type { SessionEntry } from "./session-entries";
 
 export const TOOL_EXECUTION_START_CUSTOM_TYPE = "tool_execution_start";
@@ -155,6 +156,16 @@ function findUnfinishedTurn(
 		return undefined;
 	}
 	if (tail.role === "assistant" && !tail.content.some(isToolCallContent)) return undefined;
+	// Successful terminal yields deliberately stop the loop on their toolResult,
+	// without another assistant message. Incremental sections remain unfinished;
+	// a completed workpool batch uses the same boundary as live execution.
+	if (
+		tail.role === "toolResult" &&
+		tail.toolName === "yield" &&
+		isTerminalYieldResult({ isError: tail.isError, result: { details: tail.details } }) &&
+		collectPendingToolCalls(entries).length === 0
+	)
+		return undefined;
 
 	let previousAssistant: AssistantMessage | undefined;
 	for (let index = tailIndex; index >= 0; index--) {

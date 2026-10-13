@@ -53,6 +53,16 @@ function reasoningReplayReader(model: TokenizerModel | null | undefined): Reason
 	return { api: model.api, provider: model.provider, id: model.id };
 }
 
+/** Whether this reader keeps another Claude model's signature from the same deployment. */
+function readsDeploymentSignatures(model: TokenizerModel | null | undefined): boolean {
+	const compat = model?.compat;
+	return (
+		model?.api === "anthropic-messages" &&
+		((compat !== undefined && "officialEndpoint" in compat && compat.officialEndpoint) ||
+			model.thinking?.prefixBinding === true)
+	);
+}
+
 /** Identity of the reader whose replayed reasoning a {@link Tokenizer} counts; equal keys count it alike. */
 export function reasoningReplayKey(model: TokenizerModel | null | undefined): string {
 	const reader = reasoningReplayReader(model);
@@ -244,11 +254,7 @@ export class Tokenizer {
 		this.#frameBilling = snapcompact.frameBilling(model ?? undefined);
 		this.frameBillingKey = snapcompact.frameBillingKey(this.#frameBilling);
 		this.#reasoningReader = reasoningReplayReader(model);
-		const compat = model?.compat;
-		this.#readsDeploymentSignatures =
-			model?.api === "anthropic-messages" &&
-			((compat !== undefined && "officialEndpoint" in compat && compat.officialEndpoint) ||
-				model.thinking?.prefixBinding === true);
+		this.#readsDeploymentSignatures = readsDeploymentSignatures(model);
 		this.reasoningReplayKey = reasoningReplayKey(model);
 		this.thinkingReplayTokens = resolveThinkingReplayTokens(model ?? {});
 		this.nativeHistoryReplay = options?.nativeHistoryReplay ?? true;
@@ -541,6 +547,7 @@ export class Tokenizer {
 			tokenizerEncodingForModel(model) === this.#encoding &&
 			snapcompact.frameBillingKey(snapcompact.frameBilling(model ?? undefined)) === this.frameBillingKey &&
 			reasoningReplayKey(model) === this.reasoningReplayKey &&
+			readsDeploymentSignatures(model) === this.#readsDeploymentSignatures &&
 			resolveThinkingReplayTokens(model ?? {}) === this.thinkingReplayTokens &&
 			(options?.nativeHistoryReplay ?? true) === this.nativeHistoryReplay
 		);

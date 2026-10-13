@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
+
 ## [18.10.3] - 2026-10-12
 
 ### Added

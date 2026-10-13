@@ -145,7 +145,7 @@ export function createSettingsAwareStreamFn(
 			openAIResponsesReplaysNativeHistory(model, streamOptions?.providerSessionState);
 		const tokenizerKey = `${model.provider}\0${model.api}\0${model.id}\0${nativeHistoryReplay}`;
 		let tokenizer = tokenizers.get(tokenizerKey);
-		if (!tokenizer) {
+		if (!tokenizer || !tokenizer.countsAlike(model, { nativeHistoryReplay })) {
 			tokenizer = new Tokenizer(model, { nativeHistoryReplay });
 			tokenizers.set(tokenizerKey, tokenizer);
 		}

@@ -21,6 +21,7 @@ import {
 import { prompt } from "@oh-my-pi/pi-utils";
 import yieldDescription from "../prompts/tools/yield.md" with { type: "text" };
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
+import { isTerminalYieldResult } from "../task/yield-result";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { ToolSession } from ".";
 import { buildOutputValidator, formatAllValidationIssues } from "./output-schema-validator";
@@ -735,17 +736,5 @@ subprocessToolRegistry.register<YieldDetails>("yield", {
 			schemaOverridden: record.schemaOverridden === true ? true : undefined,
 		};
 	},
-	shouldTerminate: event => {
-		if (event.isError) return false;
-		const details = event.result?.details;
-		if (!details || typeof details !== "object") return true;
-		const record = details as Record<string, unknown>;
-		if (record.complete === true) return true;
-		return !(
-			record.status === "success" &&
-			Array.isArray(record.type) &&
-			record.type.length > 0 &&
-			record.type.every(item => typeof item === "string")
-		);
-	},
+	shouldTerminate: isTerminalYieldResult,
 });

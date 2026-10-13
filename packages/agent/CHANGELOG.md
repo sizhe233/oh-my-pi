@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Rebuild token estimates when a model keeps its identity but changes its reasoning replay policy
+
 ## [18.10.3] - 2026-10-12
 
 ### Breaking Changes

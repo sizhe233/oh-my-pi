@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { withoutUnverifiedThinking } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Api, Model, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
 import {
 	applyGeneratedModelPolicies,
@@ -9,6 +10,7 @@ import {
 } from "../scripts/generated-policies";
 import { buildModel } from "../src/build";
 import { resolveProviderModels } from "../src/model-manager";
+import { toModelSpec } from "../src/provider-models/bundled-references";
 import { cursorModelManagerOptions } from "../src/provider-models/special";
 
 function createSpec<TApi extends Api>(overrides: {
@@ -53,6 +55,56 @@ function buildGenerated<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi> {
 }
 
 describe("generated model policies", () => {
+	it("keeps unknown capabilities opt-in after repeated snapshot re-bakes", () => {
+		const first = buildGenerated(
+			createSpec({ id: "unknown-model", api: "openai-responses", provider: "meta", reasoning: false }),
+		);
+		const snapshot = JSON.parse(JSON.stringify(first)) as ModelSpec<"openai-responses">;
+		const second = buildGenerated(snapshot);
+		const third = buildGenerated(JSON.parse(JSON.stringify(second)) as ModelSpec<"openai-responses">);
+
+		for (const model of [first, second, third]) {
+			expect(model.thinking?.unverified).toBe(true);
+			expect(withoutUnverifiedThinking(model).reasoning).toBe(false);
+			expect(withoutUnverifiedThinking(model).thinking).toBeUndefined();
+		}
+		expect(third).toEqual(second);
+	});
+
+	it("removes an obsolete opt-in ladder without retaining its promoted capability", () => {
+		const stale = createSpec({
+			id: "Gryphe/MythoMax-L2-13b",
+			api: "openai-completions",
+			provider: "deepinfra",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.High], unverified: true },
+		});
+		const regenerated = buildGenerated(stale);
+		const repeated = buildGenerated(
+			toModelSpec(JSON.parse(JSON.stringify(regenerated)) as Model<"openai-completions">),
+		);
+
+		expect(regenerated.reasoning).toBe(false);
+		expect(regenerated.thinking).toBeUndefined();
+		expect(repeated).toEqual(regenerated);
+	});
+
+	it("does not downgrade an authoritative reasoning capability when re-baking its ladder", () => {
+		const regenerated = buildGenerated(
+			createSpec({
+				id: "unknown-model",
+				api: "openai-responses",
+				provider: "meta",
+				reasoning: true,
+				thinking: { mode: "effort", efforts: [Effort.High] },
+			}),
+		);
+
+		expect(regenerated.thinking?.efforts).toContain(Effort.Low);
+		expect(regenerated.thinking?.unverified).toBeUndefined();
+		expect(withoutUnverifiedThinking(regenerated).reasoning).toBe(true);
+	});
+
 	it("re-bakes thinking metadata and applies parsed catalog corrections", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({

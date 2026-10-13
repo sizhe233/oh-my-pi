@@ -273,6 +273,42 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(4_763 + fitted).toBeLessThanOrEqual(10_000);
 	});
 
+	it("recounts a same-identity reader after its deployment signature policy changes", () => {
+		const opus = getBundledModel<"anthropic-messages">("anthropic", "claude-opus-5-5");
+		const detached: Model<"anthropic-messages"> = {
+			// A custom deployment does not inherit the Claude API's output-cap exemption.
+			...opus,
+			provider: "test-anthropic-deployment",
+			providerType: undefined,
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+			compat: { ...opus.compat, officialEndpoint: false },
+			thinking: opus.thinking ? { ...opus.thinking, prefixBinding: false } : undefined,
+		};
+		const rebound: Model<"anthropic-messages"> = {
+			...detached,
+			compat: { ...detached.compat, officialEndpoint: true },
+		};
+		const context = replayedReasoningContext(detached);
+		const turn = context.messages[1];
+		if (turn.role !== "assistant") throw new Error("Expected assistant fixture");
+		turn.model = "claude-opus-5";
+		turn.providerPayload = undefined;
+		turn.content = [
+			{ type: "thinking", thinking: "Reviewing.", thinkingSignature: "signed" },
+			{ type: "text", text: "Done." },
+		];
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+		const fresh = captureBase();
+		wrapped(detached, context, {});
+		wrapped(rebound, context, {});
+		createSettingsAwareStreamFn(Settings.isolated({}), fresh.fn)(rebound, context, {});
+		expect(calls[0]?.options?.maxTokens).toBeUndefined();
+		expect(calls[1]?.options?.maxTokens).toBeLessThan(9_000);
+		expect(calls[1]?.options?.maxTokens).toBe(fresh.calls[0]?.options?.maxTokens);
+	});
+
 	it("recounts replayed reasoning for a model it does not replay to", () => {
 		// Same encoding, different Responses reader: only the producing model
 		// replays the turn's 5,000 reasoning tokens.

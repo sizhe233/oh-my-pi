@@ -9,6 +9,7 @@
 
 import { resolveDiscoveryApi, resolveModelPolicy } from "./compat/resolve";
 import type { ModelIdentity } from "./compat/types";
+import { withoutUnverifiedThinking } from "./model-thinking";
 import { resolveModelTokenizer } from "./model-tokenizer";
 import { materializeTimeBasedCost } from "./pricing";
 import { type Api, MODEL_KINDS, type Model, type ModelSpec } from "./types";
@@ -345,7 +346,8 @@ export function buildDiscoveredModel(spec: ModelSpec<Api>, providerType: string)
  * materialized by the generator and consumed directly (see `models.ts`), so
  * this only runs for discovered/custom/override specs.
  */
-export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi> {
+export function buildModel<TApi extends Api>(input: ModelSpec<TApi>): Model<TApi> {
+	const spec = withoutUnverifiedThinking(input);
 	const policy = resolveModelPolicy(spec);
 	const supportsComputerUseConfig = explicitComputerUseConfig(spec);
 	const model: Model<TApi> = {

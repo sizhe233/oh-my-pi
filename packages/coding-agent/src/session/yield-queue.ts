@@ -45,9 +45,25 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, StoredEntry[]>();
 	#idleFlushPending = false;
+	#idleFlushHolds = 0;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
+	}
+
+	/**
+	 * Keep follow-ups queued until a restored turn has scheduled its retry.
+	 * Streaming step-boundary delivery remains available and receipts remain
+	 * outstanding, so run drivers still see pending work. Releases nest safely.
+	 */
+	holdIdleFlush(): () => void {
+		this.#idleFlushHolds++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (--this.#idleFlushHolds === 0) this.requestIdleFlush();
+		};
 	}
 
 	register<P>(kind: string, dispatcher: YieldDispatcher<P>): () => void {
@@ -135,6 +151,7 @@ export class YieldQueue {
 	async flush(mode: YieldFlushMode): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
+			if (this.#idleFlushHolds > 0) return;
 		}
 		const idleMessages: BuiltMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
@@ -219,7 +236,7 @@ export class YieldQueue {
 	}
 
 	#scheduleIdleFlush(): void {
-		if (this.#idleFlushPending) return;
+		if (this.#idleFlushPending || this.#idleFlushHolds > 0) return;
 		this.#idleFlushPending = true;
 		try {
 			this.#options.scheduleIdleFlush(async () => {

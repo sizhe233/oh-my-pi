@@ -311,6 +311,32 @@ describe("countMessage replayed thinking", () => {
 		expect(tokenizer.countMessage(ranTools)).toBe(OUTPUT_TOKENS);
 	});
 
+	test.each(["officialEndpoint", "prefixBinding"] as const)(
+		"recounts another Claude model's turn when the same reader changes %s",
+		field => {
+			const directOpus = getBundledModel<"anthropic-messages">("anthropic", "claude-opus-5-5");
+			const detached: Model<"anthropic-messages"> = {
+				...directOpus,
+				compat: { ...directOpus.compat, officialEndpoint: false },
+				thinking: directOpus.thinking ? { ...directOpus.thinking, prefixBinding: false } : undefined,
+			};
+			const rebound: Model<"anthropic-messages"> =
+				field === "officialEndpoint"
+					? { ...detached, compat: { ...detached.compat, officialEndpoint: true } }
+					: { ...detached, thinking: { ...directOpus.thinking!, prefixBinding: true } };
+			const turn = signedTurn(reader("anthropic", "claude-opus-5"), VISIBLE, SIGNATURE);
+			const agent = new Agent({ initialState: { model: detached, systemPrompt: [], tools: [], messages: [] } });
+			const before = agent.tokenizer;
+			expect(before.countMessage(turn)).toBe(VISIBLE_TOKENS);
+			expect(before.countsAlike(rebound)).toBe(false);
+			agent.setModel(rebound);
+			expect(agent.tokenizer).not.toBe(before);
+			expect(agent.tokenizer.countMessage(turn)).toBe(OUTPUT_TOKENS);
+			agent.setModel(detached);
+			expect(agent.tokenizer.countMessage(turn)).toBe(VISIBLE_TOKENS);
+		},
+	);
+
 	test("lowers a native Claude replay by the visible text a shake rewrite removes, after a reload too", () => {
 		// The turn's output was mostly a 2,000-token code block; shake replaces it
 		// in place, the reasoning still replays.

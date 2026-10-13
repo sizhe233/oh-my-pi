@@ -2379,6 +2379,8 @@ async function driveSessionToResult(
 		onPromptBusy?: () => Promise<void>;
 		/** Go on with the interrupted turn instead of sending `task`, which only labels the run. */
 		restore?: boolean;
+		/** Release queued idle deliveries after the initial restored attempt reaches idle. */
+		onRestoreSettled?: () => void;
 	} = {},
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy, restore } = options;
@@ -2464,8 +2466,14 @@ async function driveSessionToResult(
 			let promptAttempts = 0;
 			for (;;) {
 				try {
-					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
-					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
+					if (restore) {
+						try {
+							await awaitAbortable(session.restoreInterruptedTurn());
+							await awaitAbortable(session.waitForIdle());
+						} finally {
+							options.onRestoreSettled?.();
+						}
+					} else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
 					break;
 				} catch (error) {
 					promptAttempts++;
@@ -3514,6 +3522,8 @@ export interface FollowUpTurnOptions {
 	 * `message` (`omp --restore`: {@link AgentSession.restoreInterruptedTurn}).
 	 */
 	restore?: boolean;
+	/** Release queued idle deliveries after the initial restored attempt reaches idle. */
+	onRestoreSettled?: () => void;
 	index?: number;
 	description?: string;
 	/** Explicit pre-expansion model role alias retained from the original run. */
@@ -3658,6 +3668,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		outcome = await driveSessionToResult(session, monitor, message, {
 			structured,
 			restore: options.restore,
+			onRestoreSettled: options.onRestoreSettled,
 			onPromptBusy: async () => {
 				attemptUnsubscribe();
 				logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });

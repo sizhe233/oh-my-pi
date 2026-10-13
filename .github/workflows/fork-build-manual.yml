@@ -84,6 +84,23 @@ jobs:
             test/tools/browser-*.test.ts \
             test/utils/image-resize.test.ts \
             test/utils/clipboard.test.ts
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
+            test/task/restore-regressions.test.ts \
+            test/task/restore.test.ts \
+            test/task/restore-revive.test.ts \
+            test/agent-session-restore.test.ts \
+            test/async-job-manager.test.ts \
+            test/registry/agent-lifecycle.test.ts \
+            test/session/yield-queue.test.ts \
+            test/session-exit-diagnostics.test.ts \
+            test/tools/yield.test.ts \
+            test/settings-stream-fn.test.ts \
+            ../agent/test/tokenizer.test.ts \
+            ../catalog/test/build.test.ts \
+            ../catalog/test/generated-policies.test.ts \
+            ../catalog/test/model-thinking.test.ts \
+            ../catalog/test/compat-cascade.test.ts \
+            ../catalog/test/published-effort-ladders.test.ts
       - name: Compile one release CLI from the same SHA
         run: bun scripts/ci-release-build-binaries.ts --targets darwin-arm64
       - name: Smoke compiled workers and caller directory handling

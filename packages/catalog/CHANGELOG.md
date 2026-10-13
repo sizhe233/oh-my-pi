@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep unverified thinking off by default after catalog regeneration and remove obsolete opt-in ladders
+
 ## [18.10.3] - 2026-10-12
 
 ### Breaking Changes

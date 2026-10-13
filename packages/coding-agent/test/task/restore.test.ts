@@ -116,6 +116,8 @@ describe("restoreSession (omp --restore)", () => {
 			sessionManager: { getSessionFile: () => mainFile },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
+			yieldQueue: { holdIdleFlush: () => () => {} },
+			waitForIdle: async () => {},
 			restoreInterruptedTurn: restoreTurn,
 		} as unknown as AgentSession;
 
