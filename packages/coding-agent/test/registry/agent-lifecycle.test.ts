@@ -293,6 +293,8 @@ describe("AgentLifecycleManager", () => {
 	});
 
 	it("tombstoning a parked agent during revive prevents the stale session from attaching", async () => {
+		using tempDir = TempDir.createSync("@omp-lifecycle-revive-tombstone-");
+		const sessionFile = path.join(tempDir.path(), "Revive-Killed.jsonl");
 		const gate = deferred();
 		const revived = makeSessionStub();
 		const ref = registry.register({
@@ -300,7 +302,7 @@ describe("AgentLifecycleManager", () => {
 			displayName: "task",
 			kind: "sub",
 			session: null,
-			sessionFile: "/tmp/Revive-Killed.jsonl",
+			sessionFile,
 			status: "parked",
 		});
 		lifecycle.adopt(
@@ -316,13 +318,19 @@ describe("AgentLifecycleManager", () => {
 		);
 
 		const revival = lifecycle.ensureLive("Revive-Killed");
-		expect(await lifecycle.release("Revive-Killed", ref, { tombstone: true })).toBe(true);
-		expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", session: null });
+		try {
+			expect(await lifecycle.release("Revive-Killed", ref, { tombstone: true })).toBe(true);
+			expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", session: null });
 
-		gate.resolve();
-		await expect(revival).rejects.toThrow(/became terminal/);
-		expect(revived.disposeCalls()).toBe(1);
-		expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", session: null });
+			gate.resolve();
+			await expect(revival).rejects.toThrow(/became terminal/);
+			expect(revived.disposeCalls()).toBe(1);
+			expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", session: null });
+			expect(await Bun.file(`${sessionFile}.tombstone`).text()).toBe("");
+		} finally {
+			gate.resolve();
+			await revival.catch(() => {});
+		}
 	});
 
 	it("ensureLive on an unknown id throws and points at history://", async () => {
