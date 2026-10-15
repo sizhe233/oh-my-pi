@@ -1,0 +1,398 @@
+name: Fork v18.11.1 acceptance
+
+# Merge this reviewed workflow to protected main before dispatching a remediation SHA.
+# Additive evidence only: all three existing platform/package/browser gates remain required.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact reviewed v18.11.1 remediation HEAD (40 lowercase hex)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  TRUSTED_SHA: ${{ github.workflow_sha }}
+  DISPATCH_SHA: ${{ github.sha }}
+  WORKFLOW_REF: ${{ github.workflow_ref }}
+  PI_NATIVE_VARIANT: baseline
+
+jobs:
+  native-linux:
+    name: Source-build exact-SHA Linux and Windows addons
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require protected-main orchestration and an exact SHA
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = sizhe233/oh-my-pi
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$WORKFLOW_REF" = sizhe233/oh-my-pi/.github/workflows/fork-v18.11.1-acceptance.yml@refs/heads/main
+          test "$TRUSTED_SHA" = "$DISPATCH_SHA"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source, version, exact importer ancestry and trusted workflow preservation
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import json, os, pathlib, subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+          source, trusted = os.environ["SOURCE_SHA"], os.environ["TRUSTED_SHA"]
+          upstream = "7cc912940b107eb2d771b0d106c640a8eddc9edf"
+          assert git("rev-parse", "HEAD") == source, "Source checkout mismatch"
+          assert git("ls-remote", "--exit-code", "origin", "refs/heads/main").split()[0] == trusted, "Main moved; rebuild/revalidate from current main"
+          importer = source
+          remediation = []
+          while True:
+              parents = git("rev-list", "--parents", "-n", "1", importer).split()
+              assert parents[0] == importer, "Invalid ancestry result"
+              if len(parents) != 2:
+                  break
+              remediation.append(importer)
+              importer = parents[1]
+          assert remediation, "Expected reviewed remediation descendants after the importer merge"
+          assert git("rev-list", "--parents", "-n", "1", importer).split() == [importer, trusted, upstream], "Importer parents must be current trusted main and official v18.11.1"
+          subprocess.run(["git", "merge-base", "--is-ancestor", upstream, source], check=True)
+          subprocess.run(["git", "diff", "--exit-code", importer, source, "--", ".github/upstream-sync.json", ".github/upstream-resolutions"], check=True)
+          manifest = json.loads(pathlib.Path(".github/upstream-sync.json").read_text())
+          for key, value in {"releaseTag": "v18.11.1", "upstreamSha": upstream, "baseSha": trusted, "upstreamRepository": "can1357/oh-my-pi", "branch": "sync/upstream-v18.11.1"}.items():
+              assert manifest[key] == value, (key, manifest.get(key))
+          review = manifest["reviewedConflictResolutions"]
+          assert review["path"] == ".github/upstream-resolutions/v18.11.1.json"
+          assert sorted(review["resolvedPaths"]) == sorted([
+              "packages/agent/test/tokenizer.test.ts",
+              "packages/catalog/src/models.json",
+              "packages/coding-agent/src/tools/browser/relay/bridge.ts",
+              "packages/coding-agent/test/tools/browser-relay-bridge.test.ts",
+          ])
+          for package in ["coding-agent", "agent", "catalog", "natives", "snapcompact", "tui"]:
+              assert json.loads(pathlib.Path(f"packages/{package}/package.json").read_text())["version"] == "18.11.1", package
+          subprocess.run(["git", "diff", "--exit-code", trusted, source, "--", ".github/workflows", "scripts/fork-sync-upstream.py", "scripts/test_fork_sync_upstream.py"], check=True)
+          report = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-evidence"
+          report.mkdir()
+          provenance = {"sourceSha": source, "sourceTree": git("rev-parse", "HEAD^{tree}"), "trustedMainSha": trusted,
+              "workflowSha": trusted, "workflowRef": os.environ["WORKFLOW_REF"], "importerMergeSha": importer, "remediationCommitsNewestFirst": remediation,
+              "upstreamSha": upstream, "version": "18.11.1", "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          (report / "build.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          print(json.dumps(provenance, indent=2))
+          PYCODE
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - name: Install frozen dependencies and source-build both baseline addons
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          bazelisk --version
+          bun install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/native-evidence/install.log"
+          test -z "$(find packages/natives/native -name '*.node' -print -quit)"
+          bun scripts/bazel-natives.ts linux-x64-baseline win32-x64-baseline --dest packages/natives/native -- --jobs=2 2>&1 | tee "$RUNNER_TEMP/native-evidence/build.log"
+          python3 - <<'PYCODE'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          report = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-evidence"
+          p = json.loads((report / "build.json").read_text())
+          p["bun"] = subprocess.check_output(["bun", "--version"], text=True).strip()
+          p["buildHost"] = "ubuntu-22.04-x64"
+          p["addons"] = {}
+          for target in ["linux-x64-baseline", "win32-x64-baseline"]:
+              name = f"pi_natives.{target}.node"
+              src = pathlib.Path("packages/natives/native") / name
+              assert src.is_file() and src.stat().st_size > 0, name
+              shutil.copy2(src, report / name)
+              p["addons"][name] = hashlib.sha256(src.read_bytes()).hexdigest()
+          subprocess.run(["git", "diff", "--exit-code"], check=True)
+          subprocess.run(["git", "diff", "--cached", "--exit-code"], check=True)
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == p["sourceSha"]
+          p["result"] = "built"
+          (report / "build.json").write_text(json.dumps(p, indent=2) + "\n")
+          PYCODE
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-v18.11.1-native-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve failed build evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-v18.11.1-native-failure-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  acceptance:
+    name: v18.11.1 acceptance (${{ matrix.target }})
+    needs: native-linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64-baseline
+            platform: linux
+            arch: x64
+          - os: macos-15
+            target: darwin-arm64
+            platform: darwin
+            arch: arm64
+          - os: windows-2025
+            target: win32-x64-baseline
+            platform: win32
+            arch: x64
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_PLATFORM: ${{ matrix.platform }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: omp-v18.11.1-native-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-evidence
+      - name: Verify provenance, run native-backed suites and retain exact outcomes
+        run: |
+          set -euo pipefail
+          python - <<'PYCODE'
+          import hashlib, json, os, pathlib, re, shutil, subprocess, sys, xml.etree.ElementTree as ET
+          root = pathlib.Path.cwd()
+          report = pathlib.Path(os.environ["RUNNER_TEMP"]) / "acceptance-evidence"
+          report.mkdir()
+          native = pathlib.Path(os.environ["RUNNER_TEMP"]) / "native-evidence"
+          p = json.loads((native / "build.json").read_text())
+          source = os.environ["SOURCE_SHA"]
+          assert re.fullmatch("[0-9a-f]{40}", source)
+          for key, value in {"sourceSha": source, "trustedMainSha": os.environ["TRUSTED_SHA"], "workflowSha": os.environ["TRUSTED_SHA"], "workflowRef": os.environ["WORKFLOW_REF"], "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"], "version": "18.11.1", "result": "built"}.items():
+              assert p[key] == value, (key, p.get(key))
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == source
+          assert subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip() == p["sourceTree"]
+          assert subprocess.check_output(["git", "ls-remote", "--exit-code", "origin", "refs/heads/main"], text=True).split()[0] == p["trustedMainSha"], "Main moved; revalidation required"
+          assert set(p["addons"]) == {"pi_natives.linux-x64-baseline.node", "pi_natives.win32-x64-baseline.node"}
+          for name, digest in p["addons"].items():
+              assert name in ["pi_natives.linux-x64-baseline.node", "pi_natives.win32-x64-baseline.node"]
+              assert hashlib.sha256((native / name).read_bytes()).hexdigest() == digest, name
+          p.update({"target": os.environ["TARGET"], "result": "running", "commands": []})
+          (report / "build.json").write_text(json.dumps(p, indent=2) + "\n")
+
+          def run(label, args, cwd=root):
+              log = report / f"{label}.log"
+              print(f"\n=== {label}: {args} ===", flush=True)
+              with log.open("w", encoding="utf-8") as output:
+                  child = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+                  for line in child.stdout:
+                      output.write(line)
+                      print(line, end="", flush=True)
+                  code = child.wait()
+              p["commands"].append({"label": label, "argv": args, "cwd": str(cwd.relative_to(root)), "exitCode": code})
+              (report / "build.json").write_text(json.dumps(p, indent=2) + "\n")
+              return code == 0
+
+          assert run("install", ["bun", "install", "--frozen-lockfile"]), "Frozen installation failed"
+          addon_dir = root / "packages/natives/native"
+          assert not list(addon_dir.glob("*.node")), "Refuse pre-existing native binaries"
+          addon = addon_dir / f"pi_natives.{os.environ['TARGET']}.node"
+          if os.environ["EXPECTED_PLATFORM"] == "darwin":
+              assert run("native-build", ["bun", "scripts/bazel-natives.ts", "darwin-arm64", "--dest", "packages/natives/native", "--", "--jobs=2"])
+          else:
+              assert addon.name in p["addons"]
+              shutil.copy2(native / addon.name, addon)
+          p["nativeSha256"] = hashlib.sha256(addon.read_bytes()).hexdigest()
+          p["nativeBuildHost"] = "macos-15-arm64" if os.environ["EXPECTED_PLATFORM"] == "darwin" else p["buildHost"]
+          # Probe both real advisory locking and ownership IPC before any disk-backed tests.
+          probe = r'''
+          import * as fs from "node:fs/promises";
+          import * as os from "node:os";
+          import * as path from "node:path";
+          import { FileLock, IpcServer, ipcEndpoint, __piNativesBuildVersion } from "./packages/natives/native/index.js";
+          import { nativeAddonStatus } from "./packages/natives/native/loader-state.js";
+          import { createHash } from "node:crypto";
+          import { compressMethod } from "./packages/coding-agent/src/cli/gc-compress.ts";
+          if (process.platform !== Bun.env.EXPECTED_PLATFORM || process.arch !== Bun.env.EXPECTED_ARCH) throw new Error("Host mismatch");
+          if (__piNativesBuildVersion() !== "18.11.1") throw new Error("Native version mismatch");
+          const expected = path.resolve("packages/natives/native", `pi_natives.${Bun.env.TARGET}.node`);
+          const nativeStatus = nativeAddonStatus();
+          if (!nativeStatus || path.resolve(nativeStatus.path) !== expected) throw new Error("Unexpected loaded native addon path");
+          if (nativeStatus.version !== "18.11.1" || nativeStatus.packageVersion !== "18.11.1" || nativeStatus.stale !== false) throw new Error("Loaded native addon identity mismatch");
+          const nativeSha256 = createHash("sha256").update(await fs.readFile(nativeStatus.path)).digest("hex");
+          const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acceptance-"));
+          try {
+            const lock = FileLock.tryAcquire(path.join(dir, "owner.lock"));
+            if (!lock.acquired) throw new Error("Native ownership file lock unavailable");
+            try {
+              const server = await IpcServer.listen(ipcEndpoint(dir, "owner"), { framing: "lines" }, connection => connection.destroy());
+              await server.close();
+            } finally { lock.release(); }
+            const result = { platform: process.platform, arch: process.arch, bun: Bun.version, nativeVersion: __piNativesBuildVersion(), nativePath: nativeStatus.path, nativeStatus, nativeSha256, ownershipFileLock: "passed", ownershipIpc: "passed", compressionMethod: (await compressMethod(os.tmpdir())) ?? "unsupported", tempDir: os.tmpdir() };
+            await Bun.write(path.join(Bun.env.RUNNER_TEMP, "acceptance-evidence", "capabilities.json"), JSON.stringify(result, null, 2) + "\n");
+            console.log(JSON.stringify(result));
+          } finally { await fs.rm(dir, { recursive: true, force: true }); }
+          '''
+          assert run("native-capabilities", ["bun", "-e", probe]), "Source-built native ownership/capability probe failed"
+          capabilities = json.loads((report / "capabilities.json").read_text())
+          status = capabilities["nativeStatus"]
+          assert pathlib.Path(status["path"]).resolve() == addon.resolve(), "Loaded addon path differs from the source-built addon"
+          assert status["version"] == status["packageVersion"] == capabilities["nativeVersion"] == "18.11.1" and status["stale"] is False, "Loaded addon identity mismatch"
+          assert pathlib.Path(capabilities["nativePath"]).resolve() == addon.resolve()
+          assert capabilities["nativeSha256"] == p["nativeSha256"] == hashlib.sha256(pathlib.Path(status["path"]).read_bytes()).hexdigest(), "Loaded addon hash differs from build provenance"
+          p["bun"] = capabilities["bun"]
+          expected_compression = {"linux": "unsupported", "darwin": "apfs", "win32": "ntfs"}[os.environ["EXPECTED_PLATFORM"]]
+          ok = capabilities["compressionMethod"] == expected_compression
+          agent = root / "packages/coding-agent"
+
+          # Every scheduled group must yield a nonempty JUnit report; no absent report counts as success.
+          requested_reports = set()
+          release_required_cases = {
+              "v18111-persistence": [
+                  "preserves the saved transcript when a pending write later fails with ENOSPC",
+                  "reports a first-write store failure and exits nonzero without a raw fatal dump",
+              ],
+              "v18111-json-assets": [
+                  "preserves JSON values after relocating a bundle",
+                  "preserves JSON values after relocating a compiled executable",
+                  "rejects invalid large JSON while building",
+              ],
+              "v18111-compaction": [
+                  "as the newest entry",
+                  "behind a newer turn the replay drops for its malformed tool call",
+                  "replays the kept tail after a native compaction that stopped before it",
+                  "keeps a truncated deliverable instead of compacting it away",
+                  "retries a stop whose only content is signed thinking with empty text",
+              ],
+              "v18111-async": [
+                  "marks only the submitted error item failed after a mixed-result batch",
+                  "delivers a completion handle id after its creating cell finishes",
+                  "keeps a suspended run on its own artifact root while an overlapping run uses another",
+                  "stops polling a wait its client cancelled or aborted",
+              ],
+              "v18111-eval-completion": [
+                  "waits for a completion started in an earlier JavaScript cell",
+                  "times out waiting on a running completion started in an earlier JavaScript cell",
+              ],
+          }
+
+          def tests(label, paths, cwd=agent, parallel=False):
+              global ok
+              requested_reports.add(label)
+              for path in paths:
+                  assert (cwd / path).exists(), f"Missing mandatory suite: {path}"
+              args = ["bun", "test", "--timeout=120000", "--reporter=junit", f"--reporter-outfile={report / (label + '.xml')}"]
+              if parallel:
+                  args.append("--parallel=2")
+              ok = run(label, args + paths, cwd) and ok
+
+          # No name filters: retain ordinary native APFS/NTFS cases as well as all nine controlled boundary cases.
+          tests("gc", ["test/gc-cli.test.ts"])
+          tests("selected-leaf", ["test/task/restore-selected-leaf.test.ts"])
+          tests("restore", [
+              "test/task/restore-regressions.test.ts", "test/task/restore.test.ts", "test/task/restore-revive.test.ts",
+              "test/agent-session-restore.test.ts", "test/async-job-manager.test.ts", "test/registry/agent-lifecycle.test.ts",
+              "test/session/yield-queue.test.ts", "test/session-exit-diagnostics.test.ts", "test/tools/yield.test.ts",
+          ])
+          # v18.11.1 adds streamed-write durability and compressed JSON distribution assets.
+          # Run complete files on every host, including both relocated-bundle and compiled cases.
+          tests("v18111-persistence", [
+              "test/session-storage-streaming.test.ts", "test/modes/print-persistence-failure.test.ts",
+              "test/headless-persistence-shutdown.test.ts",
+          ])
+          tests("v18111-json-assets", ["test/json-parse-plugin.test.ts"])
+          if os.environ["EXPECTED_PLATFORM"] == "linux":
+              tests("v18111-compaction", [
+                  "../agent/test/compaction-cut-point.test.ts", "test/advisor-context-maintenance.test.ts",
+                  "test/agent-session-auto-compaction-progress-guard.test.ts", "test/agent-session-auto-compaction-queue.test.ts",
+                  "test/agent-session-unexpected-stop-guard.test.ts", "test/agent-session-stats.test.ts",
+              ])
+              tests("v18111-async", [
+                  "test/task/workpool.test.ts", "test/task/executor-result-acceptance.test.ts",
+                  "test/agent-session-todo-reminder-async-jobs.test.ts", "test/eval/worker-core.test.ts",
+                  "test/launch/broker-wait-generation.test.ts",
+              ])
+              tests("v18111-eval-completion", ["test/eval/completion-bridge.test.ts"])
+              tests("agent-runtime", ["../agent/test/tokenizer.test.ts", "../agent/test/remote-compaction.test.ts", "../agent/test/anthropic-native-compaction.test.ts", "../snapcompact/test/snapcompact.test.ts", "test/settings-stream-fn.test.ts"])
+              tests("replay-compaction", [
+                  "test/agent-session-eval-compaction-fork.test.ts", "test/compaction-hook-replay-boundary.test.ts",
+                  "test/compaction-flush-loop.test.ts", "test/compaction-speculation.test.ts", "test/agent-session-snapcompact-reader.test.ts",
+                  "test/agent-session-snapcompact-frame-dead-end.test.ts", "test/agent-session-snapcompact-auto-fallback.test.ts",
+                  "test/agent-session-handoff.test.ts", "test/agent-session-interrupted-thinking.test.ts", "test/task/completion-probe-cost.test.ts",
+                  "test/session-manager/usage-statistics.test.ts", "test/session-manager-atomic-rewrite-race.test.ts",
+                  "test/registry/persisted-agent-attribution.test.ts", "test/export-subsessions.test.ts",
+              ])
+              tests("approval-plan", ["test/tools/approval.test.ts", "test/tools/approval-mode.test.ts", "test/interactive-mode-plan-review.test.ts", "test/modes/controllers/event-controller-plan-approval-dispatch.test.ts", "../tui/test/plan-review-overlay.test.ts"])
+              catalog = root / "packages/catalog"
+              ok = run("catalog-check", ["bun", "run", "check"], catalog) and ok
+              ok = run("catalog-compile-rules", ["bun", "run", "gen:compat"], catalog) and ok
+              ok = run("catalog-rules-byte-comparison", ["git", "diff", "--exit-code", "--", "packages/catalog/src/compat/rules.json"]) and ok
+              tests("catalog-focused", ["test/generated-policies.test.ts", "test/build.test.ts", "test/model-thinking.test.ts", "test/compat-cascade.test.ts", "test/published-effort-ladders.test.ts", "test/compat-taxonomy.test.ts", "test/time-based-pricing.test.ts", "test/long-context-pricing.test.ts", "test/typesafe-discovery.test.ts", "test/model-cache-rewrites.test.ts", "test/model-manager-unbuildable-rows.test.ts"], catalog)
+              # Run every catalog test, including cache quarantine; never substitute a filtered pass.
+              tests("catalog-full", ["test"], catalog, parallel=True)
+              ok = run("importer", [sys.executable, "scripts/test_fork_sync_upstream.py"]) and ok
+
+          # Machine-readable outcomes expose every skip; the two remediation suites must execute completely.
+          coverage = {}
+          for xml in sorted(report.glob("*.xml")):
+              cases = list(ET.parse(xml).getroot().iter("testcase"))
+              def passed(case):
+                  return all(case.find(tag) is None for tag in ("failure", "error", "skipped"))
+              coverage[xml.stem] = {"total": len(cases), "passed": sum(passed(c) for c in cases), "skipped": [{"class": c.get("classname"), "name": c.get("name")} for c in cases if c.find("skipped") is not None]}
+              ok = bool(cases) and ok
+              if xml.stem in release_required_cases:
+                  required = release_required_cases[xml.stem]
+                  observed = {name: [c for c in cases if c.get("name") == name] for name in required}
+                  coverage[xml.stem]["requiredRegressionPassed"] = sum(len(matches) == 1 and passed(matches[0]) for matches in observed.values())
+                  ok = all(passed(c) for c in cases) and coverage[xml.stem]["requiredRegressionPassed"] == len(required) and ok
+              if xml.stem == "gc":
+                  boundary = [c for c in cases if c.get("classname") == "runGcCommand compression path boundary"]
+                  coverage["gc"]["compressionBoundaryPassed"] = sum(passed(c) for c in boundary)
+                  ok = len(boundary) == 9 and all(passed(c) for c in boundary) and ok
+                  if expected_compression != "unsupported":
+                      ordinary = [c for c in cases if c.get("classname") == "runGcCommand session compression" and c.get("name") == "--apply stores an idle session compressed with identical bytes and mtimes"]
+                      ok = len(ordinary) == 1 and passed(ordinary[0]) and ok
+              if xml.stem == "selected-leaf":
+                  ok = len(cases) == 13 and all(passed(c) for c in cases) and ok
+          ok = requested_reports.issubset(coverage) and "gc" in coverage and "selected-leaf" in coverage and "restore" in coverage and ok
+          p["requestedReports"] = sorted(requested_reports)
+          (report / "coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
+          ok = run("tracked-source-unchanged", ["git", "diff", "--exit-code"]) and ok
+          ok = run("tracked-index-unchanged", ["git", "diff", "--cached", "--exit-code"]) and ok
+          ok = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == source and ok
+          ok = subprocess.check_output(["git", "ls-remote", "--exit-code", "origin", "refs/heads/main"], text=True).split()[0] == p["trustedMainSha"] and ok
+          p.update({"result": "passed" if ok else "failed", "capabilities": capabilities, "coverage": coverage})
+          (report / "build.json").write_text(json.dumps(p, indent=2) + "\n")
+          (report / "SHA256SUMS.txt").write_text("".join(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.name}\n" for f in sorted(report.iterdir()) if f.is_file() and f.name != "SHA256SUMS.txt"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"Source: {source}\n\nTrusted main/workflow: {p['workflowSha']}\n\nTarget: {p['target']}; native SHA-256: {p['nativeSha256']}\n\nActual compression: {capabilities['compressionMethod']}; result: {p['result']}\n\n")
+              summary.write("```json\n" + json.dumps(coverage, indent=2) + "\n```\n")
+          sys.exit(0 if ok else 1)
+          PYCODE
+      - name: Preserve logs, JUnit, native capability and source provenance on every outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-v18.11.1-acceptance-${{ matrix.target }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          if-no-files-found: warn
+          retention-days: 14
