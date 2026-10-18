@@ -363,6 +363,7 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 				timestamp: Date.now(),
 			});
 			const extensionRunner = {
+				clearSessionApprovals: () => {},
 				hasHandlers: (eventType: string) => eventType === "session_tree",
 				emit: async () => undefined,
 			} as unknown as ExtensionRunner;
