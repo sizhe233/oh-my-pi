@@ -451,25 +451,33 @@ class SyncFixture(unittest.TestCase):
 
     def test_merge_preserves_history_fork_files_workflow_boundary_and_scoped_push(self):
         """Consumers get the exact two-parent source merge, without enabling upstream CI."""
+        os.environ["SYNC_BRANCH"] = "main"
+        before = self.remote_refs()
         output = self.invoke()
         candidate = output["candidate_sha"]
+        branch = f"sync/upstream-v1.1.0-{self.base}"
         self.assertEqual(output["changed"], "true")
+        self.assertEqual(output["sync_branch"], branch)
         self.assertEqual(self.run_git(self.remote, "show", "-s", "--format=%P", candidate).stdout.strip().split(),
                          [self.base, self.upstream_sha])
         self.assertEqual(self.run_git(self.remote, "show", f"{candidate}:fork.txt").stdout, "fork feature\n")
         self.assertEqual(self.run_git(self.remote, "show", f"{candidate}:upstream.txt").stdout, "upstream feature\n")
         self.assertEqual(self.run_git(self.remote, "diff", "--name-only", self.base, candidate, "--", SYNC.WORKFLOWS).stdout, "")
         manifest = json.loads(self.run_git(self.remote, "show", f"{candidate}:{SYNC.MANIFEST}").stdout)
+        self.assertEqual(manifest["baseSha"], self.base)
+        self.assertEqual(manifest["branch"], branch)
         self.assertEqual(manifest["upstreamSha"], self.upstream_sha)
         self.assertEqual(set(manifest["upstreamWorkflowChanges"]), {
             "M\t.github/workflows/common.yml", "A\t.github/workflows/new.yml", "D\t.github/workflows/removed.yml"})
         self.assertEqual(self.run_git(self.remote, "rev-parse", "main").stdout.strip(), self.base)
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "sync/upstream-v1.1.0").stdout.strip(), candidate)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", branch).stdout.strip(), candidate)
+        self.assertEqual(set(self.remote_refs().splitlines()) - set(before.splitlines()),
+                         {f"{candidate} refs/heads/{branch}"})
         self.assertNotIn("refs/tags/", self.remote_refs())
         pushes = [(args, env) for args, env in self.calls if args[0] == "push"]
         self.assertEqual(len(pushes), 1)
         args, environment = pushes[0]
-        self.assertEqual(args, ("push", f"https://github.com/{SYNC.DESTINATION}.git", f"{candidate}:refs/heads/sync/upstream-v1.1.0"))
+        self.assertEqual(args, ("push", f"https://github.com/{SYNC.DESTINATION}.git", f"{candidate}:refs/heads/{branch}"))
         self.assertEqual(environment["GIT_CONFIG_KEY_0"], f"http.https://github.com/{SYNC.DESTINATION}.git.extraheader")
         self.assertFalse(any(env is not None for command, env in self.calls if command[0] != "push"))
 
@@ -485,7 +493,66 @@ class SyncFixture(unittest.TestCase):
         self.checkout()
         os.environ["GITHUB_EVENT_NAME"] = "schedule"
         self.assertEqual(self.invoke()["changed"], "false")
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "sync/upstream-v1.1.0").stdout.strip(), original)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", f"sync/upstream-v1.1.0-{self.base}").stdout.strip(), original)
+
+    def test_new_trusted_base_uses_new_branch_without_rewriting_old_candidates(self):
+        """A reviewed main change can import the same release while prior candidate refs stay intact."""
+        original = self.invoke()
+        legacy_branch = "sync/upstream-v1.1.0"
+        self.run_git(self.remote, "update-ref", f"refs/heads/{legacy_branch}", original["candidate_sha"])
+        self.checkout()
+        self.write(self.work, ".github/workflows/acceptance.yml", "new reviewed acceptance workflow\n")
+        self.publish_fixture_main()
+        before = self.remote_refs()
+        self.calls.clear()
+        output = self.invoke()
+        branch = f"sync/upstream-v1.1.0-{self.base}"
+        candidate = output["candidate_sha"]
+        self.assertNotEqual(output["sync_branch"], original["sync_branch"])
+        self.assertEqual(output["sync_branch"], branch)
+        self.assertEqual(self.run_git(self.remote, "show", "-s", "--format=%P", candidate).stdout.strip().split(),
+                         [self.base, self.upstream_sha])
+        self.assertEqual(self.run_git(self.remote, "show", f"{candidate}:.github/workflows/acceptance.yml").stdout,
+                         "new reviewed acceptance workflow\n")
+        self.assertEqual(set(self.remote_refs().splitlines()),
+                         set(before.splitlines()) | {f"{candidate} refs/heads/{branch}"})
+        pushes = [args for args, _ in self.calls if args[0] == "push"]
+        self.assertEqual(pushes, [("push", f"https://github.com/{SYNC.DESTINATION}.git",
+                                  f"{candidate}:refs/heads/{branch}")])
+
+    def test_existing_candidate_from_another_base_is_rejected_without_writes(self):
+        """Putting an older candidate under a new base's name cannot omit the reviewed main change."""
+        original = self.invoke()["candidate_sha"]
+        self.checkout()
+        self.write(self.work, "later.txt", "new reviewed main change\n")
+        self.publish_fixture_main()
+        branch = f"sync/upstream-v1.1.0-{self.base}"
+        self.run_git(self.remote, "update-ref", f"refs/heads/{branch}", original)
+        before = self.remote_refs()
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "exact fork and upstream parents"):
+            self.invoke()
+        self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
+        self.assertEqual(self.remote_refs(), before)
+
+    def test_existing_candidate_manifest_branch_must_match_release_and_full_base(self):
+        """Valid merge parents cannot authorize a manifest claiming a different destination branch."""
+        output = self.invoke()
+        manifest = json.loads((self.work / SYNC.MANIFEST).read_text())
+        manifest["branch"] = "sync/upstream-v1.1.0"
+        self.write(self.work, SYNC.MANIFEST, json.dumps(manifest, indent=2) + "\n")
+        self.run_git(self.work, "add", SYNC.MANIFEST)
+        self.run_git(self.work, "commit", "--amend", "--no-edit")
+        forged = self.run_git(self.work, "rev-parse", "HEAD").stdout.strip()
+        self.run_git(self.work, "push", str(self.remote), f"{forged}:refs/fixture/wrong-manifest")
+        self.run_git(self.remote, "update-ref", f"refs/heads/{output['sync_branch']}", forged)
+        self.checkout()
+        before = self.remote_refs()
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "provenance mismatch"):
+            self.invoke()
+        self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
+        self.assertEqual(self.remote_refs(), before)
 
     def test_code_conflict_aborts_merge_without_publishing(self):
         """An overlapping application change is surfaced for review, never guessed or pushed."""
@@ -558,11 +625,12 @@ class SyncFixture(unittest.TestCase):
 
     def test_existing_nonmerge_branch_is_never_overwritten(self):
         """A name collision with a user branch stops instead of force-pushing."""
-        self.run_git(self.remote, "update-ref", "refs/heads/sync/upstream-v1.1.0", self.base)
+        branch = f"sync/upstream-v1.1.0-{self.base}"
+        self.run_git(self.remote, "update-ref", f"refs/heads/{branch}", self.base)
         with self.assertRaisesRegex(RuntimeError, "exact fork and upstream parents"):
             self.invoke()
         self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "sync/upstream-v1.1.0").stdout.strip(), self.base)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", branch).stdout.strip(), self.base)
 
     def test_forged_existing_candidate_tree_is_rejected_even_with_valid_parents(self):
         """Matching provenance cannot authorize unrelated source changes on an existing branch."""
@@ -572,14 +640,15 @@ class SyncFixture(unittest.TestCase):
         self.run_git(self.work, "commit", "--amend", "--no-edit")
         forged = self.run_git(self.work, "rev-parse", "HEAD").stdout.strip()
         self.run_git(self.work, "push", str(self.remote), f"{forged}:refs/fixture/forged")
-        self.run_git(self.remote, "update-ref", "refs/heads/sync/upstream-v1.1.0", forged)
+        branch = f"sync/upstream-v1.1.0-{self.base}"
+        self.run_git(self.remote, "update-ref", f"refs/heads/{branch}", forged)
         self.checkout()
         self.calls.clear()
         with self.assertRaisesRegex(RuntimeError, "reproducible merge tree"):
             self.invoke()
         self.assertNotEqual(candidate, forged)
         self.assertFalse(any(args[0] == "push" for args, _ in self.calls))
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "sync/upstream-v1.1.0").stdout.strip(), forged)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", branch).stdout.strip(), forged)
 
     def test_repository_hooks_do_not_execute_in_write_job(self):
         """Git merge and commit cannot execute a hook while the importer holds its token."""
