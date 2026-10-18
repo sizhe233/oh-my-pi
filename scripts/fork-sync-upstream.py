@@ -273,7 +273,8 @@ def validate_candidate(candidate: str, base: str, upstream_sha: str, tag: str) -
     if parents != [base, upstream_sha]:
         raise RuntimeError("Sync candidate must retain exact fork and upstream parents")
     manifest = json.loads(git("show", f"{candidate}:{MANIFEST}").stdout)
-    if (manifest.get("baseSha"), manifest.get("upstreamSha"), manifest.get("releaseTag")) != (base, upstream_sha, tag):
+    if (manifest.get("baseSha"), manifest.get("upstreamSha"), manifest.get("releaseTag"), manifest.get("branch")) != (
+            base, upstream_sha, tag, f"sync/upstream-{tag}-{base}"):
         raise RuntimeError("Existing sync branch provenance mismatch")
     if git("diff", "--name-only", base, candidate, "--", WORKFLOWS).stdout.strip():
         raise RuntimeError("Existing candidate modifies the fork workflow boundary")
@@ -312,7 +313,8 @@ def main() -> None:
         prior_match = TAG_PATTERN.fullmatch(prior["releaseTag"])
         if prior_match and tuple(map(int, TAG_PATTERN.fullmatch(tag).groups())) <= tuple(map(int, prior_match.groups())):
             raise RuntimeError("Release version is not newer than the recorded sync")
-    branch = f"sync/upstream-{tag}"
+    # Bind each candidate to the complete trusted base; keep older candidates intact.
+    branch = f"sync/upstream-{tag}-{base}"
     if not branch.startswith("sync/upstream-"):
         raise RuntimeError("Invalid destination branch")
     destination = f"https://github.com/{DESTINATION}.git"
