@@ -21,7 +21,8 @@ import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-r
 import type { AgentSession } from "../session/agent-session";
 import { hasRestorableTurn } from "../session/exit-diagnostics";
 import { extractSessionInit, type PersistedSessionInit } from "../session/session-manager";
-import { collectSubSessions } from "../session/sub-sessions";
+import type { SessionEntry } from "../session/session-entries";
+import { collectSubSessions, type SubSession } from "../session/sub-sessions";
 import type { EventBus } from "../utils/event-bus";
 import { runSubagentFollowUpTurn } from "./executor";
 import { persistedAgentDefinition } from "./persisted-revive";
@@ -69,6 +70,23 @@ export async function restoreSession(session: AgentSession, options: RestoreOpti
 	}
 }
 
+/** Inspect only the selected ancestry; abandoned siblings must not decide whether a turn resumes. */
+function selectedBranchEntries(sub: SubSession): SessionEntry[] {
+	const byId = new Map(sub.entries.map(entry => [entry.id, entry]));
+	const branch: SessionEntry[] = [];
+	const seen = new Set<string>();
+	let id = sub.leafId;
+	while (id !== null) {
+		const entry = byId.get(id);
+		// A broken ancestry is not authority to execute a persisted turn.
+		if (!entry || seen.has(id)) return [];
+		seen.add(id);
+		branch.push(entry);
+		id = entry.parentId;
+	}
+	return branch.reverse();
+}
+
 /**
  * Has every subagent of `session` that its last process left mid-turn go on with that
  * turn (see the module docs). Nothing is restored for a session without a file, or
@@ -108,7 +126,9 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 		if (sub.parent && !candidates.has(sub.parent)) continue;
 		candidates.set(key, { ref, init });
 	}
-	const interrupted = keys.filter(key => candidates.has(key) && hasRestorableTurn(subSessions[key]!.entries));
+	const interrupted = keys.filter(
+		key => candidates.has(key) && hasRestorableTurn(selectedBranchEntries(subSessions[key]!)),
+	);
 	const ownerKeys = new Set<string>();
 	for (const key of interrupted) {
 		for (let parent = subSessions[key]!.parent; parent; parent = subSessions[parent]!.parent) ownerKeys.add(parent);
@@ -167,28 +187,35 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 							throw new Error(`Subagent "${id}" changed before restore execution`);
 						}
 					}
-					const result = await runSubagentFollowUpTurn({
-						id,
-						agent: persistedAgentDefinition(ref.displayName, init),
-						message: init.task,
-						restore: true,
-						onRestoreSettled: owners.get(key)?.releaseIdle,
-						structured,
-						workPoolYieldItems: init.workPoolYieldItems,
-						outputSchema: init.outputSchema,
-						outputSchemaMode: init.outputSchemaMode,
-						signal,
-						eventBus: options.eventBus,
-						subagentEventBus: options.subagentEventBus,
-						artifactsDir: path.dirname(sessionFileOfRef),
-						maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
-					});
-					const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
-					const structuredOutput = result.structuredOutput;
-					if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
-						throw new AsyncJobError(text, structuredOutput);
+					// Acquire only after admission, for this exact generation. A leaf needs
+					// the same TTL protection as owners while its restored turn is settling.
+					const release = lifecycle.hold(id, ref);
+					try {
+						const result = await runSubagentFollowUpTurn({
+							id,
+							agent: persistedAgentDefinition(ref.displayName, init),
+							message: init.task,
+							restore: true,
+							onRestoreSettled: owners.get(key)?.releaseIdle,
+							structured,
+							workPoolYieldItems: init.workPoolYieldItems,
+							outputSchema: init.outputSchema,
+							outputSchemaMode: init.outputSchemaMode,
+							signal,
+							eventBus: options.eventBus,
+							subagentEventBus: options.subagentEventBus,
+							artifactsDir: path.dirname(sessionFileOfRef),
+							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
+						});
+						const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
+						const structuredOutput = result.structuredOutput;
+						if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
+							throw new AsyncJobError(text, structuredOutput);
+						}
+						return structuredOutput ? { text, structured: structuredOutput } : text;
+					} finally {
+						release();
 					}
-					return structuredOutput ? { text, structured: structuredOutput } : text;
 				},
 				{
 					id,

@@ -230,6 +230,7 @@ function noUiRunner(): ExtensionRunner {
 		consumeToolCallEmitted: () => false,
 		hasUI: () => false,
 		hasSessionApproval: () => false,
+		getSessionApprovalEpoch: () => 0,
 		sessionId: "acp-permission-test",
 		runScoped<T>(fn: () => T): T {
 			return fn();

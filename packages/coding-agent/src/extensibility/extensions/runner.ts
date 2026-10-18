@@ -446,6 +446,7 @@ export type ShutdownHandler = () => void;
  */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
+	extensionRunner.clearSessionApprovals();
 	try {
 		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
 		await extensionRunner.emit({
@@ -514,6 +515,8 @@ export class ExtensionRunner {
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	/** Grant keys (see `sessionApprovalScope`) approved "for this session", each prefixed by the session it covers. */
 	#sessionApprovals = new Set<string>();
+	#sessionApprovalEpoch = 0;
+	#sessionApprovalSessionId?: string;
 	#trackUserWait?: UserWaitTracker;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
@@ -1069,13 +1072,28 @@ export class ExtensionRunner {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
 	}
 
-	/** Whether the user approved `key` for the current session; a new or switched session starts with none. */
+	/** Capture the current approval lifetime before awaiting UI or extension handlers. */
+	getSessionApprovalEpoch(): number {
+		if (this.#sessionApprovalSessionId !== this.sessionId) this.clearSessionApprovals();
+		return this.#sessionApprovalEpoch;
+	}
+
+	/** Revoke grants and pending responses, including resets that retain the same session id. */
+	clearSessionApprovals(): void {
+		this.#sessionApprovals.clear();
+		this.#sessionApprovalSessionId = this.sessionId;
+		this.#sessionApprovalEpoch++;
+	}
+
+	/** Whether the user approved `key` for the current, uninterrupted session lifetime. */
 	hasSessionApproval(key: string): boolean {
-		return this.#sessionApprovals.has(`${this.sessionId}\0${key}`);
+		this.getSessionApprovalEpoch();
+		return this.#sessionApprovals.has(key);
 	}
 
 	grantSessionApproval(key: string): void {
-		this.#sessionApprovals.add(`${this.sessionId}\0${key}`);
+		this.getSessionApprovalEpoch();
+		this.#sessionApprovals.add(key);
 	}
 
 	getUIContext(): ExtensionUIContext {

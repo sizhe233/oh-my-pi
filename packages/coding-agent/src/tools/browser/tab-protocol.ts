@@ -178,7 +178,11 @@ export type WorkerOutbound =
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
-	| { type: "closed" };
+	| {
+			type: "closed";
+			/** The worker could not confirm its owned page closed; the supervisor must attempt fallback closure. */
+			targetCloseFailed?: boolean;
+	  };
 
 export interface Transport {
 	send(msg: WorkerOutbound | WorkerInbound, transferList?: Transferable[]): void;

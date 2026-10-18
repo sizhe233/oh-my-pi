@@ -2302,9 +2302,11 @@ function closeAbandonedOwnedTarget(browser: PuppeteerBrowserHandle, initPayload:
 }
 
 async function waitForClosed(tab: WorkerTabSession): Promise<void> {
-	const { promise, resolve } = Promise.withResolvers<void>();
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
 	const unsubscribe = tab.worker.onMessage(msg => {
-		if (msg.type === "closed") resolve();
+		if (msg.type !== "closed") return;
+		if (msg.targetCloseFailed) reject(new ToolError("Browser tab worker could not close its owned target"));
+		else resolve();
 	});
 	try {
 		await raceWithTimeout(promise, GRACE_MS, "Timed out closing browser tab worker");

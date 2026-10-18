@@ -358,12 +358,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		};
 
 		if (approvalCheck.required) {
+			const approvalEpoch = this.runner.getSessionApprovalEpoch();
+			const assertApprovalCurrent = () => {
+				if (this.runner.getSessionApprovalEpoch() === approvalEpoch) return;
+				cancelPreflight();
+				throw new Error(`Tool approval invalidated because the session changed: ${this.tool.name}`);
+			};
 			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
 			if (
 				scheduledCall?.id === toolCallId &&
 				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
 			) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
+				assertApprovalCurrent();
 			}
 
 			const hasApprovalHandlers =
@@ -412,24 +419,29 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 			}
 
+			assertApprovalCurrent();
 			const uiContext = this.runner.getUIContext();
 			const safetyAppendix =
 				pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
 			let approved: boolean;
+			let grantSession = false;
 			try {
 				const answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
 					reason: approvalCheck.reason,
 					appendix: safetyAppendix,
 					sessionSubject: sessionScope?.subject,
 				});
+				assertApprovalCurrent();
 				approved = answer !== "deny";
-				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
+				grantSession = answer === "session";
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				cancelPreflight();
 				throw err;
 			}
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+			assertApprovalCurrent();
+			if (grantSession && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
 			if (!approved) {
 				cancelPreflight();
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);

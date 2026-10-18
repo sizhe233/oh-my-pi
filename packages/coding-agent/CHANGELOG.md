@@ -4,7 +4,9 @@
 
 ### Fixed
 
+- Fixed cleanup losing track of omp-created browser tabs when a close attempt fails.
 - Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
+
 ## [18.12.1] - 2026-10-17
 
 ### Breaking Changes

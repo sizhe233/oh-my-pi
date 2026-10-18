@@ -960,6 +960,7 @@ describe("AgentSession advisor toggle", () => {
 	});
 	it("clears advisor cost when a branch skips conversation restore", async () => {
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => ({ skipConversationRestore: true }),
 		} as unknown as ExtensionRunner;
@@ -1000,6 +1001,7 @@ describe("AgentSession advisor toggle", () => {
 	it("clears advisor cost when a branch hook throws after the session changed", async () => {
 		const failure = new Error("session_branch handler failed");
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: () => false,
 			emit: async (event: { type: string }) => {
 				if (event.type === "session_branch") throw failure;

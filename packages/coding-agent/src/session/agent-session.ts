@@ -5753,6 +5753,7 @@ export class AgentSession implements SettingsScope {
 	 * gap slips past the disposal guards.
 	 */
 	beginDispose(): void {
+		this.#extensionRunner?.clearSessionApprovals();
 		this.#isDisposed = true;
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
@@ -6158,6 +6159,7 @@ export class AgentSession implements SettingsScope {
 		// after the boundary and re-enter the supposedly empty context. The
 		// sibling boundary op (branchFromBtw) guards on the same predicates.
 		if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
+		this.#extensionRunner?.clearSessionApprovals();
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
@@ -10157,6 +10159,7 @@ export class AgentSession implements SettingsScope {
 			}
 		}
 
+		this.#extensionRunner?.clearSessionApprovals();
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
@@ -10328,6 +10331,7 @@ export class AgentSession implements SettingsScope {
 		await this.flushToDisk();
 		// Work admitted during the hook or flush awaits would be copied mid-flight.
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
+		if (previousSessionFile) this.#extensionRunner?.clearSessionApprovals();
 		let advisorRecordersDetached = false;
 		try {
 			advisorRecordersDetached = true;
@@ -11783,6 +11787,7 @@ export class AgentSession implements SettingsScope {
 			}
 		}
 
+		this.#extensionRunner?.clearSessionApprovals();
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
 		await this.#sessionBeforeSwitchReconciler?.();
@@ -12240,6 +12245,7 @@ export class AgentSession implements SettingsScope {
 		// old session (pending messages, async jobs, auto-learn capture) is discarded.
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 
+		this.#extensionRunner?.clearSessionApprovals();
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -12356,6 +12362,7 @@ export class AgentSession implements SettingsScope {
 		);
 		this.#assertIdleForSnapshot("branch /btw");
 
+		this.#extensionRunner?.clearSessionApprovals();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#releaseQueuedTtsrReservations();

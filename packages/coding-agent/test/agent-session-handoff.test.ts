@@ -540,6 +540,7 @@ describe("AgentSession handoff", () => {
 			settings: { ...compactionModule.DEFAULT_COMPACTION_SETTINGS, strategy: "context-full" },
 		};
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "session.compacting"),
 			emit: vi.fn(async (event: { type: string }) =>
 				event.type === "session.compacting"
@@ -611,6 +612,7 @@ describe("AgentSession handoff", () => {
 			settings: { ...compactionModule.DEFAULT_COMPACTION_SETTINGS, strategy: "context-full" },
 		};
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "session.compacting"),
 			emit: vi.fn(async (event: { type: string }) =>
 				event.type === "session.compacting"

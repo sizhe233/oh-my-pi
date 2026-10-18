@@ -3467,9 +3467,14 @@ export class WorkerCore {
 		await this.#tracing?.dispose();
 		await this.#consoleCapture.detach();
 		this.#emulation?.dispose();
-		if (this.#ownsTarget && page && !page.isClosed()) await page.close().catch(() => undefined);
+		let targetCloseFailed = false;
+		if (this.#ownsTarget && page && !page.isClosed()) {
+			await page.close().catch(() => {
+				targetCloseFailed = true;
+			});
+		}
 		if (this.#browser?.connected) this.#browser.disconnect();
-		this.#transport.send({ type: "closed" });
+		this.#transport.send({ type: "closed", targetCloseFailed });
 		this.#transport.close();
 	}
 
