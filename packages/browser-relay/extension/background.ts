@@ -11,7 +11,12 @@
  * port with a fetch first: a refused WebSocket is logged into the extension's
  * error list by Chrome's network layer on every attempt, a refused fetch is not.
  */
-import type { ExtToRelayMessage, RelayToExtMessage, TabSnapshot } from "../../coding-agent/src/tools/browser/relay/protocol";
+import { ABANDONED_TABS_PROTOCOL_VERSION } from "../../coding-agent/src/tools/browser/relay/protocol";
+import type {
+	ExtToRelayMessage,
+	RelayToExtMessage,
+	TabSnapshot,
+} from "../../coding-agent/src/tools/browser/relay/protocol";
 import { ownedDebuggerTabs } from "./debugger-ownership";
 
 import { ScreenshotCapture } from "./screenshot-capture";
@@ -27,9 +32,11 @@ const screenshotCapture = new ScreenshotCapture(
 const DEFAULT_PORT = 9224;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
-/** The 30s keepalive alarm also re-dials; omp's relay wait assumes one dial per alarm period. */
-const RECONNECT_MAX_MS = 30_000;
+// Keep browser-affine open retries inside the relay's 12-second reconnect window.
+const RECONNECT_MAX_MS = 10_000;
 const PROBE_TIMEOUT_MS = 2_000;
+const REMOVE_TAB_ATTEMPTS = 3;
+const REMOVE_TAB_RETRY_MS = 500;
 
 let ws: WebSocket | null = null;
 let reconnectDelay = RECONNECT_MIN_MS;
@@ -66,6 +73,52 @@ async function markCreatedTab(tabId: number, created: boolean): Promise<void> {
 	await chrome.storage.session.set({ [CREATED_TABS_KEY]: [...ids] }).catch(() => {});
 }
 
+/** Unacknowledged late creates survive a service-worker restart, but not a new browser incarnation. */
+const ABANDONED_TABS_KEY = "ompAbandonedTabIds";
+let abandonedTabs: Promise<Set<number>> | null = null;
+let abandonedWrites: Promise<void> = Promise.resolve();
+let greetedSocket: WebSocket | null = null;
+let arbitratedSocket: WebSocket | null = null;
+function loadAbandonedTabs(): Promise<Set<number>> {
+	abandonedTabs ??= chrome.storage.session.get({ [ABANDONED_TABS_KEY]: [] }).then(stored => {
+		const raw = stored[ABANDONED_TABS_KEY];
+		return new Set(Array.isArray(raw) ? raw.filter((id): id is number => typeof id === "number") : []);
+	});
+	return abandonedTabs;
+}
+
+function markAbandonedTab(tabId: number, abandoned: boolean): Promise<void> {
+	const next = abandonedWrites.then(async () => {
+		const ids = await loadAbandonedTabs();
+		if (abandoned) ids.add(tabId);
+		else ids.delete(tabId);
+		await chrome.storage.session.set({ [ABANDONED_TABS_KEY]: [...ids] });
+	});
+	abandonedWrites = next.catch(() => {});
+	return next;
+}
+
+/** Report through the current hello-bound connection; only the relay can arbitrate live claims. */
+async function reportAbandonedTabs(socket: WebSocket): Promise<void> {
+	await abandonedWrites;
+	const ids = await loadAbandonedTabs();
+	if (ws !== socket || greetedSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
+	for (const tabId of ids) {
+		const tab = await chrome.tabs.get(tabId).catch(async (error: unknown) => {
+			// An unavailable browser API is not proof that the owned tab disappeared.
+			if (error instanceof Error && /No tab with id/i.test(error.message)) {
+				await markAbandonedTab(tabId, false);
+			}
+			return null;
+		});
+		if (!tab) continue;
+		const snap = snapshot(tab);
+		if (snap && ws === socket && greetedSocket === socket && socket.readyState === WebSocket.OPEN) {
+			socket.send(JSON.stringify({ t: "abandonedTab", tab: snap } satisfies ExtToRelayMessage));
+		}
+	}
+}
+
 /**
  * Stable per-install browser identity, persisted in `chrome.storage.local` and
  * sent in every hello. The relay namespaces tab registries per instance, so
@@ -81,6 +134,25 @@ async function ensureInstanceId(): Promise<string> {
 	instanceId = typeof existing === "string" && existing.length > 0 ? existing : crypto.randomUUID();
 	await chrome.storage.local.set({ [key]: instanceId } as Record<string, string>);
 	return instanceId;
+}
+
+/**
+ * Identity of this browser run, in `chrome.storage.session`. Chrome clears it on restart, when it also reuses tab
+ * ids, so the relay retires the previous run's targets instead of resolving an old target id to a new tab. An
+ * extension reload clears it too: omp then loses its handles to the tabs it opened, which stay open.
+ */
+let browserSession: Promise<string> | null = null;
+function ensureBrowserSession(): Promise<string> {
+	browserSession ??= (async () => {
+		const key = "relayBrowserSession";
+		const stored = await chrome.storage.session.get({ [key]: "" });
+		const existing = stored[key];
+		if (typeof existing === "string" && existing.length > 0) return existing;
+		const created = crypto.randomUUID();
+		await chrome.storage.session.set({ [key]: created } as Record<string, string>);
+		return created;
+	})();
+	return browserSession;
 }
 
 interface RelaySettings {
@@ -175,6 +247,23 @@ function post(msg: ExtToRelayMessage): void {
 	if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
+/** Chrome can refuse a tab close for a moment (a tab being dragged, an unload in progress); try again before failing. */
+async function removeTab(tabId: number): Promise<void> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await chrome.tabs.remove(tabId);
+			return;
+		} catch (error) {
+			// Already closed: the close the relay asked for has happened.
+			if (/No tab with id/.test(String(error))) return;
+			if (attempt >= REMOVE_TAB_ATTEMPTS) throw error;
+			const pause = Promise.withResolvers<void>();
+			setTimeout(pause.resolve, REMOVE_TAB_RETRY_MS);
+			await pause.promise;
+		}
+	}
+}
+
 async function setBadge(connected: boolean): Promise<void> {
 	try {
 		await chrome.action.setBadgeText({ text: connected ? "on" : "off" });
@@ -185,10 +274,11 @@ async function setBadge(connected: boolean): Promise<void> {
 }
 
 async function buildHello(): Promise<ExtToRelayMessage> {
-	const [tabs, targets, created] = await Promise.all([
+	const [tabs, targets, created, abandoned] = await Promise.all([
 		chrome.tabs.query({}),
 		chrome.debugger.getTargets(),
 		loadCreatedTabs(),
+		loadAbandonedTabs(),
 	]);
 	const snapshots: TabSnapshot[] = [];
 	for (const tab of tabs) {
@@ -203,12 +293,15 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 	return {
 		t: "hello",
 		instanceId: await ensureInstanceId(),
+		browserSession: await ensureBrowserSession(),
 		userAgent: navigator.userAgent,
 		browserVersion: versionMatch?.[0] ?? "Chrome/unknown",
 		discardedTabsProtocol: 1, // Keep in sync with the relay protocol version.
 		tabs: snapshots,
 		attachedTabIds,
 		ownedTabIds: snapshots.filter(snap => created.has(snap.tabId)).map(snap => snap.tabId),
+		abandonedTabIds: [...abandoned],
+		abandonedTabsProtocol: ABANDONED_TABS_PROTOCOL_VERSION,
 	};
 }
 
@@ -221,13 +314,12 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 async function tabWindowId(): Promise<number | undefined> {
 	const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
 	const chosen =
-		windows.find(window => window.focused) ??
-		windows.find(window => window.state !== "minimized") ??
-		windows[0];
+		windows.find(window => window.focused) ?? windows.find(window => window.state !== "minimized") ?? windows[0];
 	return chosen?.id;
 }
 
-async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<unknown> {
+/** Run one relay RPC; `origin` is the socket it came in on, which alone can carry its answer. */
+async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>, origin: WebSocket): Promise<unknown> {
 	switch (msg.op) {
 		case "attach":
 			await chrome.debugger.attach({ tabId: msg.tabId }, "1.3");
@@ -248,15 +340,30 @@ async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<un
 				msg.params,
 			);
 		case "createTab": {
+			if (origin !== ws || origin.readyState !== WebSocket.OPEN || origin !== arbitratedSocket) {
+				throw new Error(
+					"Update the omp browser relay before creating owned tabs: late-create arbitration is unavailable",
+				);
+			}
 			// Keep automatic relay tabs in the background; only an explicit RPC override may select them.
-			const tab = await chrome.tabs.create({ url: msg.url, active: msg.active ?? false, windowId: await tabWindowId() });
+			const tab = await chrome.tabs.create({
+				url: msg.url,
+				active: msg.active ?? false,
+				windowId: await tabWindowId(),
+			});
 			const snap = snapshot(tab);
 			if (!snap) throw new Error("created tab has no id");
 			await markCreatedTab(snap.tabId, true);
+			// Another driver can already have adopted this tab on the replacement socket.
+			// Persist the abandoned create and ask the relay to arbitrate; never remove it directly.
+			if (origin !== ws || origin.readyState !== WebSocket.OPEN) {
+				await markAbandonedTab(snap.tabId, true);
+				if (ws) void reportAbandonedTabs(ws).catch(() => {});
+			}
 			return { tab: snap };
 		}
 		case "removeTab":
-			await chrome.tabs.remove(msg.tabId);
+			await removeTab(msg.tabId);
 			return {};
 		case "activateTab": {
 			const tab = await chrome.tabs.get(msg.tabId);
@@ -272,7 +379,7 @@ async function runRpc(msg: Extract<RelayToExtMessage, { t: "rpc" }>): Promise<un
 	}
 }
 
-function handleRelayMessage(raw: string): void {
+function handleRelayMessage(socket: WebSocket, raw: string): void {
 	let msg: RelayToExtMessage;
 	try {
 		msg = JSON.parse(raw) as RelayToExtMessage;
@@ -280,10 +387,32 @@ function handleRelayMessage(raw: string): void {
 		return;
 	}
 	if (msg.t === "pong") return;
-	void runRpc(msg)
-		.then(result => post({ t: "rpcResult", id: msg.id, ok: true, result }))
+	if (msg.t === "helloAck") {
+		if (
+			ws === socket &&
+			greetedSocket === socket &&
+			socket.readyState === WebSocket.OPEN &&
+			msg.abandonedTabsProtocol === ABANDONED_TABS_PROTOCOL_VERSION
+		) {
+			arbitratedSocket = socket;
+		}
+		return;
+	}
+	if (msg.t === "abandonedTabHandled") {
+		if (ws === socket && greetedSocket === socket && socket.readyState === WebSocket.OPEN) {
+			void markAbandonedTab(msg.tabId, false).catch(() => {});
+		}
+		return;
+	}
+	// Answer only on the socket the RPC came in on: RPC ids are local to that connection, and the relay already
+	// failed the call when it closed.
+	const answer = (reply: ExtToRelayMessage): void => {
+		if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(reply));
+	};
+	void runRpc(msg, socket)
+		.then(result => answer({ t: "rpcResult", id: msg.id, ok: true, result }))
 		.catch((err: unknown) => {
-			post({ t: "rpcResult", id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) });
+			answer({ t: "rpcResult", id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) });
 		});
 }
 
@@ -327,12 +456,18 @@ async function connect(): Promise<void> {
 		socket.onopen = () => {
 			reconnectDelay = RECONNECT_MIN_MS;
 			void setBadge(true);
-			void buildHello().then(hello => post(hello));
+			void buildHello().then(hello => {
+				if (ws === socket && socket.readyState === WebSocket.OPEN) {
+					greetedSocket = socket;
+					socket.send(JSON.stringify(hello));
+					void reportAbandonedTabs(socket).catch(() => {});
+				}
+			});
 			clearInterval(pingTimer ?? undefined);
 			pingTimer = setInterval(() => post({ t: "ping" }), PING_INTERVAL_MS);
 		};
 		socket.onmessage = event => {
-			if (typeof event.data === "string") handleRelayMessage(event.data);
+			if (typeof event.data === "string") handleRelayMessage(socket, event.data);
 		};
 		socket.onclose = () => {
 			if (ws !== socket) return;
@@ -383,17 +518,21 @@ chrome.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-	void chrome.tabs.get(tabId).then(tab => {
-		const snap = snapshot(tab);
-		if (snap) post({ t: "tabUpdated", tab: snap });
-	}).catch(() => {
-		// The tab may have closed before Chrome answered.
-	});
+	void chrome.tabs
+		.get(tabId)
+		.then(tab => {
+			const snap = snapshot(tab);
+			if (snap) post({ t: "tabUpdated", tab: snap });
+		})
+		.catch(() => {
+			// The tab may have closed before Chrome answered.
+		});
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
 	screenshotCapture.detach({ tabId });
 	void markCreatedTab(tabId, false);
+	void markAbandonedTab(tabId, false).catch(() => {});
 	post({ t: "tabRemoved", tabId });
 });
 
