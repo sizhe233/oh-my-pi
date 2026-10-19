@@ -4,7 +4,10 @@
 
 ### Fixed
 
+- Fixed relay reconnection cleanup closing a tab adopted by another session; safe owned-tab creation now requires late-create arbitration support from both the relay and extension.
+- Fixed browser cleanup removing selected upload files before an owned tab was confirmed closed, or closing a tab claimed by another live session.
 - Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
+
 ## [18.12.2] - 2026-10-18
 
 ### Added

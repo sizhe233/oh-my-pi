@@ -123,6 +123,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		gates = [];
 		extensionEnds = [];
 		extensionRunner = {
+			clearSessionApprovals: () => {},
 			emit: vi.fn(async (event: ExtensionEvent) => {
 				if (event.type === "agent_end") extensionEnds.push(event);
 			}),

@@ -90,6 +90,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		// while returning the same short-circuit result without compiling a
 		// temporary extension for every test.
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			initialize: () => {},
 			onError: () => {},
 			hasHandlers: (type: string) => compactHookEnabled && type === "session_before_compact",

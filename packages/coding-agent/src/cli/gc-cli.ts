@@ -1878,7 +1878,15 @@ async function collectSessionFiles(session: SessionInfo): Promise<string[]> {
 	const artifactsDir = sessionArtifactsPath(session.path);
 	const files = [session.path];
 	try {
-		for await (const name of ANY_FILE_GLOB.scan({ cwd: artifactsDir, dot: true, onlyFiles: true })) {
+		// Glob's no-follow option does not protect its cwd itself.
+		const rootStat = await fs.lstat(artifactsDir);
+		if (rootStat.isSymbolicLink()) throw new Error("Refusing symlinked session artifact root");
+		for await (const name of ANY_FILE_GLOB.scan({
+			cwd: artifactsDir,
+			dot: true,
+			onlyFiles: true,
+			followSymlinks: false,
+		})) {
 			if (isCompressScratchPath(name)) continue;
 			files.push(path.join(artifactsDir, name));
 		}

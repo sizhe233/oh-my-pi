@@ -80,6 +80,7 @@ describe("AgentSession bash session ownership", () => {
 		const completion = Promise.withResolvers<{ result: typeof bashResult }>();
 		const emitUserBash = vi.fn(() => completion.promise);
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
 			emit: vi.fn().mockResolvedValue(undefined),
@@ -136,6 +137,7 @@ describe("AgentSession bash session ownership", () => {
 		}));
 		const definition = createBashTool(tempDir.path(), { spawnHook });
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn(() => false),
 			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 			emit: vi.fn().mockResolvedValue(undefined),
@@ -181,6 +183,7 @@ describe("AgentSession bash session ownership", () => {
 			}));
 			const definition = createBashTool(tempDir.path(), { spawnHook });
 			const extensionRunner = {
+				clearSessionApprovals: () => {},
 				hasHandlers: vi.fn(() => false),
 				getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 				emit: vi.fn().mockResolvedValue(undefined),
@@ -224,6 +227,7 @@ describe("AgentSession bash session ownership", () => {
 		});
 		const definition = createBashTool(tempDir.path(), { spawnHook });
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn(() => false),
 			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 			emit: vi.fn().mockResolvedValue(undefined),
@@ -248,6 +252,7 @@ describe("AgentSession bash session ownership", () => {
 		const definition = createBashTool(tempDir.path(), { spawnHook });
 		const emitUserBash = vi.fn().mockResolvedValue({ result: bashResult });
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
 			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
@@ -445,6 +450,7 @@ describe("AgentSession bash session ownership", () => {
 	it("starts a fresh shell after a command that was pending when its session was left", async () => {
 		const hook = Promise.withResolvers<undefined>();
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			// The first command waits in its hook until the session has changed, then runs.
 			emitUserBash: vi.fn().mockReturnValueOnce(hook.promise).mockResolvedValue(undefined),
