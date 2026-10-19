@@ -100,12 +100,6 @@ export type WorkerInitPayload =
 			 * previously force-killed the tab). Never set for first-time Electron attach.
 			 */
 			recover?: boolean;
-			/**
-			 * True when omp created this page itself (a relay-forced fresh tab) rather
-			 * than adopting a pre-existing user tab. Only owned targets are closed by
-			 * the worker on `{ type: "close" }` — an adopted tab belongs to the user.
-			 */
-			ownsTarget?: boolean;
 			/** Session tab name used to group omp-owned relay tabs. */
 			groupLabel?: string;
 			/**
@@ -183,7 +177,7 @@ export type WorkerOutbound =
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
-	| { type: "closed" };
+	| { type: "closed"; targetCloseFailed?: boolean };
 
 export interface Transport {
 	send(msg: WorkerOutbound | WorkerInbound, transferList?: Transferable[]): void;

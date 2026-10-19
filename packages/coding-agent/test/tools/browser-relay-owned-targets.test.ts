@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
-import { closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
+import { closeRelayOwnedTarget, closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
 import type { RelayToExtMessage } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 
 const WS_ENDPOINT = "ws://relay.test/cdp";
@@ -25,6 +25,8 @@ function connectOwnedTab(bridge: RelayBridge): { extension: RelaySocket; removed
 		extension,
 		JSON.stringify({
 			t: "hello",
+			instanceId: "owned-target-fixture",
+			browserSession: "same-browser-run",
 			userAgent: "test",
 			browserVersion: "Chrome/151.0.0.0",
 			discardedTabsProtocol: 1,
@@ -96,7 +98,7 @@ describe("relay owned-target close confirmation", () => {
 		expect(bridge.listTargets()).toEqual([]);
 	});
 
-	it("keeps an offline target unresolved even though discovery hides it, allowing a later retry", async () => {
+	it("retains an offline target, then consumes its record after reconnect completes the queued close", async () => {
 		const bridge = new RelayBridge({});
 		const { extension, removed, targetId } = connectOwnedTab(bridge);
 		installRelayTransport(bridge);
@@ -107,7 +109,10 @@ describe("relay owned-target close confirmation", () => {
 		expect(removed).toEqual([]);
 
 		const reconnected = connectOwnedTab(bridge);
-		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(true);
+		expect(reconnected.targetId).toBe(targetId);
+		// The upstream relay retries the queued live close on hello. The durable reaper
+		// must then consume that record without closing any other tab.
+		expect(await closeRelayOwnedTarget(WS_ENDPOINT, targetId)).toBe(true);
 		expect(reconnected.removed).toEqual([9]);
 	});
 

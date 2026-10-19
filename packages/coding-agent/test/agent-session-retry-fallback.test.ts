@@ -1757,6 +1757,7 @@ describe("AgentSession retry fallback", () => {
 				};
 			});
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			emit: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn().mockReturnValue(false),
 			emitBeforeAgentStart: vi.fn(async () => {
@@ -4197,6 +4198,7 @@ describe("AgentSession retry fallback", () => {
 		const sessionStopCalls: number[] = [];
 		const sessionStopLastAssistantMessages: Array<AssistantMessage | undefined> = [];
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),

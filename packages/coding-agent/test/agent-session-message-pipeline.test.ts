@@ -1939,6 +1939,7 @@ describe("AgentSession message pipeline", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {} as never,
 			extensionRunner: {
+				clearSessionApprovals: () => {},
 				hasHandlers: () => true,
 				emit: extensionEmit,
 			} as never,

@@ -87,6 +87,7 @@ describe("AgentSession.fork(entryId)", () => {
 			event.type === "session_before_branch" ? { cancel: true } : undefined,
 		);
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit,
 		} as unknown as ExtensionRunner;
@@ -123,6 +124,7 @@ describe("AgentSession.fork(entryId)", () => {
 		// The hook admits user eval work, which keeps running after the hook returns.
 		const userEval = new AbortController();
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => {
 				session!.trackEvalExecution(Promise.withResolvers<void>().promise, userEval).catch(() => undefined);
@@ -197,6 +199,7 @@ describe("AgentSession.fork(entryId)", () => {
 	] as const)("extends a cut at %s through the batch's recorded results", async (_label, cutAt) => {
 		const emit = vi.fn(async (_event: { type: string }) => undefined);
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit,
 		} as unknown as ExtensionRunner;
