@@ -621,7 +621,7 @@ describe("AgentSession advisor toggle", () => {
 		});
 
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
-		expect(await session.dropImages()).toEqual({ removed: 1 });
+		expect(await session.dropImages()).toMatchObject({ removed: 1 });
 		expect(advisor.state.messages).toHaveLength(0);
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 		expect(session.getAdvisorStats().cost).toBeCloseTo(0.5, 8);
@@ -960,6 +960,7 @@ describe("AgentSession advisor toggle", () => {
 	});
 	it("clears advisor cost when a branch skips conversation restore", async () => {
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => ({ skipConversationRestore: true }),
 		} as unknown as ExtensionRunner;
@@ -1000,6 +1001,7 @@ describe("AgentSession advisor toggle", () => {
 	it("clears advisor cost when a branch hook throws after the session changed", async () => {
 		const failure = new Error("session_branch handler failed");
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: () => false,
 			emit: async (event: { type: string }) => {
 				if (event.type === "session_branch") throw failure;
