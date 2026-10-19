@@ -337,11 +337,13 @@ describe("AgentSession empty stop guard", () => {
 		expect(assistantText(session.agent.state.messages)).toContain("fresh final answer");
 	});
 
-	it("accepts a signed thinking-only stop without retrying", async () => {
-		const { session, mock } = await createHarness([
-			signedThinkingOnlyStop(),
-			{ content: ["must not be requested"], stopReason: "stop" },
-		]);
+	it("keeps a signed thinking-only stop instead of discarding it as empty", async () => {
+		// Unexpected-stop recovery owns signed thinking-only stops; disable it so
+		// only the empty-stop guard decides the turn.
+		const { session, mock } = await createHarness(
+			[signedThinkingOnlyStop(), { content: ["must not be requested"], stopReason: "stop" }],
+			{ "features.unexpectedStopDetection": "none" },
+		);
 
 		await session.prompt("finish with signed thinking");
 		await session.waitForIdle();
@@ -451,6 +453,7 @@ describe("AgentSession empty stop guard", () => {
 		const finalMessageEndEntered = Promise.withResolvers<void>();
 		let assistantMessageEnds = 0;
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "message_end"),
 			emitBeforeAgentStart: vi.fn(async () => undefined),
 			emit: vi.fn(async (event: { type: string; message?: AgentMessage }) => {
