@@ -1,15 +1,38 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.10.3",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.10.3",
-  "releaseId": 410932075,
-  "publishedAt": "2026-10-12T19:23:53Z",
-  "upstreamSha": "81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b",
-  "baseSha": "82c829b5e3092f1647ede503a09c5cd60ed3f65e",
-  "mergeBaseSha": "c8913466dd7bf92040de911f8e00e30b8f4e48a2",
-  "branch": "sync/upstream-v18.10.3",
+  "releaseTag": "v18.12.2",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.12.2",
+  "releaseId": 416712440,
+  "publishedAt": "2026-10-18T21:03:22Z",
+  "upstreamSha": "1d5aff90b057ce7dbfe32ea557a527c1b3144b72",
+  "baseSha": "64bdd6ddded030ad6fdefc1303904f4c048e9758",
+  "mergeBaseSha": "81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b",
+  "branch": "sync/upstream-v18.12.2-64bdd6ddded030ad6fdefc1303904f4c048e9758",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
   "upstreamWorkflowChanges": [],
-  "reviewedConflictResolutions": null
+  "reviewedConflictResolutions": {
+    "path": ".github/upstream-resolutions/v18.12.2.json",
+    "blob": "7703314c48db4e925473c124c610688d22a872f1",
+    "resolvedPaths": [
+      "packages/agent/src/tokenizer.ts",
+      "packages/agent/test/tokenizer.test.ts",
+      "packages/browser-relay/README.md",
+      "packages/browser-relay/extension/background.ts",
+      "packages/catalog/src/models.json",
+      "packages/coding-agent/src/tools/browser/relay/bridge.ts",
+      "packages/coding-agent/src/tools/browser/relay/extension-assets/background.js.txt",
+      "packages/coding-agent/src/tools/browser/relay/protocol.ts",
+      "packages/coding-agent/src/tools/browser/screenshot.ts",
+      "packages/coding-agent/src/tools/browser/tab-supervisor.ts",
+      "packages/coding-agent/src/tools/browser/tab-worker.ts",
+      "packages/coding-agent/test/tools/browser-attach.test.ts",
+      "packages/coding-agent/test/tools/browser-op-tracking.test.ts",
+      "packages/coding-agent/test/tools/browser-relay-bridge.test.ts",
+      "packages/coding-agent/test/tools/chromium-probe.ts"
+    ],
+    "postMergeTestPaths": [
+      "packages/coding-agent/test/tools/browser-relay-detach.test.ts"
+    ]
+  }
 }
