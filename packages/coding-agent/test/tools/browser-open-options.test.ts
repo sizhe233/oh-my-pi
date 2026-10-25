@@ -21,7 +21,13 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import * as relayOwnedTargets from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
-import { acquireTab, getTab, releaseAllTabs, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import {
+	acquireTab,
+	getTab,
+	releaseAllTabs,
+	releaseTab,
+	runInTab,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import type { Browser, Page, Target } from "puppeteer-core";
@@ -361,9 +367,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 							},
 						});
 					}
-					return new Response(`<title>${name}</title><a id="download" href="/file?name=managed.txt">download</a>`, {
-						headers: { "content-type": "text/html" },
-					});
+					return new Response(
+						`<title>${name}</title><a id="download" href="/file?name=managed.txt">download</a>`,
+						{
+							headers: { "content-type": "text/html" },
+						},
+					);
 				},
 			});
 			let recycledDirectory: string | undefined;
@@ -390,11 +399,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 						const previousWorker = tab.worker;
 						// Require the real worker path: inline fallback cannot recycle safely.
 						expect(previousWorker.mode).toBe("worker");
-						expect(await rejectionOf(runInTab(name, {
-							code: "await new Promise(() => {});",
-							timeoutMs: 5_000,
-							session,
-						}))).toMatchObject({ message: expect.stringContaining("Browser code execution timed out after ") });
+						expect(
+							await rejectionOf(
+								runInTab(name, {
+									code: "await new Promise(() => {});",
+									timeoutMs: 5_000,
+									session,
+								}),
+							),
+						).toMatchObject({ message: expect.stringContaining("Browser code execution timed out after ") });
 						expect(getTab(name)).toBe(tab);
 						expect(tab.state).toBe("alive");
 						expect(tab.worker).not.toBe(previousWorker);
@@ -416,7 +429,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					});
 					void running.catch(() => undefined);
 					try {
-						await Promise.race([gateReached.promise, running.then(() => { throw new Error("Run ended before gate"); })]);
+						await Promise.race([
+							gateReached.promise,
+							running.then(() => {
+								throw new Error("Run ended before gate");
+							}),
+						]);
 						const filename = `user-${phase}.txt`;
 						const directory = phase === "initial" ? path.join(root, "downloads") : recycledDirectory;
 						await userPage.evaluate(`{

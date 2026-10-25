@@ -10,13 +10,15 @@ import {
 	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
-import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
 	denyError,
-	formatApprovalPrompt,
+	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
+	sessionApprovalScope,
 	truncateForPrompt,
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -61,7 +63,13 @@ function renderOptionsWithTheme<T extends object>(options: T, theme: Theme): T &
  */
 export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare name: string;
-	declare description: string;
+	get description(): string {
+		const description = this.registeredTool.definition.description;
+		const guidance = this.runner.getNativeDelegationGuidance(this.name);
+		return guidance
+			? prompt.render(nativeDelegationTemplate, { description, name: this.name, guidance })
+			: description;
+	}
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
@@ -337,20 +345,32 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			context !== undefined &&
 			Object.hasOwn(context, "acpApprovedArgs") &&
 			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
+		// A prompt the approval mode raised can be approved for the rest of the session; provider
+		// safety checks are per-call, so they never offer it.
+		const sessionScope =
+			pendingSafetyChecks.length === 0 ? sessionApprovalScope(resolved, this.tool.name) : undefined;
+		const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
 		const approvalCheck = {
 			required:
 				pendingSafetyChecks.length > 0 ||
-				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
+				(resolved.policy === "prompt" && !acpBypass && !sessionApproved && (explicitPrompt || !xdevBypass)),
 			reason: resolved.reason,
 		};
 
 		if (approvalCheck.required) {
+			const approvalEpoch = this.runner.getSessionApprovalEpoch();
+			const assertApprovalCurrent = () => {
+				if (this.runner.getSessionApprovalEpoch() === approvalEpoch) return;
+				cancelPreflight();
+				throw new Error(`Tool approval invalidated because the session changed: ${this.tool.name}`);
+			};
 			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
 			if (
 				scheduledCall?.id === toolCallId &&
 				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
 			) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
+				assertApprovalCurrent();
 			}
 
 			const hasApprovalHandlers =
@@ -399,22 +419,29 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 			}
 
+			assertApprovalCurrent();
 			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
-			let choice: string | undefined;
+			const safetyAppendix =
+				pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
+			let approved: boolean;
+			let grantSession = false;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				const answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
+					reason: approvalCheck.reason,
+					appendix: safetyAppendix,
+					sessionSubject: sessionScope?.subject,
+				});
+				assertApprovalCurrent();
+				approved = answer !== "deny";
+				grantSession = answer === "session";
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				cancelPreflight();
 				throw err;
 			}
-			const approved = choice === "Approve";
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+			assertApprovalCurrent();
+			if (grantSession && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
 			if (!approved) {
 				cancelPreflight();
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);

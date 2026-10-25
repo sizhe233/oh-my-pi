@@ -1284,6 +1284,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			} as never,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			extensionRunner: {
+				clearSessionApprovals: () => {},
 				initialize: () => {},
 				onError: () => () => {},
 				hasHandlers: () => false,

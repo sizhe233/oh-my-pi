@@ -133,6 +133,7 @@ describe("AgentSession plan-mode compaction hook contract (issue #4359)", () => 
 		// emit() on it. Casting keeps the test focused on the hook payload.
 		const beforeCompactEvents: SessionBeforeCompactEvent[] = [];
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: (type: string) => type === "session_before_compact",
 			emit: async (event: { type: string } & Record<string, unknown>) => {
 				if (event.type === "session_before_compact") {

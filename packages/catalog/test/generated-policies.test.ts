@@ -715,7 +715,7 @@ describe("generated model policies", () => {
 	});
 
 	it("marks Ollama Cloud generated rows to omit max output tokens", () => {
-		const models: ModelSpec<Api>[] = [
+		const models = [
 			createSpec({
 				id: "deepseek-v4-flash",
 				api: "ollama-chat",
@@ -730,9 +730,7 @@ describe("generated model policies", () => {
 				contextWindow: 1048576,
 				maxTokens: 1048576,
 			}),
-		];
-
-		applyGeneratedModelPolicies(models);
+		].map(model => buildGenerated(model));
 
 		expect(models[0]?.omitMaxOutputTokens).toBe(true);
 		expect(models[1]?.omitMaxOutputTokens).toBeUndefined();
