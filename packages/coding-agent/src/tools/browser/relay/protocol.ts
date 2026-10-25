@@ -26,7 +26,7 @@ export type RelayRpcRequest =
 	| { op: "attach"; tabId: number }
 	| { op: "detach"; tabId: number }
 	| { op: "send"; tabId: number; sessionId?: string; method: string; params?: Record<string, unknown> }
-	/** `active: false` opens the tab without selecting it; absent keeps Chrome's default (selected). */
+	/** Tabs open in the background by default; `active: true` explicitly selects the new tab. */
 	| { op: "createTab"; url: string; active?: boolean }
 	| { op: "removeTab"; tabId: number }
 	| { op: "activateTab"; tabId: number }
@@ -36,10 +36,18 @@ export type RelayRpcRequest =
 	| { op: "ungroup"; tabIds: number[] };
 
 /** Messages sent relay → extension. */
-export type RelayToExtMessage = ({ t: "rpc"; id: number } & RelayRpcRequest) | { t: "pong" };
+export type RelayToExtMessage =
+	| ({ t: "rpc"; id: number } & RelayRpcRequest)
+	| { t: "pong" }
+	| { t: "helloAck"; abandonedTabsProtocol: number }
+	/** The relay consumed an abandoned create: closed, gone, or adopted by a driver. */
+	| { t: "abandonedTabHandled"; tabId: number };
 
 /** Required capability for safe relay target discovery and auto-attach. */
 export const DISCARDED_TABS_PROTOCOL_VERSION = 1;
+
+/** Both peers arbitrate late creates before an extension may create owned tabs. */
+export const ABANDONED_TABS_PROTOCOL_VERSION = 1;
 
 /** Messages sent extension → relay. */
 export type ExtToRelayMessage =
@@ -68,11 +76,20 @@ export type ExtToRelayMessage =
 			 * older extensions.
 			 */
 			ownedTabIds?: number[];
+			/** Created tabs whose original RPC socket closed; retained until the relay acknowledges arbitration. */
+			abandonedTabIds?: number[];
+			abandonedTabsProtocol?: number;
+			/**
+			 * Identity of this browser run (`chrome.storage.session`), new after a browser restart, when Chrome
+			 * reuses tab ids: target ids embed it, so an old target id never names a new tab. Absent on older extensions.
+			 */
+			browserSession?: string;
 	  }
 	| { t: "cdpEvent"; tabId: number; sessionId?: string; method: string; params?: Record<string, unknown> }
 	| { t: "detached"; tabId: number; reason: string; relayInitiated?: boolean }
 	| { t: "tabCreated"; tab: TabSnapshot }
 	| { t: "tabUpdated"; tab: TabSnapshot }
 	| { t: "tabRemoved"; tabId: number }
+	| { t: "abandonedTab"; tab: TabSnapshot }
 	| { t: "rpcResult"; id: number; ok: boolean; result?: unknown; error?: string }
 	| { t: "ping" };

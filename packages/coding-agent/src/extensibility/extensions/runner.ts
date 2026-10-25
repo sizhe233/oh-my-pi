@@ -42,6 +42,7 @@ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../s
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
+import { trackUserWaits, type UserWaitTracker } from "./user-wait";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type {
 	AfterProviderResponseEvent,
@@ -197,6 +198,7 @@ function createHandlerUIContext(
 	timeoutBudget?: HandlerTimeoutBudget,
 ): ExtensionUIContext {
 	const askDialog = ui.askDialog;
+	const approve = ui.approve;
 	const runDialog = async <T>(dialog: () => Promise<T>): Promise<T> => {
 		timeoutBudget?.pause();
 		try {
@@ -215,6 +217,10 @@ function createHandlerUIContext(
 		askDialog: askDialog
 			? (questions, dialogOptions) =>
 					runDialog(() => askDialog.call(ui, questions, attachHandlerSignal(dialogOptions, handlerSignal)))
+			: undefined,
+		approve: approve
+			? (prompt, dialogOptions) =>
+					runDialog(() => approve.call(ui, prompt, attachHandlerSignal(dialogOptions, handlerSignal)))
 			: undefined,
 		custom: async (factory, options) => {
 			let customSettled = false;
@@ -241,7 +247,7 @@ function createHandlerUIContext(
 		},
 		editor: (title, prefill, dialogOptions, editorOptions) =>
 			runDialog(() => ui.editor(title, prefill, attachHandlerSignal(dialogOptions, handlerSignal), editorOptions)),
-	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "custom" | "editor">;
+	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "approve" | "custom" | "editor">;
 	const delegatedMethods = new Map<PropertyKey, unknown>();
 
 	return new Proxy(ui, {
@@ -440,6 +446,7 @@ export type ShutdownHandler = () => void;
  */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
+	extensionRunner.clearSessionApprovals();
 	try {
 		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
 		await extensionRunner.emit({
@@ -471,6 +478,7 @@ const noOpUIContext: ExtensionUIContext = {
 	editor: async () => undefined,
 	addAutocompleteProvider: () => {},
 	setEditorComponent: () => {},
+	getEditorComponent: () => undefined,
 	get theme() {
 		return theme;
 	},
@@ -505,6 +513,11 @@ export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
+	/** Grant keys (see `sessionApprovalScope`) approved "for this session", each prefixed by the session it covers. */
+	#sessionApprovals = new Set<string>();
+	#sessionApprovalEpoch = 0;
+	#sessionApprovalSessionId?: string;
+	#trackUserWait?: UserWaitTracker;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -523,6 +536,9 @@ export class ExtensionRunner {
 	#switchSessionHandler: SwitchSessionHandler = async () => ({ cancelled: false });
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
+	#resolvePlanReviewFn: NonNullable<ExtensionContextActions["resolvePlanReview"]> = () => false;
+	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
+	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
@@ -676,6 +692,11 @@ export class ExtensionRunner {
 		return this.#nativeToolResolver?.(name) !== undefined;
 	}
 
+	/** Guidance a same-name replacement inherits from the native `name` tool it can delegate to. */
+	getNativeDelegationGuidance(name: string): string {
+		return this.#nativeToolResolver?.(name)?.tool.delegationGuidance ?? "";
+	}
+
 	/**
 	 * Run the native built-in of `name` with `params` and return its result — the delegation target
 	 * of a same-tool `ctx.invokeTool`. Calls the unwrapped native `execute` directly with the loop's
@@ -816,6 +837,9 @@ export class ExtensionRunner {
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
+		if (contextActions.resolvePlanReview) this.#resolvePlanReviewFn = contextActions.resolvePlanReview;
+		if (contextActions.getPendingPlanReview) this.#getPendingPlanReviewFn = contextActions.getPendingPlanReview;
+		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
@@ -833,7 +857,10 @@ export class ExtensionRunner {
 			this.#compactFn = commandContextActions.compact;
 		}
 
-		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#uiContext =
+			uiContext && this.#trackUserWait
+				? trackUserWaits(uiContext, this.#trackUserWait)
+				: (uiContext ?? noOpUIContext);
 		this.#mode = mode;
 		this.#initialized = true;
 
@@ -1032,9 +1059,41 @@ export class ExtensionRunner {
 		};
 	}
 
+	/**
+	 * Runs each dialog of the UI context the next {@link initialize} receives (tool approvals, extension prompts) as a
+	 * wait for the user.
+	 */
+	setUserWaitTracker(track: UserWaitTracker): void {
+		this.#trackUserWait = track;
+	}
+
 	/** Waits until the interactive transcript can show the tool call being approved. */
 	async waitForToolApprovalPreview(toolCallId: string): Promise<void> {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
+	}
+
+	/** Capture the current approval lifetime before awaiting UI or extension handlers. */
+	getSessionApprovalEpoch(): number {
+		if (this.#sessionApprovalSessionId !== this.sessionId) this.clearSessionApprovals();
+		return this.#sessionApprovalEpoch;
+	}
+
+	/** Revoke grants and pending responses, including resets that retain the same session id. */
+	clearSessionApprovals(): void {
+		this.#sessionApprovals.clear();
+		this.#sessionApprovalSessionId = this.sessionId;
+		this.#sessionApprovalEpoch++;
+	}
+
+	/** Whether the user approved `key` for the current, uninterrupted session lifetime. */
+	hasSessionApproval(key: string): boolean {
+		this.getSessionApprovalEpoch();
+		return this.#sessionApprovals.has(key);
+	}
+
+	grantSessionApproval(key: string): void {
+		this.getSessionApprovalEpoch();
+		this.#sessionApprovals.add(key);
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -1399,6 +1458,9 @@ export class ExtensionRunner {
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
+			resolvePlanReview: (reviewId, choice, input) => this.#resolvePlanReviewFn(reviewId, choice, input),
+			getPendingPlanReview: () => this.#getPendingPlanReviewFn(),
+			openPlanReview: () => this.#openPlanReviewFn(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
