@@ -84,6 +84,10 @@ def is_ancestor(older: str, newer: str) -> bool:
 def restore_workflows(base: str) -> None:
     # Restore the complete path, including deletions of newly introduced workflows.
     # The original upstream workflow bytes remain inspectable in the second parent.
+    # A fork-deleted/upstream-modified file has no stage 2; restore alone
+    # cannot remove that unmerged path. Remove the tracked subtree first,
+    # then recreate only the trusted fork tree (including its deletions).
+    git("rm", "-r", "--force", "--ignore-unmatch", "--", WORKFLOWS)
     git("restore", f"--source={base}", "--staged", "--worktree", "--", WORKFLOWS)
     if git("diff", "--cached", "--name-only", base, "--", WORKFLOWS).stdout.strip():
         raise RuntimeError("Fork workflow boundary changed")

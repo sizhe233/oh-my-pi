@@ -449,6 +449,18 @@ class SyncFixture(unittest.TestCase):
             self.invoke()
         self.assert_no_push()
 
+    def test_fork_deleted_upstream_modified_workflow_stays_deleted(self):
+        # Mirrors v18.16.0 bun-cache-warm.yml: delete/modify is unmerged
+        # without a stage-2 entry, which git restore cannot remove directly.
+        (self.work / ".github/workflows/common.yml").unlink()
+        self.publish_fixture_main()
+        outputs = self.invoke()
+        candidate = outputs["candidate_sha"]
+        self.assertEqual(self.run_git(self.work, "diff", "--name-only", self.base, candidate,
+                                      "--", ".github/workflows").stdout, "")
+        self.assertNotEqual(self.run_git(self.work, "cat-file", "-e",
+                            f"{candidate}:.github/workflows/common.yml", check=False).returncode, 0)
+
     def test_merge_preserves_history_fork_files_workflow_boundary_and_scoped_push(self):
         """Consumers get the exact two-parent source merge, without enabling upstream CI."""
         os.environ["SYNC_BRANCH"] = "main"
