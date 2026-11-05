@@ -2360,6 +2360,74 @@ describe("RelayBridge orphan reaper close (OMP.closeOwnedTarget)", () => {
 		expect(back.rpcs("removeTab")).toHaveLength(0);
 	});
 
+	it("joins concurrent orphan closes so a failed close cannot leave another removal behind an adopted tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 2 })], [2]);
+		const driver = new FakeCdpSocket();
+		const driverConn = bridge.cdpConnected(driver);
+		const sessionId = await attachPage(bridge, ext, driver, driverConn, 2);
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		const first = reap(bridge, reaper, reaperConn, 2);
+		const second = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+		const claimId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: claimId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === claimId)?.error).toMatchObject({
+			message: expect.stringContaining("is closing"),
+		});
+		const remove = ext.pending("removeTab")[0]!;
+		ext.markAcked(remove.id);
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: remove.id, error: "close refused" }));
+		await flush();
+		for (const id of [first, second]) {
+			expect(reaper.messages.find(message => message.id === id)?.error).toMatchObject({
+				message: expect.stringContaining("close refused"),
+			});
+		}
+		expect(ext.pending("removeTab")).toHaveLength(0);
+		const retryId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: retryId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === retryId)?.result).toEqual({});
+		const stale = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(reaper.messages.find(message => message.id === stale)?.result).toEqual({ closed: false });
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+	});
+
+	it("keeps a replacement connection's close locked when the old connection fails", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 2 })], [2]);
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		const previous = reap(bridge, reaper, reaperConn, 2);
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+		bridge.extClosed(ext);
+		const back = new FakeExtSocket();
+		helloWithOwned(bridge, back, [tab({ tabId: 2 })], [2]);
+		const current = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(back.rpcs("removeTab")).toHaveLength(1);
+		expect(reaper.messages.find(message => message.id === previous)?.error).toBeDefined();
+		const driver = new FakeCdpSocket();
+		const driverConn = bridge.cdpConnected(driver);
+		const sessionId = await attachPage(bridge, back, driver, driverConn, 2);
+		const claimId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: claimId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === claimId)?.error).toMatchObject({
+			message: expect.stringContaining("is closing"),
+		});
+		ack(bridge, back, "removeTab");
+		await flush();
+		expect(reaper.messages.find(message => message.id === current)?.result).toEqual({ closed: true });
+	});
+
 	it("errors (record retained) while the target's browser is disconnected", async () => {
 		const bridge = new RelayBridge({});
 		const ext = new FakeExtSocket();

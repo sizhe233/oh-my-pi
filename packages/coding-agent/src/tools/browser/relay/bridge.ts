@@ -358,6 +358,8 @@ export class RelayBridge {
 	 * the URL the tab showed: closed at that browser's next hello, unless the tab is gone or shows another page.
 	 */
 	#closeOnHello = new Map<string, string>();
+	/** Join closes on the same extension connection; a replacement socket starts a new operation. */
+	#tabCloses = new Map<string, { socket: RelaySocket | null; promise: Promise<void> }>();
 	/** `Date.now()` when the last ready extension socket closed; null while one is ready or none ever was. */
 	#extensionGoneSince: number | null = null;
 	#pendingRpc = new Map<
@@ -2227,16 +2229,28 @@ export class RelayBridge {
 	 * its relay lease through the retry. One whose close still fails (its browser offline, the socket dropping
 	 * mid-call, or Chrome refusing every try) is closed at that browser's next hello, unless the user closed it.
 	 */
-	async #closeTab(key: string, tabId: number, inst: ExtInstance): Promise<void> {
+	#closeTab(key: string, tabId: number, inst: ExtInstance): Promise<void> {
+		const existing = this.#tabCloses.get(key);
+		if (existing && existing.socket === inst.socket) return existing.promise;
+		const close = Promise.withResolvers<void>();
+		const pending = { socket: inst.socket, promise: close.promise };
+		this.#tabCloses.set(key, pending);
 		const tab = this.#tabs.get(key);
 		if (tab) tab.closing = true;
-		try {
-			await this.#rpc({ op: "removeTab", tabId }, inst);
-		} catch (err) {
-			// The tab stays open, so a later detach is Chrome's own again.
-			if (tab) tab.closing = false;
-			this.#closeOnHello.set(key, tab?.url ?? "");
-			throw err;
-		}
+		void (async () => {
+			try {
+				await this.#rpc({ op: "removeTab", tabId }, inst);
+			} catch (err) {
+				// An old socket's failure cannot unlock a newer close or queue a close for a replacement tab.
+				if (this.#tabCloses.get(key) === pending && this.#tabs.get(key) === tab) {
+					if (tab) tab.closing = false;
+					this.#closeOnHello.set(key, tab?.url ?? "");
+				}
+				throw err;
+			} finally {
+				if (this.#tabCloses.get(key) === pending) this.#tabCloses.delete(key);
+			}
+		})().then(close.resolve, close.reject);
+		return close.promise;
 	}
 }
