@@ -501,6 +501,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-open-rollback-"));
 			const scope: SharedTargetScope = { projectDir: root, runtimeDir: root, daemonName: "relay-open" };
 			const scopeSpy = spyOn(relayOwnedTargets, "relayTargetScope").mockReturnValue(scope);
+			const closeRelayTarget = relayOwnedTargets.closeRelayTarget;
+			const unconfirmed: string[] = [];
+			const closeSpy = spyOn(relayOwnedTargets, "closeRelayTarget").mockImplementation(
+				async (endpoint, targetId) => {
+					const confirmed = await closeRelayTarget(endpoint, targetId);
+					if (!confirmed) unconfirmed.push(targetId);
+					return confirmed;
+				},
+			);
 			const name = `relay-rollback-${crypto.randomUUID()}`;
 			const cdpUrl = `http://${new URL(browser.wsEndpoint()).host}`;
 			const handle: PuppeteerBrowserHandle = {
@@ -536,7 +545,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			};
 			try {
 				const borrowed = await browser.newPage();
-				await borrowed.goto(`data:text/html,<title>${name}</title>`);
+				await borrowed.setContent(`<title>${name}</title>`);
 				const client = await browser.target().createCDPSession();
 				const pageTargets = async () =>
 					(await client.send("Target.getTargets")).targetInfos
@@ -577,7 +586,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				expect(await pageTargets()).toEqual(before);
 				expect(borrowed.isClosed()).toBe(false);
 				expect(handle.refCount).toBe(1);
-				expect(await ownedTargets()).toEqual([]);
+				// The real worker already closed its page. Raw Chromium cannot
+				// acknowledge the supervisor's second close; retain that ownership
+				// for the ownership-aware reaper instead of inferring from discovery.
+				expect(unconfirmed).toHaveLength(ownsTarget ? 1 : 0);
+				expect(await ownedTargets()).toEqual(unconfirmed);
 				await client.detach();
 			} finally {
 				controller.abort();
@@ -587,6 +600,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					await ownedTargets();
 				} finally {
 					scopeSpy.mockRestore();
+					closeSpy.mockRestore();
 					await server.stop(true);
 					await browser.close();
 					if (launched.userDataDir) await removeUserDataDir(launched.userDataDir);
