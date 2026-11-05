@@ -122,6 +122,7 @@ function newSession(
 					emit: async () => undefined,
 					getSessionApprovalEpoch: () => 0,
 					clearSessionApprovals: () => {},
+					invalidatePendingApprovals: () => {},
 				} as unknown as ExtensionRunner)
 			: undefined,
 		rebuildSystemPrompt: async toolNames => ({

@@ -1035,6 +1035,12 @@ export class ExtensionRunner {
 		return this.#sessionApprovalEpoch;
 	}
 
+	/** Reject pending responses when the transcript changes within the same session, preserving its grants. */
+	invalidatePendingApprovals(): void {
+		this.getSessionApprovalEpoch();
+		this.#sessionApprovalEpoch++;
+	}
+
 	/** Revoke grants and pending responses, including resets that retain the same session id. */
 	clearSessionApprovals(): void {
 		this.#sessionApprovals.clear();

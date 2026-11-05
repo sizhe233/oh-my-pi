@@ -28,6 +28,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession tree navigation e
 			}),
 			getSessionApprovalEpoch: () => 0,
 			clearSessionApprovals: () => {},
+			invalidatePendingApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		ctx = await createTestSession({
 			systemPrompt: ["You are a helpful assistant. Reply with just a few words."],
