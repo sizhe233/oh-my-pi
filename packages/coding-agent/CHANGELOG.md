@@ -4,9 +4,9 @@
 
 ### Fixed
 
-- Approval dialogs from an abandoned session or tree branch no longer authorize tools after navigation, reset, or disposal ([#62](https://github.com/sizhe233/oh-my-pi/pull/62) by [@sizhe233](https://github.com/sizhe233)).
-- Browser tabs reject competing ownership claims during close and after their creating worker adopts them ([#62](https://github.com/sizhe233/oh-my-pi/pull/62) by [@sizhe233](https://github.com/sizhe233)).
-- Session restore resumes interrupted tasks only from their selected branches, and session compression refuses symlinked artifact roots ([#62](https://github.com/sizhe233/oh-my-pi/pull/62) by [@sizhe233](https://github.com/sizhe233)).
+- Approval dialogs from an abandoned session or tree branch no longer authorize tools after navigation, reset, or disposal ([#64](https://github.com/sizhe233/oh-my-pi/pull/64) by [@sizhe233](https://github.com/sizhe233)).
+- Browser tabs reject competing ownership claims during close and after their creating worker adopts them ([#64](https://github.com/sizhe233/oh-my-pi/pull/64) by [@sizhe233](https://github.com/sizhe233)).
+- Session restore resumes interrupted tasks only from their selected branches, and session compression refuses symlinked artifact roots ([#64](https://github.com/sizhe233/oh-my-pi/pull/64) by [@sizhe233](https://github.com/sizhe233)).
 - Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
 ## [18.16.0] - 2026-11-02
 
