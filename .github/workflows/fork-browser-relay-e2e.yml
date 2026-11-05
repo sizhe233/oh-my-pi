@@ -24,7 +24,7 @@ jobs:
    real-extension:
       name: Real extension and relay on Windows (${{ matrix.mode }})
       runs-on: windows-2025
-      timeout-minutes: 20
+      timeout-minutes: 90
       strategy:
          fail-fast: false
          matrix:
@@ -49,9 +49,19 @@ jobs:
               if ((git rev-parse HEAD).Trim() -cne $env:SOURCE_SHA) { throw 'Source SHA mismatch' }
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
            with:
-              bun-version: 1.4.2
+              bun-version: 1.4.4
          - name: Install frozen dependencies without lifecycle scripts
            run: bun install --frozen-lockfile --ignore-scripts
+         - name: Build native addon from the exact checkout
+           env:
+              CARGO_BUILD_JOBS: "2"
+           shell: pwsh
+           run: |
+              $ErrorActionPreference = 'Stop'
+              bun run build:native
+              if ($LASTEXITCODE -ne 0) { throw 'Source native build failed' }
+              bun -e 'import "./packages/natives/native/index.js"; import { nativeAddonStatus } from "./packages/natives/native/loader-state.js"; const s = nativeAddonStatus(); if (!s || s.stale || s.version !== s.packageVersion) throw new Error("Native source version mismatch"); console.log(s);'
+              if ($LASTEXITCODE -ne 0) { throw 'Source native identity check failed' }
          - name: Check render-guard regression contracts and extension types
            shell: pwsh
            run: |
