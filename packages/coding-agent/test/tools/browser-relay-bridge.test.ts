@@ -477,6 +477,47 @@ describe("RelayBridge tab grouping", () => {
 		expect(groups[0]!.tabIds).toEqual([9]);
 	});
 
+	it("consumes the provisional claim when the creating worker adopts its own tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const worker = new FakeCdpSocket();
+		const workerConn = bridge.cdpConnected(worker);
+		bridge.cdpMessage(workerConn, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		const workerSession = await attachPage(bridge, ext, worker, workerConn, 9);
+		const adopt = ++msgSeq;
+		bridge.cdpMessage(
+			workerConn,
+			JSON.stringify({
+				id: adopt,
+				sessionId: workerSession,
+				method: "OMP.claimTarget",
+				params: { ownsTarget: true },
+			}),
+		);
+		await flush();
+		expect(worker.messages.find(message => message.id === adopt)?.result).toEqual({});
+		const other = new FakeCdpSocket();
+		const otherConn = bridge.cdpConnected(other);
+		const otherSession = await attachPage(bridge, ext, other, otherConn, 9);
+		const steal = ++msgSeq;
+		bridge.cdpMessage(
+			otherConn,
+			JSON.stringify({
+				id: steal,
+				sessionId: otherSession,
+				method: "OMP.claimTarget",
+				params: { ownsTarget: true },
+			}),
+		);
+		await flush();
+		expect(other.messages.find(message => message.id === steal)?.error).toMatchObject({
+			message: expect.stringContaining("already driven by another omp session"),
+		});
+	});
+
 	it("hands a created tab from its supervisor to the owned worker without opening a second claim", async () => {
 		const bridge = new RelayBridge({});
 		const ext = new FakeExtSocket();

@@ -466,8 +466,10 @@ describe("always-ask-cached wrapper cycle", () => {
 			const tool: AgentTool = { ...pathTool("write", "write", cwd), execute };
 			const runner = runnerWith(session, async () => choice);
 			const handlers = vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === "tool_approval_resolved");
-			const emit = vi.spyOn(runner, "emit").mockImplementation(async event => {
+			const originalEmit: typeof runner.emit = runner.emit.bind(runner);
+			const emit = vi.spyOn(runner, "emit").mockImplementation(event => {
 				if (event.type === "tool_approval_resolved") runner.clearSessionApprovals();
+				return originalEmit(event);
 			});
 			try {
 				await expect(

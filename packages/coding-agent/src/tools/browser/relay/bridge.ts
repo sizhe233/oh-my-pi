@@ -1263,6 +1263,9 @@ export class RelayBridge {
 			}
 			throw new Error(`Tab ${tabKey} is already driven by another omp session`);
 		}
+		// Adoption consumes the temporary creator claim even when creation and
+		// driving use the same connection; a later worker must not steal it.
+		if (handoff) tab.provisionalClaimConnId = undefined;
 		if (!conn.claims.has(tabKey)) {
 			conn.claims.add(tabKey);
 			this.#log("tab claimed", { conn: conn.id, tabKey });
