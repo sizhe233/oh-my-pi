@@ -15,6 +15,7 @@ import {
 	removeUserDataDir,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
+	closeCdpTarget,
 	forgetSharedTarget,
 	recordSharedTarget,
 	type SharedTargetScope,
@@ -486,13 +487,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 	);
 
 	it.each([
-		["failure", false],
-		["failure", true],
-		["cancellation", false],
-		["cancellation", true],
+		["failure", false, "native-confirmed"],
+		["failure", true, "native-confirmed"],
+		["cancellation", false, "native-confirmed"],
+		["cancellation", true, "native-confirmed"],
+		["failure", true, "relay-unconfirmed"],
+		["cancellation", true, "relay-unconfirmed"],
 	] as const)(
-		"rolls back a relay open after %s, closing only its owned target (ownsTarget=%s)",
-		async (outcome, ownsTarget) => {
+		"rolls back a relay open after %s, closing only its owned target (ownsTarget=%s, transport=%s)",
+		async (outcome, ownsTarget, transport) => {
 			// Real Chromium and workers exercise attach-mode ownership through post-init
 			// navigation. The relay-kind handle selects the fork's fresh/adopted paths;
 			// this deliberately does not claim extension, focus, or tab-group coverage.
@@ -505,7 +508,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			const unconfirmed: string[] = [];
 			const closeSpy = spyOn(relayOwnedTargets, "closeRelayTarget").mockImplementation(
 				async (endpoint, targetId) => {
-					const confirmed = await closeRelayTarget(endpoint, targetId);
+					// The fixture is native Chromium labeled as a relay handle.
+					// Exercise its real, unfiltered close confirmation for the original
+					// cleanup contract, and the conservative relay helper separately.
+					const confirmed =
+						transport === "native-confirmed"
+							? await closeCdpTarget(browser, targetId)
+							: await closeRelayTarget(endpoint, targetId);
 					if (!confirmed) unconfirmed.push(targetId);
 					return confirmed;
 				},
@@ -586,11 +595,21 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				expect(await pageTargets()).toEqual(before);
 				expect(borrowed.isClosed()).toBe(false);
 				expect(handle.refCount).toBe(1);
-				// The real worker already closed its page. Raw Chromium cannot
-				// acknowledge the supervisor's second close; retain that ownership
-				// for the ownership-aware reaper instead of inferring from discovery.
-				expect(unconfirmed).toHaveLength(ownsTarget ? 1 : 0);
-				expect(await ownedTargets()).toEqual(unconfirmed);
+				expect(closeSpy).toHaveBeenCalledTimes(ownsTarget ? 1 : 0);
+				if (ownsTarget) {
+					expect(closeSpy.mock.calls[0]?.[0]).toBe(browser.wsEndpoint());
+					expect(closeSpy.mock.calls[0]?.[1]).toBe(Reflect.get(created[0]!, "_targetId"));
+				}
+				if (transport === "native-confirmed") {
+					// Preserve the original strict native-fixture cleanup assertion.
+					expect(unconfirmed).toEqual([]);
+					expect(await ownedTargets()).toEqual([]);
+				} else {
+					// Raw Chromium cannot acknowledge the worker's already-closed page
+					// to the relay helper. Keep its record for the ownership-aware reaper.
+					expect(unconfirmed).toEqual([Reflect.get(created[0]!, "_targetId")]);
+					expect(await ownedTargets()).toEqual(unconfirmed);
+				}
 				await client.detach();
 			} finally {
 				controller.abort();
