@@ -17,8 +17,12 @@ function harness(overrides: Partial<ChromiumProbeHost> = {}) {
 	const events: string[] = [];
 	const diagnostics: ChromiumProbeDiagnostic[] = [];
 	let exitCode: number | null = null;
-	const child: Pick<ChildProcess, "pid" | "exitCode" | "peekStderr" | "kill" | "wait"> = {
+	const exited = Promise.withResolvers<number>();
+	// Avoid an unhandled rejection in mutation controls that deliberately remove the observer.
+	exited.promise.catch(() => undefined);
+	const child: Pick<ChildProcess, "pid" | "exitCode" | "exited" | "peekStderr" | "kill" | "wait"> = {
 		pid: 123,
+		exited: exited.promise,
 		get exitCode() {
 			return exitCode;
 		},
@@ -26,6 +30,7 @@ function harness(overrides: Partial<ChromiumProbeHost> = {}) {
 		kill: () => {
 			events.push("kill");
 			exitCode = 137;
+			exited.resolve(137);
 		},
 		wait: async () => {
 			events.push("wait");
@@ -64,7 +69,7 @@ function harness(overrides: Partial<ChromiumProbeHost> = {}) {
 		report: diagnostic => diagnostics.push(diagnostic),
 		...overrides,
 	};
-	return { host, child, events, diagnostics, probe: createChromiumProbe(host) };
+	return { host, child, events, diagnostics, exited, probe: createChromiumProbe(host) };
 }
 
 describe("Chromium test availability diagnostics", () => {
@@ -84,6 +89,50 @@ describe("Chromium test availability diagnostics", () => {
 		assert.equal(state.diagnostics.length, 1);
 		assert.equal(state.diagnostics[0]!.error.stage, "cdp");
 	});
+
+	for (const exitKind of ["resolved", "rejected"] as const) {
+		it(`fails closed when the browser exit ${exitKind}, before a replacement server can answer CDP`, async () => {
+			const entered = Promise.withResolvers<void>();
+			const impostor = Promise.withResolvers<void>();
+			let observedSignal: AbortSignal | undefined;
+			let observedBudget: number | undefined;
+			const state = harness({
+				ci: () => "1",
+				waitForCdp: async (_url, timeoutMs, signal) => {
+					observedBudget = timeoutMs;
+					observedSignal = signal;
+					const aborted = Promise.withResolvers<never>();
+					const onAbort = () => aborted.reject(new Error("browser exited before CDP became ready"));
+					if (signal?.aborted) onAbort();
+					else signal?.addEventListener("abort", onAbort, { once: true });
+					entered.resolve();
+					try {
+						await Promise.race([impostor.promise, aborted.promise]);
+					} finally {
+						signal?.removeEventListener("abort", onAbort);
+					}
+				},
+			});
+			const result = state.probe.chromiumAvailable().catch((error: unknown) => error);
+			await entered.promise;
+			if (exitKind === "resolved") state.exited.resolve(127);
+			else state.exited.reject(new Error("failed to observe child exit"));
+			try {
+				const checkpoint = Promise.withResolvers<void>();
+				setImmediate(checkpoint.resolve);
+				await checkpoint.promise;
+				assert.equal(observedBudget, 5000);
+				assert.equal(observedSignal?.aborted, true);
+				impostor.resolve();
+				assert.match(String(await result), /Chromium unavailable in CI.*browser exited before CDP/);
+				assert.equal(state.diagnostics[0]!.error.stage, "cdp");
+				assert.deepEqual(state.events.slice(-3), ["kill", "wait", "remove"]);
+			} finally {
+				impostor.resolve();
+				await result;
+			}
+		});
+	}
 
 	it("keeps an unavailable local browser skippable when CI is explicitly false", async () => {
 		const state = harness({ resolveExecutable: async () => undefined });

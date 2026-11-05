@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
-import type { AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
@@ -17,6 +17,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
+	emitSessionShutdownEvent,
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
 	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
@@ -31,6 +32,7 @@ import type {
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -2554,6 +2556,7 @@ describe("ExtensionRunner", () => {
 					editor: async () => undefined,
 					addAutocompleteProvider: () => {},
 					setEditorComponent: () => {},
+					getEditorComponent: () => undefined,
 					get theme() {
 						return {} as never;
 					},
@@ -2623,9 +2626,346 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
+				"Approve dangerous_tool for this session",
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
+		});
+
+		it("approving for this session skips later mode prompts of that tool and tier, until the session changes", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const select = vi.fn(async (_title: string, options: string[]) => options[1]);
+			initializeRunner(runner, select);
+			const context = () => ({
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			});
+			const run = (tool: typeof approvalTool | AgentTool, id: string) =>
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					id,
+					{},
+					undefined,
+					undefined,
+					context(),
+				);
+			await run(approvalTool, "call-grant");
+			await run(approvalTool, "call-granted");
+			expect(select).toHaveBeenCalledTimes(1);
+			// The grant covers that tool at that tier only: its write-tier calls and other tools still ask.
+			await run({ ...approvalTool, approval: "write" as const }, "call-write-tier");
+			await run({ ...approvalTool, name: "other_tool" }, "call-other");
+			expect(select).toHaveBeenCalledTimes(3);
+			// A critical override asks every time and never offers the session choice.
+			const critical = { ...approvalTool, approval: () => ({ tier: "exec" as const, override: true }) };
+			select.mockImplementationOnce(async () => "Approve");
+			await run(critical, "call-critical");
+			expect(select).toHaveBeenLastCalledWith(expect.any(String), ["Approve", "Deny"]);
+			// A new session starts without the grant.
+			await sessionManager.newSession();
+			await run(approvalTool, "call-new-session");
+			expect(select).toHaveBeenCalledTimes(5);
+		});
+
+		const approvalFixture = () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const settings = Settings.isolated({
+				"tools.approvalMode": "always-ask",
+				"compaction.enabled": false,
+				"advisor.enabled": false,
+			});
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }] }));
+			const context = {
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings,
+			};
+			const run = (name = "dangerous_tool") =>
+				new ExtensionToolWrapper(
+					{
+						...approvalTool,
+						name,
+						parameters: Type.Object({}),
+						execute,
+					},
+					runner,
+				).execute(`call-${name}`, {}, undefined, undefined, context);
+			const session = new AgentSession({
+				agent: new Agent({
+					initialState: {
+						model: getBundledModel("anthropic", "claude-sonnet-4-5")!,
+						systemPrompt: ["Test"],
+						tools: [],
+					},
+				}),
+				sessionManager,
+				modelRegistry,
+				settings,
+				extensionRunner: runner,
+			});
+			return { runner, run, execute, session };
+		};
+
+		it.each(["Approve", "Approve other_tool for this session"])(
+			"beginDispose revokes grants and rejects pending %s before asynchronous teardown",
+			async answer => {
+				const { runner, run, execute, session } = approvalFixture();
+				const response = Promise.withResolvers<string>();
+				const prompted = Promise.withResolvers<void>();
+				initializeRunner(runner, async (_title, choices) => choices[1]);
+				try {
+					await run();
+					await run();
+					initializeRunner(runner, async () => {
+						prompted.resolve();
+						return response.promise;
+					});
+					const pending = run("other_tool");
+					const rejected = pending.then(
+						() => undefined,
+						(error: unknown) => {
+							if (!(error instanceof Error)) throw error;
+							return error;
+						},
+					);
+					await prompted.promise;
+					session.beginDispose();
+					response.resolve(answer);
+					expect((await rejected)?.message).toContain("session changed");
+					expect(execute).toHaveBeenCalledTimes(2);
+					const deny = vi.fn(async () => "Deny");
+					initializeRunner(runner, deny);
+					await expect(run()).rejects.toThrow("denied by user");
+					await expect(run("other_tool")).rejects.toThrow("denied by user");
+					expect(deny).toHaveBeenCalledTimes(2);
+				} finally {
+					response.resolve("Deny");
+					await session.dispose();
+				}
+			},
+		);
+
+		it.each(["new", "reset", "shutdown"] as const)("accepted %s revokes prior session approvals", async operation => {
+			const { runner, run, session } = approvalFixture();
+			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+			initializeRunner(runner, select);
+			try {
+				await run();
+				await run();
+				expect(select).toHaveBeenCalledTimes(1);
+				if (operation === "new") expect(await session.newSession()).toBe(true);
+				else if (operation === "reset") expect(await session.resetSessionContext()).toBeDefined();
+				else expect(await emitSessionShutdownEvent(runner)).toBe(false);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(2);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["new", "switch", "branch", "fork-no-file", "reset-busy"] as const)(
+			"refused %s preserves the current approval lifetime",
+			async operation => {
+				const { runner, run, session } = approvalFixture();
+				const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+				initializeRunner(runner, select);
+				const abort = new AbortController();
+				let tracked: Promise<unknown> | undefined;
+				const evaluation = Promise.withResolvers<void>();
+				try {
+					await run();
+					if (operation === "fork-no-file") expect(await session.fork()).toBe(false);
+					else if (operation === "reset-busy") {
+						tracked = session.trackEvalExecution(evaluation.promise, abort).catch(() => {});
+						expect(await session.resetSessionContext()).toBeUndefined();
+					} else {
+						vi.spyOn(runner, "hasHandlers").mockImplementation(
+							name => name === "session_before_switch" || name === "session_before_branch",
+						);
+						vi.spyOn(runner, "emit").mockResolvedValue({ cancel: true });
+						if (operation === "new") expect(await session.newSession()).toBe(false);
+						else if (operation === "switch") expect(await session.switchSession("unused.jsonl")).toBe(false);
+						else {
+							const id = sessionManager.appendMessage({ role: "user", content: "branch here", timestamp: 1 });
+							expect((await session.branch(id)).cancelled).toBe(true);
+						}
+					}
+					await run();
+					expect(select).toHaveBeenCalledTimes(1);
+				} finally {
+					abort.abort();
+					evaluation.resolve();
+					await tracked;
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it.each(["tool_approval_requested", "tool_approval_resolved"] as const)(
+			"a session change during %s cannot execute or grant a stale response",
+			async eventType => {
+				const { runner, run, execute, session } = approvalFixture();
+				const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+				initializeRunner(runner, select);
+				vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === eventType);
+				const emit: typeof runner.emit = runner.emit.bind(runner);
+				vi.spyOn(runner, "emit").mockImplementation(event => {
+					if (event.type === eventType) {
+						runner.clearSessionApprovals();
+						runner.grantSessionApproval("new-session-grant");
+					}
+					return emit(event);
+				});
+				try {
+					await expect(run()).rejects.toThrow("session changed");
+					expect(execute).not.toHaveBeenCalled();
+					expect(select).toHaveBeenCalledTimes(eventType === "tool_approval_requested" ? 0 : 1);
+					expect(runner.hasSessionApproval("new-session-grant")).toBe(true);
+				} finally {
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it.each(["new", "switch"] as const)(
+			"accepted %s rejects late approval before abort teardown settles",
+			async operation => {
+				const { runner, run, execute, session } = approvalFixture();
+				const response = Promise.withResolvers<string>();
+				const prompted = Promise.withResolvers<void>();
+				const teardown = Promise.withResolvers<void>();
+				const enteredTeardown = Promise.withResolvers<void>();
+				initializeRunner(runner, async () => {
+					prompted.resolve();
+					return response.promise;
+				});
+				const pending = run().then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await prompted.promise;
+				vi.spyOn(session, "abort").mockImplementation(async () => {
+					enteredTeardown.resolve();
+					await teardown.promise;
+					throw new Error("test teardown stopped before disk access");
+				});
+				const transition = (
+					operation === "new" ? session.newSession() : session.switchSession("unused.jsonl")
+				).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				try {
+					await enteredTeardown.promise;
+					response.resolve("Approve");
+					expect(await pending).toMatchObject({ message: expect.stringContaining("session changed") });
+					expect(execute).not.toHaveBeenCalled();
+				} finally {
+					response.resolve("Deny");
+					teardown.resolve();
+					await transition;
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it("an accepted branch revokes grants while same-session tree navigation preserves them", async () => {
+			const { runner, run, session } = approvalFixture();
+			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+			initializeRunner(runner, select);
+			try {
+				const user = sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+				const leaf = sessionManager.appendMessage(createAssistantMessage("answer"));
+				await run();
+				expect((await session.navigateTree(user, { summarize: false })).cancelled).toBe(false);
+				await run();
+				expect(select).toHaveBeenCalledTimes(1);
+				await session.navigateTree(leaf, { summarize: false });
+				expect((await session.branch(user)).cancelled).toBe(false);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(2);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["whole-fork", "entry-fork", "btw"] as const)(
+			"accepted %s invalidates a late response before transcript identity mutation",
+			async operation => {
+				const { runner, run, execute, session } = approvalFixture();
+				const user = sessionManager.appendMessage({ role: "user", content: "task", timestamp: 1 });
+				const assistant = createAssistantMessage("answer");
+				const leaf = sessionManager.appendMessage(assistant);
+				const id = sessionManager.getSessionId();
+				const response = Promise.withResolvers<string>();
+				const prompted = Promise.withResolvers<void>();
+				initializeRunner(runner, async () => {
+					prompted.resolve();
+					return response.promise;
+				});
+				const pending = run().then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await prompted.promise;
+				// An in-memory identity seam: stop exactly at mutation, without pretending to exercise disk I/O.
+				vi.spyOn(sessionManager, "getSessionFile").mockReturnValue(tempDir.join("virtual.jsonl"));
+				const stop = () => {
+					throw new Error("test stopped at transcript mutation");
+				};
+				vi.spyOn(sessionManager, "fork").mockImplementation(async () => stop());
+				vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(stop);
+				try {
+					const transition =
+						operation === "whole-fork"
+							? session.fork()
+							: operation === "entry-fork"
+								? session.fork(leaf)
+								: session.branchFromBtw("question", assistant, leaf, id);
+					await expect(transition).rejects.toThrow("test stopped at transcript mutation");
+					expect(sessionManager.getSessionId()).toBe(id);
+					expect(sessionManager.getEntry(user)?.type).toBe("message");
+					response.resolve("Approve dangerous_tool for this session");
+					expect(await pending).toMatchObject({ message: expect.stringContaining("session changed") });
+					expect(execute).not.toHaveBeenCalled();
+				} finally {
+					response.resolve("Deny");
+					await pending;
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it("switching A to B to A cannot revive A's old approval", async () => {
+			const { runner, run, session } = approvalFixture();
+			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+			initializeRunner(runner, select);
+			try {
+				await run();
+				const original = sessionManager.captureState();
+				await sessionManager.newSession();
+				await run();
+				sessionManager.restoreState(original);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(3);
+			} finally {
+				await session.dispose();
+			}
 		});
 		it("runs bridged preflight before approval and cancels denied state", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);

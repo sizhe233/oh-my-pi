@@ -376,20 +376,31 @@ try {
 		)) as string;
 		return logs.some(entry => entry.message === "extension connected" && entry.data?.instanceId === instance);
 	});
-	await until("second browser discovery", async () =>
-		(await targets(recovered)).some(t => t.url.includes("second-instance")),
+	const secondTarget = await until("second browser discovery", async () =>
+		(await targets(recovered)).find(t => t.url.includes("second-instance")),
 	);
+	// Explicit browser affinity must beat another profile's selected tab; connection order is not routing intent.
 	const routed = await recovered.send<{ targetId: string }>("Target.createTarget", {
 		url: "data:text/html,<title>routed-to-second</title>",
+		nearTargetId: secondTarget.targetId,
 	});
 	// createTab resolves before navigation commits; observe the actual tab's
 	// committed URL rather than treating pending navigation as wrong routing.
-	await until("created tab committed in second browser", async () =>
-		(await tabs(second.worker)).some(t => t.url.includes("routed-to-second")),
+	const routedTab = await until("created tab committed in second browser", async () =>
+		(await tabs(second.worker)).find(t => t.url.includes("routed-to-second")),
+	);
+	assert.equal(Number(routed.targetId.split(".").at(-1)), routedTab.id);
+	assert.equal(
+		routed.targetId.slice(0, routed.targetId.lastIndexOf(".")),
+		secondTarget.targetId.slice(0, secondTarget.targetId.lastIndexOf(".")),
 	);
 	assert(!(await tabs(first.worker)).some(t => t.url.includes("routed-to-second")));
 	assert((await tabs(second.worker)).find(t => t.id === secondUser.id)?.active);
 	await recovered.send("Target.closeTarget", { targetId: routed.targetId });
+	await until("routed owned tab removed without closing the second browser's user tab", async () => {
+		const remaining = await tabs(second.worker);
+		return !remaining.some(t => t.id === routedTab.id) && remaining.some(t => t.id === secondUser.id);
+	});
 	// Third instance has a live extension but no browser windows/tabs.
 	const empty = await launch(port, "windowless", true);
 	await until("windowless extension handshake", async () => {
@@ -403,14 +414,16 @@ try {
 		url: "data:text/html,<title>windowless-fallback</title>",
 	});
 	assert.equal((await tabs(empty.worker)).length, 0);
-	await until("fallback tab committed in a populated browser", async () =>
-		[...(await tabs(first.worker)), ...(await tabs(second.worker))].some(t => t.url.includes("windowless-fallback")),
+	// With no caller affinity, the first selected eligible tab still determines the browser.
+	await until("fallback tab committed in first selected browser", async () =>
+		(await tabs(first.worker)).some(t => t.url.includes("windowless-fallback")),
 	);
+	assert(!(await tabs(second.worker)).some(t => t.url.includes("windowless-fallback")));
 	await recovered.send("Target.closeTarget", { targetId: fallback.targetId });
 	result(
 		11,
 		"pass",
-		"Real multi-profile browsers routed creation to the last connected populated instance; a subsequently connected windowless extension did not receive new tabs.",
+		"Explicit target affinity routed creation to the second browser; unscoped creation stayed with the first selected populated browser despite a subsequently connected windowless extension.",
 	);
 } catch (error) {
 	failure = error instanceof Error ? (error.stack ?? error.message) : String(error);

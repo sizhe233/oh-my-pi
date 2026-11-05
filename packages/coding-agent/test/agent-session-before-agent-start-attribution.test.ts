@@ -45,6 +45,7 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 			],
 		});
 		const extensionRunner = {
+			clearSessionApprovals: () => {},
 			emitBeforeAgentStart,
 			emit: vi.fn().mockResolvedValue(undefined),
 		} as unknown as ExtensionRunner;
