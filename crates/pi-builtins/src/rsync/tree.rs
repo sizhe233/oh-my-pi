@@ -1655,7 +1655,10 @@ mod tests {
 			let root = base.join("a".repeat(120));
 			std::fs::create_dir(&root).unwrap();
 			assert!(root.join("sk0").as_os_str().len() > 108);
-			let tree = open_tree(&root, &TreeOpts::default());
+			// Exercise exact creation permissions without depending on or changing
+			// the process-wide umask of the runner. The temporary root is private.
+			let fs = pi_vfs::Fs::native().with_creation_mask(Some(0o027)).blocking();
+			let tree = Tree::open(&fs, &root, &TreeOpts::default()).unwrap();
 			tree.mknod(Path::new("sk0"), NodeKind::Socket, 0o640).unwrap();
 			let meta = std::fs::symlink_metadata(root.join("sk0")).unwrap();
 			assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));

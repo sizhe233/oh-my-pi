@@ -58,6 +58,8 @@ describe("hook-provided compaction replay boundary", () => {
 
 		let boundary: string | undefined;
 		const extensionRunner = {
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 			hasHandlers: (type: string) => type === "session_before_compact",
 			emit: async (event: { type: string; preparation?: CompactionPreparation }) => {
 				if (event.type !== "session_before_compact" || !event.preparation) return undefined;
