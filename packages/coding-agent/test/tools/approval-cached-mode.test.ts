@@ -457,4 +457,81 @@ describe("always-ask-cached wrapper cycle", () => {
 		await wrapper.execute("e2", {}, undefined, undefined, context(session));
 		expect(select).toHaveBeenCalledTimes(1);
 	});
+	it.each(["Approve File", "Always Approve File"])(
+		"does not store %s when the resolved event changes the approval lifetime",
+		async choice => {
+			const cwd = path.join(agentDir, "work");
+			const session = SessionManager.inMemory(cwd);
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }] }));
+			const tool: AgentTool = { ...pathTool("write", "write", cwd), execute };
+			const runner = runnerWith(session, async () => choice);
+			const handlers = vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === "tool_approval_resolved");
+			const emit = vi.spyOn(runner, "emit").mockImplementation(async event => {
+				if (event.type === "tool_approval_resolved") runner.clearSessionApprovals();
+			});
+			try {
+				await expect(
+					new ExtensionToolWrapper(tool, runner).execute(
+						"stale-cache",
+						{ path: "a.txt" },
+						undefined,
+						undefined,
+						context(session),
+					),
+				).rejects.toThrow("session changed");
+				expect(execute).not.toHaveBeenCalled();
+			} finally {
+				handlers.mockRestore();
+				emit.mockRestore();
+			}
+			const deny = vi.fn(async () => "Deny");
+			await expect(
+				new ExtensionToolWrapper(tool, runnerWith(session, deny)).execute(
+					"verify-cache",
+					{ path: "a.txt" },
+					undefined,
+					undefined,
+					context(session),
+				),
+			).rejects.toThrow("denied by user");
+			expect(deny).toHaveBeenCalledTimes(1);
+			expect(execute).not.toHaveBeenCalled();
+		},
+	);
+	it.each(["switch", "reset", "abort"] as const)(
+		"rejects a late session approval after %s without executing or granting",
+		async transition => {
+			const session = SessionManager.inMemory(path.join(agentDir, "work"));
+			const shown = Promise.withResolvers<void>();
+			const answer = Promise.withResolvers<string | undefined>();
+			let sessionChoice: string | undefined;
+			const select = vi.fn(async (_title: string, options: string[]) => {
+				sessionChoice = options.find(option => option.endsWith("for this session"));
+				shown.resolve();
+				return await answer.promise;
+			});
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }] }));
+			const tool: AgentTool = {
+				...pathTool("probe_exec", "exec", agentDir),
+				approvalCacheTargets: undefined,
+				execute,
+			};
+			const runner = runnerWith(session, select);
+			const wrapper = new ExtensionToolWrapper(tool, runner);
+			const controller = new AbortController();
+			const pending = wrapper.execute("late", {}, controller.signal, undefined, context(session));
+			const outcome = pending.then(
+				() => "executed",
+				() => "rejected",
+			);
+			await shown.promise;
+			if (transition === "switch") await session.newSession();
+			else if (transition === "reset") runner.clearSessionApprovals();
+			else controller.abort(new Error("cancelled while awaiting approval"));
+			answer.resolve(sessionChoice);
+			expect(await outcome).toBe("rejected");
+			expect(execute).not.toHaveBeenCalled();
+			expect(runner.hasSessionApproval("probe_exec\0exec")).toBe(false);
+		},
+	);
 });

@@ -100,13 +100,7 @@ export type WorkerInitPayload =
 			 * previously force-killed the tab). Never set for first-time Electron attach.
 			 */
 			recover?: boolean;
-			/**
-			 * True when omp created this page itself (a relay-forced fresh tab) rather
-			 * than adopting a pre-existing user tab. Only owned targets are closed by
-			 * the worker on `{ type: "close" }` — an adopted tab belongs to the user.
-			 */
-			ownsTarget?: boolean;
-			/** Session tab name used to group omp-owned relay tabs. */
+			/** Owning session label used to group omp-owned relay tabs. */
 			groupLabel?: string;
 			/**
 			 * The user drives this browser (connected, relay): downloads keep its one browser-wide folder and real file
