@@ -84,6 +84,8 @@ describe("AgentSession bash session ownership", () => {
 			emitUserBash,
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		return { completion, emitUserBash, extensionRunner };
 	}
@@ -140,6 +142,8 @@ describe("AgentSession bash session ownership", () => {
 			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		createSession(undefined, extensionRunner);
 
@@ -185,6 +189,8 @@ describe("AgentSession bash session ownership", () => {
 				getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 				emit: vi.fn().mockResolvedValue(undefined),
 				emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+				getSessionApprovalEpoch: () => 0,
+				clearSessionApprovals: () => {},
 			} as unknown as ExtensionRunner;
 			createSession(undefined, extensionRunner);
 
@@ -228,6 +234,8 @@ describe("AgentSession bash session ownership", () => {
 			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		createSession(undefined, extensionRunner);
 		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockResolvedValue(bashResult);
@@ -253,6 +261,8 @@ describe("AgentSession bash session ownership", () => {
 			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		createSession(undefined, extensionRunner);
 
@@ -450,6 +460,8 @@ describe("AgentSession bash session ownership", () => {
 			emitUserBash: vi.fn().mockReturnValueOnce(hook.promise).mockResolvedValue(undefined),
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const oldSessionFile = await createSwitchableSession(extensionRunner);
 		const pending = session.executeBash("PI_LEFT_SESSION_MARK=kept");

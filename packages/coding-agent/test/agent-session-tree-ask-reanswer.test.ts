@@ -412,6 +412,8 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 				}
 				return undefined;
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		const ctx = await createTestSession({ inMemory: true, extensionRunner });

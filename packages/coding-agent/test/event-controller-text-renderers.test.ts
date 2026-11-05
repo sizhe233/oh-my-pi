@@ -55,6 +55,8 @@ describe("EventController with assistant text renderers", () => {
 		const extensionRunner = {
 			getAssistantThinkingRenderers: () => [],
 			getAssistantTextRenderers: () => [renderer],
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const ctx = createInteractiveModeContext({ viewSession: { extensionRunner } });
 		const controller = new EventController(ctx);
@@ -89,6 +91,8 @@ describe("EventController with assistant text renderers", () => {
 		const extensionRunner = {
 			getAssistantThinkingRenderers: () => [],
 			getAssistantTextRenderers: () => renderers,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const ctx = createInteractiveModeContext({ viewSession: { extensionRunner, agent: { state: {} } } });
 		const controller = new EventController(ctx);

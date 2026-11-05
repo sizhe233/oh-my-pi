@@ -2167,6 +2167,8 @@ describe("AgentSession retry delay cap", () => {
 			emitBeforeAgentStart: async () => undefined,
 			hasHandlers: () => false,
 			emitSessionStop: async () => undefined,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		session = new AgentSession({

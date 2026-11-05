@@ -1955,6 +1955,8 @@ describe("cold revival replays the system prompt the last request sent", () => {
 					const override = await hooks.beforeAgentStart?.(session, systemPrompt);
 					return override ? { systemPrompt: override } : undefined;
 				},
+				getSessionApprovalEpoch: () => 0,
+				clearSessionApprovals: () => {},
 			} as unknown as ExtensionRunner,
 			rebuildSystemPrompt: async toolNames => ({ systemPrompt: buildPrompt(toolNames) }),
 		});

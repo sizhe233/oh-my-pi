@@ -80,6 +80,8 @@ function passthroughRunner(seen: string[] = []): ExtensionRunner {
 			return undefined;
 		},
 		emitToolResult: async () => undefined,
+		getSessionApprovalEpoch: () => 0,
+		clearSessionApprovals: () => {},
 	} as unknown as ExtensionRunner;
 }
 
@@ -1162,6 +1164,8 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 		// consults first.
 		const wrapped = new ExtensionToolWrapper(device, {
 			consumeToolCallEmitted: () => false,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner);
 		const settings = Settings.isolated({ "tools.approval": { ast_edit: "deny" } });
 		const handlers = new CursorExecHandlers({
@@ -2417,6 +2421,8 @@ describe("CursorExecHandlers passive tool context", () => {
 		return {
 			...passthroughRunner(),
 			emitToolCall: async () => ({ additionalContext: "hook context" }),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 	}
 

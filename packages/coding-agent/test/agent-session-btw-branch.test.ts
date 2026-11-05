@@ -223,6 +223,8 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
 			emit,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -255,6 +257,8 @@ describe("AgentSession.branchFromBtw", () => {
 				await hookRelease.promise;
 				return undefined;
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -295,6 +299,8 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
 			emit: vi.fn(async () => ({ skipConversationRestore: true })),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -421,6 +427,8 @@ describe("AgentSession.branchFromBtw", () => {
 				await hookRelease.promise;
 				return undefined;
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
