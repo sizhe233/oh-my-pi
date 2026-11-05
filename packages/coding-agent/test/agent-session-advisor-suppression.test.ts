@@ -63,6 +63,8 @@ interface CompletedAdvisorHarness {
 }
 
 interface AdvisorTestExtensionRunner {
+	getSessionApprovalEpoch(): number;
+	clearSessionApprovals(): void;
 	hasHandlers(eventType: string): boolean;
 	emitBeforeAgentStart(): Promise<undefined>;
 	emit(event: { type: string; message?: AgentMessage }): Promise<void>;
@@ -367,6 +369,8 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const hookStarted = Promise.withResolvers<void>();
 		const releaseHook = Promise.withResolvers<void>();
 		const extensionRunner: AdvisorTestExtensionRunner = {
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 			hasHandlers: eventType => eventType === "message_end",
 			emitBeforeAgentStart: async () => undefined,
 			emit: async event => {
@@ -405,6 +409,8 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const hookStarted = Promise.withResolvers<void>();
 		const releaseHook = Promise.withResolvers<void>();
 		const extensionRunner: AdvisorTestExtensionRunner = {
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 			hasHandlers: eventType => eventType === "message_start",
 			emitBeforeAgentStart: async () => undefined,
 			emit: async event => {
@@ -961,6 +967,8 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const settling = Promise.withResolvers<void>();
 		const releaseSettle = Promise.withResolvers<void>();
 		const extensionRunner: AdvisorTestExtensionRunner = {
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 			hasHandlers: () => true,
 			emitBeforeAgentStart: async () => undefined,
 			emit: async event => {
