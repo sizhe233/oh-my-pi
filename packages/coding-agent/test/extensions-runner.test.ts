@@ -3066,6 +3066,62 @@ describe("ExtensionRunner", () => {
 			},
 		);
 
+		it("same-session tree navigation rejects a late approval without clearing existing grants", async () => {
+			const { runner, run, execute, session } = approvalFixture();
+			const response = Promise.withResolvers<string>();
+			const prompted = Promise.withResolvers<void>();
+			let allowSession = "";
+			const select = vi.fn(async (_title: string, choices: string[]) => {
+				allowSession = choices[1]!;
+				prompted.resolve();
+				return response.promise;
+			});
+			initializeRunner(runner, select);
+			const user = sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+			sessionManager.appendMessage(createAssistantMessage("answer"));
+			runner.grantSessionApproval("existing-grant");
+			const pending = run().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await prompted.promise;
+				expect((await session.navigateTree(user, { summarize: false })).cancelled).toBe(false);
+				response.resolve(allowSession);
+				expect(await pending).toMatchObject({ message: expect.stringContaining("session changed") });
+				expect(execute).not.toHaveBeenCalled();
+				expect(runner.hasSessionApproval("existing-grant")).toBe(true);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(2);
+			} finally {
+				response.resolve("Deny");
+				await pending;
+				await session.dispose();
+			}
+		});
+
+		it.each(["no-op", "cancelled"] as const)("%s tree navigation preserves the approval lifetime", async outcome => {
+			const { runner, session } = approvalFixture();
+			try {
+				const user = sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+				const leaf = sessionManager.appendMessage(createAssistantMessage("answer"));
+				runner.grantSessionApproval("existing-grant");
+				const epoch = runner.getSessionApprovalEpoch();
+				if (outcome === "cancelled") {
+					vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === "session_before_tree");
+					vi.spyOn(runner, "emit").mockResolvedValue({ cancel: true });
+				}
+				const result = await session.navigateTree(outcome === "no-op" ? leaf : user, { summarize: false });
+				expect(result.cancelled).toBe(outcome === "cancelled");
+				expect(runner.getSessionApprovalEpoch()).toBe(epoch);
+				expect(runner.hasSessionApproval("existing-grant")).toBe(true);
+			} finally {
+				vi.restoreAllMocks();
+				await session.dispose();
+			}
+		});
+
 		it("an accepted branch revokes grants while same-session tree navigation preserves them", async () => {
 			const { runner, run, session } = approvalFixture();
 			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);

@@ -14000,6 +14000,8 @@ export class AgentSession implements SettingsScope {
 		// A run admitted during the hook or summary awaits would keep writing into the branch the leaf leaves.
 		if (options.requireIdle) this.#assertIdleForSnapshot("navigate the session tree");
 
+		this.#extensionRunner?.invalidatePendingApprovals();
+
 		// All cancellation/no-op exits are behind us. Invalidate prompt setup
 		// admitted on the abandoned branch before committing any tree changes.
 		this.#promptGeneration++;

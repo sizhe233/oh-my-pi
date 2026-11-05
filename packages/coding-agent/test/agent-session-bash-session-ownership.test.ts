@@ -86,6 +86,7 @@ describe("AgentSession bash session ownership", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			getSessionApprovalEpoch: () => 0,
 			clearSessionApprovals: () => {},
+			invalidatePendingApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		return { completion, emitUserBash, extensionRunner };
 	}
@@ -144,6 +145,7 @@ describe("AgentSession bash session ownership", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			getSessionApprovalEpoch: () => 0,
 			clearSessionApprovals: () => {},
+			invalidatePendingApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		createSession(undefined, extensionRunner);
 
@@ -191,6 +193,7 @@ describe("AgentSession bash session ownership", () => {
 				emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 				getSessionApprovalEpoch: () => 0,
 				clearSessionApprovals: () => {},
+				invalidatePendingApprovals: () => {},
 			} as unknown as ExtensionRunner;
 			createSession(undefined, extensionRunner);
 
@@ -236,6 +239,7 @@ describe("AgentSession bash session ownership", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			getSessionApprovalEpoch: () => 0,
 			clearSessionApprovals: () => {},
+			invalidatePendingApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		createSession(undefined, extensionRunner);
 		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockResolvedValue(bashResult);
@@ -263,6 +267,7 @@ describe("AgentSession bash session ownership", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			getSessionApprovalEpoch: () => 0,
 			clearSessionApprovals: () => {},
+			invalidatePendingApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		createSession(undefined, extensionRunner);
 
@@ -462,6 +467,7 @@ describe("AgentSession bash session ownership", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			getSessionApprovalEpoch: () => 0,
 			clearSessionApprovals: () => {},
+			invalidatePendingApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const oldSessionFile = await createSwitchableSession(extensionRunner);
 		const pending = session.executeBash("PI_LEFT_SESSION_MARK=kept");

@@ -367,6 +367,7 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 				emit: async () => undefined,
 				getSessionApprovalEpoch: () => 0,
 				clearSessionApprovals: () => {},
+				invalidatePendingApprovals: () => {},
 			} as unknown as ExtensionRunner;
 			session = new AgentSession({
 				agent: new Agent({
