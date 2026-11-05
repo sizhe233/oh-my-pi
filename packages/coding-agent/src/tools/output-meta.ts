@@ -22,7 +22,12 @@ import {
 	truncateMiddle,
 	truncateTail,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { formatOutputNotice, type OutputMeta, type TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import {
+	formatOutputNotice,
+	type MinimizedMeta,
+	type OutputMeta,
+	type TruncationMeta,
+} from "@oh-my-pi/pi-tui/tools/output-meta";
 import { renderError } from "./tool-errors";
 import {
 	cfgToolsArtifactHeadBytes,
@@ -45,6 +50,8 @@ export interface LimitsInput {
 	columnLines?: { first: number; last: number };
 	/** Target the `:raw:<first>-<last>` recovery selector is appended to. */
 	columnSelectorBase?: string;
+	/** Bytes a `:raw` read of the first cut line returns when that line is larger, so the hint names the cap. */
+	columnRawByteCap?: number;
 }
 
 // =============================================================================
@@ -338,6 +345,7 @@ export class OutputMetaBuilder {
 			this.columnTruncated(limits.columnMax, limits.columnUnit, undefined, undefined, {
 				lines: limits.columnLines,
 				selectorBase: limits.columnSelectorBase,
+				rawByteCap: limits.columnRawByteCap,
 			});
 		}
 		return this;
@@ -379,7 +387,7 @@ export class OutputMetaBuilder {
 		unit: "bytes" | "chars" = "chars",
 		artifactId?: string,
 		artifactElidedBytes?: number,
-		recovery?: { lines?: { first: number; last: number }; selectorBase?: string },
+		recovery?: { lines?: { first: number; last: number }; selectorBase?: string; rawByteCap?: number },
 	): this {
 		if (maxColumn <= 0) return this;
 		// Lines matter only with a target the recovery selector can read them from.
@@ -393,6 +401,7 @@ export class OutputMetaBuilder {
 				...(artifactId && artifactElidedBytes ? { artifactElidedBytes } : {}),
 				...(lines ? { lines } : {}),
 				...(lines && recovery?.selectorBase !== undefined ? { selectorBase: recovery.selectorBase } : {}),
+				...(lines && recovery?.rawByteCap !== undefined ? { rawByteCap: recovery.rawByteCap } : {}),
 			},
 		};
 		return this;
@@ -416,7 +425,7 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
-	/** Mark the output as a bounded page of session artifact storage its source re-reads with line selectors ({@link OutputMeta.pagedSource}). */
+	/** Mark the output as a bounded page of a file or artifact its source re-reads with line selectors ({@link OutputMeta.pagedSource}). */
 	pagedSource(): this {
 		this.#meta.pagedSource = true;
 		return this;
@@ -426,6 +435,12 @@ export class OutputMetaBuilder {
 	diagnostics(summary: string, messages: string[]): this {
 		if (messages.length === 0) return this;
 		this.#meta.diagnostics = { summary, messages };
+		return this;
+	}
+
+	/** Record the bash minimizer's rewrite. No-op when the output was not minimized. */
+	minimized(value: MinimizedMeta | undefined): this {
+		if (value) this.#meta.minimized = value;
 		return this;
 	}
 
@@ -510,11 +525,20 @@ export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
 const INLINE_CAP_SLACK_BYTES = 2 * 1024;
 
 /**
+ * Resolve the spill threshold (bytes) from session settings. Results above it
+ * spill to an artifact; `read` caps its line pages at it so a file read pages
+ * at a line boundary instead of being middle-elided.
+ */
+export function resolveArtifactSpillThreshold(s: Settings | undefined): number {
+	return getSpillConfig(s).threshold;
+}
+
+/**
  * Resolve the `enforceInlineByteCap` budget for streaming tools (bash/ssh)
  * from session settings: the user's spill threshold plus notice slack.
  */
 export function resolveInlineByteCapBudget(s: Settings | undefined): number {
-	return getSpillConfig(s).threshold + INLINE_CAP_SLACK_BYTES;
+	return resolveArtifactSpillThreshold(s) + INLINE_CAP_SLACK_BYTES;
 }
 
 /**
@@ -555,9 +579,9 @@ async function spillLargeResultToArtifact(
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
 	if (existingMeta?.truncation?.artifactId) return result;
 
-	// A bounded page of artifact storage its source URL re-reads with `:N-M` is already
-	// recoverable. Spilling it would only create a redundant artifact holding another
-	// artifact's page (and can repeat indefinitely on subsequent artifact reads).
+	// A bounded page its source re-reads with `:N-M` is already recoverable. Spilling it
+	// would middle-elide a page that already names its exact continuation, or duplicate
+	// an artifact's page into another artifact (repeatedly, on subsequent artifact reads).
 	if (existingMeta?.pagedSource) return result;
 
 	// Measure total text content. `totalLength` is the UTF-16 length of the "\n"-joined text.
