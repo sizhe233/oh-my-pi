@@ -374,6 +374,8 @@ function noUiRunner(): ExtensionRunner {
 		runScoped<T>(fn: () => T): T {
 			return fn();
 		},
+		getSessionApprovalEpoch: () => 0,
+		clearSessionApprovals: () => {},
 	} as unknown as ExtensionRunner;
 }
 

@@ -84,6 +84,8 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			extensionRunner: {
 				emitBeforeAgentStart: async () => ({ systemPrompt: [OVERRIDE] }),
 				emit: async () => undefined,
+				getSessionApprovalEpoch: () => 0,
+				clearSessionApprovals: () => {},
 			} as unknown as ExtensionRunner,
 			rebuildSystemPrompt: async () => ({ systemPrompt: [REBUILT_BASE] }),
 		});

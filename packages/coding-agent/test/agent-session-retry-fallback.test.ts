@@ -1998,6 +1998,8 @@ describe("AgentSession retry fallback", () => {
 				await session.setModelTemporary(setupTarget, undefined, { ephemeral: true });
 				return undefined;
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		session = new AgentSession({
 			agent,
@@ -5004,6 +5006,8 @@ describe("AgentSession retry fallback", () => {
 				sessionStopLastAssistantMessages.push(event.last_assistant_message);
 				return Promise.resolve(undefined);
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		session = new AgentSession({

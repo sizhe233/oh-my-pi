@@ -452,6 +452,8 @@ describe("AgentSession empty stop guard", () => {
 				await releaseMessageEnd.promise;
 				return undefined;
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const { session } = await createHarness(
 			[emptyStop(), emptyStop(), emptyStop(), emptyStop()],
