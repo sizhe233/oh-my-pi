@@ -379,8 +379,24 @@ try {
 	await until("second browser discovery", async () =>
 		(await targets(recovered)).some(t => t.url.includes("second-instance")),
 	);
+	// A new hello must not move a caller to another browser/profile. The first
+	// selected tab remains in the original browser; an explicit nearTargetId
+	// is required to route this connection into the second browser.
+	const stable = await recovered.send<{ targetId: string }>("Target.createTarget", {
+		url: "data:text/html,<title>stable-first-browser</title>",
+		background: true,
+	});
+	await until("default creation stays in first browser", async () =>
+		(await tabs(first.worker)).some(t => t.url.includes("stable-first-browser")),
+	);
+	assert(!(await tabs(second.worker)).some(t => t.url.includes("stable-first-browser")));
+	await recovered.send("Target.closeTarget", { targetId: stable.targetId });
+	const secondTarget = (await targets(recovered)).find(t => t.url.includes("second-instance"));
+	assert(secondTarget, "Second browser user target must be discoverable");
 	const routed = await recovered.send<{ targetId: string }>("Target.createTarget", {
 		url: "data:text/html,<title>routed-to-second</title>",
+		nearTargetId: secondTarget.targetId,
+		background: true,
 	});
 	// createTab resolves before navigation commits; observe the actual tab's
 	// committed URL rather than treating pending navigation as wrong routing.
@@ -410,7 +426,7 @@ try {
 	result(
 		11,
 		"pass",
-		"Real multi-profile browsers routed creation to the last connected populated instance; a subsequently connected windowless extension did not receive new tabs.",
+		"Real multi-profile browsers kept default creation in the first selected browser and honored explicit nearTargetId routing to the second browser; a subsequently connected windowless extension did not receive new tabs.",
 	);
 } catch (error) {
 	failure = error instanceof Error ? (error.stack ?? error.message) : String(error);

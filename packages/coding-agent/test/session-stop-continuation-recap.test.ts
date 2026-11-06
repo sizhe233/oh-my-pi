@@ -97,6 +97,8 @@ describe("session_stop block continuation — idle recap resilience (#4323)", ()
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn(() => false),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();

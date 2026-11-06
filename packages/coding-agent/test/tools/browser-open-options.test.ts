@@ -7,7 +7,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
-import { applyIgnoreHttpsErrors, resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
+import { resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
 import { DownloadManager } from "@oh-my-pi/pi-coding-agent/tools/browser/downloads";
 import {
 	buildHeadlessLaunchArgs,
@@ -15,16 +15,24 @@ import {
 	removeUserDataDir,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
+	closeCdpTarget,
 	forgetSharedTarget,
 	recordSharedTarget,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import * as relayOwnedTargets from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
-import { acquireTab, getTab, releaseAllTabs, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import {
+	acquireTab,
+	getTab,
+	releaseAllTabs,
+	releaseTab,
+	runInTab,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import type { Browser, Page, Target } from "puppeteer-core";
+import { CLAUDE_TRACE_DEBUG_CERT, CLAUDE_TRACE_DEBUG_KEY } from "@oh-my-pi/pi-coding-agent/cli/claude-trace-cli";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 import {
@@ -65,7 +73,7 @@ afterAll(async () => {
 });
 
 describe("browser open options CDP helpers", () => {
-	it("sends the invalid-certificate override through CDP", async () => {
+	it("adds the per-open launch switches when requested", () => {
 		const args = buildHeadlessLaunchArgs(
 			{ width: 800, height: 600 },
 			{ ignoreHttpsErrors: true, allowFileAccess: true },
@@ -74,23 +82,16 @@ describe("browser open options CDP helpers", () => {
 		expect(args).toContain("--enable-features=WebMCPTesting,DevToolsWebMCPSupport");
 		expect(args).toContain("--ignore-certificate-errors");
 		expect(args).toContain("--allow-file-access-from-files");
-		const calls: Array<{ method: string; params: unknown }> = [];
-		let detached = false;
-		const page = {
-			createCDPSession: async () => ({
-				send: async (method: string, params: unknown) => {
-					calls.push({ method, params });
-				},
-				detach: async () => {
-					detached = true;
-				},
-			}),
-		} as unknown as Page;
+	});
 
-		await applyIgnoreHttpsErrors(page);
-
-		expect(calls).toEqual([{ method: "Security.setIgnoreCertificateErrors", params: { ignore: true } }]);
-		expect(detached).toBe(true);
+	it("rejects ignore_https_errors on the relay before opening a tab", async () => {
+		const name = `relay-tls-${crypto.randomUUID()}`;
+		const error = await rejectionOf(
+			browserHost()({ action: "open", name, app: { relay: true }, ignore_https_errors: true }),
+		);
+		expect(error).toBeInstanceOf(ToolError);
+		expect(error).toMatchObject({ message: expect.stringContaining("Security domain") });
+		expect(getTab(name)).toBeUndefined();
 	});
 
 	it("omits per-open launch switches unless requested", () => {
@@ -361,9 +362,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 							},
 						});
 					}
-					return new Response(`<title>${name}</title><a id="download" href="/file?name=managed.txt">download</a>`, {
-						headers: { "content-type": "text/html" },
-					});
+					return new Response(
+						`<title>${name}</title><a id="download" href="/file?name=managed.txt">download</a>`,
+						{
+							headers: { "content-type": "text/html" },
+						},
+					);
 				},
 			});
 			let recycledDirectory: string | undefined;
@@ -382,7 +386,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					timeoutMs: 15_000,
 				});
 				if (tab.backend !== "worker") throw new Error("Expected a relay worker");
-				expect(tab.ownsTarget).toBe(ownsTarget);
+				expect(tab.ownsPage).toBe(ownsTarget);
 				const targetId = tab.targetId;
 				recycledDirectory = path.join(os.tmpdir(), `omp-downloads-${targetId}`);
 				for (const phase of ["initial", "recycled"] as const) {
@@ -390,16 +394,20 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 						const previousWorker = tab.worker;
 						// Require the real worker path: inline fallback cannot recycle safely.
 						expect(previousWorker.mode).toBe("worker");
-						expect(await rejectionOf(runInTab(name, {
-							code: "await new Promise(() => {});",
-							timeoutMs: 5_000,
-							session,
-						}))).toMatchObject({ message: expect.stringContaining("Browser code execution timed out after ") });
+						expect(
+							await rejectionOf(
+								runInTab(name, {
+									code: "await new Promise(() => {});",
+									timeoutMs: 5_000,
+									session,
+								}),
+							),
+						).toMatchObject({ message: expect.stringContaining("Browser code execution timed out after ") });
 						expect(getTab(name)).toBe(tab);
 						expect(tab.state).toBe("alive");
 						expect(tab.worker).not.toBe(previousWorker);
 						expect(tab.targetId).toBe(targetId);
-						expect(tab.ownsTarget).toBe(ownsTarget);
+						expect(tab.ownsPage).toBe(ownsTarget);
 					}
 					gateReached = Promise.withResolvers<void>();
 					gateOpened = Promise.withResolvers<void>();
@@ -416,7 +424,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					});
 					void running.catch(() => undefined);
 					try {
-						await Promise.race([gateReached.promise, running.then(() => { throw new Error("Run ended before gate"); })]);
+						await Promise.race([
+							gateReached.promise,
+							running.then(() => {
+								throw new Error("Run ended before gate");
+							}),
+						]);
 						const filename = `user-${phase}.txt`;
 						const directory = phase === "initial" ? path.join(root, "downloads") : recycledDirectory;
 						await userPage.evaluate(`{
@@ -474,13 +487,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 	);
 
 	it.each([
-		["failure", false],
-		["failure", true],
-		["cancellation", false],
-		["cancellation", true],
+		["failure", false, "native-confirmed"],
+		["failure", true, "native-confirmed"],
+		["cancellation", false, "native-confirmed"],
+		["cancellation", true, "native-confirmed"],
+		["failure", true, "relay-unconfirmed"],
+		["cancellation", true, "relay-unconfirmed"],
 	] as const)(
-		"rolls back a relay open after %s, closing only its owned target (ownsTarget=%s)",
-		async (outcome, ownsTarget) => {
+		"rolls back a relay open after %s, closing only its owned target (ownsTarget=%s, transport=%s)",
+		async (outcome, ownsTarget, transport) => {
 			// Real Chromium and workers exercise attach-mode ownership through post-init
 			// navigation. The relay-kind handle selects the fork's fresh/adopted paths;
 			// this deliberately does not claim extension, focus, or tab-group coverage.
@@ -489,6 +504,21 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-open-rollback-"));
 			const scope: SharedTargetScope = { projectDir: root, runtimeDir: root, daemonName: "relay-open" };
 			const scopeSpy = spyOn(relayOwnedTargets, "relayTargetScope").mockReturnValue(scope);
+			const closeRelayTarget = relayOwnedTargets.closeRelayTarget;
+			const unconfirmed: string[] = [];
+			const closeSpy = spyOn(relayOwnedTargets, "closeRelayTarget").mockImplementation(
+				async (endpoint, targetId) => {
+					// The fixture is native Chromium labeled as a relay handle.
+					// Exercise its real, unfiltered close confirmation for the original
+					// cleanup contract, and the conservative relay helper separately.
+					const confirmed =
+						transport === "native-confirmed"
+							? await closeCdpTarget(browser, targetId)
+							: await closeRelayTarget(endpoint, targetId);
+					if (!confirmed) unconfirmed.push(targetId);
+					return confirmed;
+				},
+			);
 			const name = `relay-rollback-${crypto.randomUUID()}`;
 			const cdpUrl = `http://${new URL(browser.wsEndpoint()).host}`;
 			const handle: PuppeteerBrowserHandle = {
@@ -524,7 +554,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			};
 			try {
 				const borrowed = await browser.newPage();
-				await borrowed.goto(`data:text/html,<title>${name}</title>`);
+				await borrowed.setContent(`<title>${name}</title>`);
 				const client = await browser.target().createCDPSession();
 				const pageTargets = async () =>
 					(await client.send("Target.getTargets")).targetInfos
@@ -565,7 +595,21 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				expect(await pageTargets()).toEqual(before);
 				expect(borrowed.isClosed()).toBe(false);
 				expect(handle.refCount).toBe(1);
-				expect(await ownedTargets()).toEqual([]);
+				expect(closeSpy).toHaveBeenCalledTimes(ownsTarget ? 1 : 0);
+				if (ownsTarget) {
+					expect(closeSpy.mock.calls[0]?.[0]).toBe(browser.wsEndpoint());
+					expect(closeSpy.mock.calls[0]?.[1]).toBe(Reflect.get(created[0]!, "_targetId"));
+				}
+				if (transport === "native-confirmed") {
+					// Preserve the original strict native-fixture cleanup assertion.
+					expect(unconfirmed).toEqual([]);
+					expect(await ownedTargets()).toEqual([]);
+				} else {
+					// Raw Chromium cannot acknowledge the worker's already-closed page
+					// to the relay helper. Keep its record for the ownership-aware reaper.
+					expect(unconfirmed).toEqual([Reflect.get(created[0]!, "_targetId")]);
+					expect(await ownedTargets()).toEqual(unconfirmed);
+				}
 				await client.detach();
 			} finally {
 				controller.abort();
@@ -575,6 +619,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					await ownedTargets();
 				} finally {
 					scopeSpy.mockRestore();
+					closeSpy.mockRestore();
 					await server.stop(true);
 					await browser.close();
 					if (launched.userDataDir) await removeUserDataDir(launched.userDataDir);
@@ -680,38 +725,78 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		}
 	});
 
-	it("keeps the tab on what loaded when the page outlasts the open timeout", async () => {
-		const server = Bun.serve({
-			port: 0,
-			fetch(request) {
-				// The image never answers, so the page never fires `load`.
-				if (new URL(request.url).pathname === "/hang.png") return new Promise<Response>(() => {});
-				return new Response('<title>slow</title><p>partial</p><img src="/hang.png">', {
-					headers: { "content-type": "text/html" },
-				});
-			},
-		});
+	it("accepts an untrusted certificate for the tab's lifetime, across a worker recycle, and checks it again once the tab closes", async () => {
+		const serveUntrusted = () =>
+			Bun.serve({
+				port: 0,
+				tls: { cert: CLAUDE_TRACE_DEBUG_CERT, key: CLAUDE_TRACE_DEBUG_KEY },
+				fetch: () => new Response("<title>untrusted</title>", { headers: { "content-type": "text/html" } }),
+			});
+		const server = serveUntrusted();
+		// Fresh origins after the recycle and after close: Chromium reuses an accepted connection to an origin.
+		const recycled = serveUntrusted();
+		const later = serveUntrusted();
+		// Launched without --ignore-certificate-errors and attached over app.cdp_url, as the shared
+		// browser is: only the tab's CDP override can accept the certificate.
+		const { browser, userDataDir } = await launchHeadlessBrowser({ headless: true });
 		try {
+			const [page] = await browser.pages();
+			if (!page) throw new Error("Expected the launched browser to expose a page");
 			const invoke = browserHost();
-			const name = `slow-${crypto.randomUUID()}`;
-			const open = () => rejectionOf(invoke({ action: "open", name, url: server.url.href, timeout: 3 }));
-			const keptTab = { message: expect.stringContaining(`browser.tab(${JSON.stringify(name)})`) };
-			// The first open creates the tab; the second reuses the one it kept.
-			expect(await open()).toMatchObject(keptTab);
-			expect(await open()).toMatchObject(keptTab);
+			const name = `tls-${crypto.randomUUID()}`;
+			await invoke({
+				action: "open",
+				name,
+				url: server.url.href,
+				app: { cdp_url: `http://${new URL(browser.wsEndpoint()).host}` },
+				ignore_https_errors: true,
+			});
 			expect(
 				returnedValue(
 					await invoke({
 						action: "run",
 						name,
-						code: "return { url: tab.url(), text: await tab.evaluate(() => document.body.innerText) };",
+						code: "await tab.reload(); return await tab.title();",
 					}),
 				),
-			).toEqual({ url: server.url.href, text: "partial" });
+			).toBe("untrusted");
+			const opened = getTab(name);
+			const worker = opened?.backend === "worker" ? opened.worker : undefined;
+			// A worker that exits on its own is recycled: the tab is reattached to a new worker on the same page. The
+			// rejection's stack never touches the run's source, so the run guard leaves it to end the worker.
+			const endWorker = `const err = new Error("library-internal");
+err.stack = "Error: library-internal\\n    at #onFileChooser (puppeteer/Page.js:1:1)";
+Promise.reject(err);
+await Promise.withResolvers().promise;`;
+			expect(await rejectionOf(invoke({ action: "run", name, code: endWorker }))).toMatchObject({
+				message: expect.stringContaining("the tab is being reattached"),
+			});
+			const tab = getTab(name);
+			if (tab?.backend !== "worker") throw new Error("Expected a worker tab");
+			expect(await tab.workerRecovery).toBe(true);
+			expect(tab.worker).not.toBe(worker);
+			expect(
+				returnedValue(
+					await invoke({
+						action: "run",
+						name,
+						code: `await tab.goto(${JSON.stringify(recycled.url.href)}); return await tab.title();`,
+					}),
+				),
+			).toBe("untrusted");
+			await invoke({ action: "close", name });
+			// The borrowed page outlives the tab; its certificate checks come back with the override released.
+			expect(await rejectionOf(page.goto(later.url.href))).toMatchObject({
+				message: expect.stringContaining("net::ERR_CERT_AUTHORITY_INVALID"),
+			});
 		} finally {
 			server.stop(true);
+			recycled.stop(true);
+			later.stop(true);
+			await browser.close();
+			if (userDataDir) await removeUserDataDir(userDataDir);
 		}
-	}, 20_000);
+	}, 30_000);
 
 	it("closes the tab its open created when the navigation fails outright, but keeps a reused one", async () => {
 		const refused = Bun.serve({ port: 0, fetch: () => new Response("") });
