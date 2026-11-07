@@ -1,15 +1,51 @@
 {
   "schemaVersion": 1,
   "upstreamRepository": "can1357/oh-my-pi",
-  "releaseTag": "v18.10.3",
-  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.10.3",
-  "releaseId": 410932075,
-  "publishedAt": "2026-10-12T19:23:53Z",
-  "upstreamSha": "81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b",
-  "baseSha": "82c829b5e3092f1647ede503a09c5cd60ed3f65e",
-  "mergeBaseSha": "c8913466dd7bf92040de911f8e00e30b8f4e48a2",
-  "branch": "sync/upstream-v18.10.3",
+  "releaseTag": "v18.18.0",
+  "releaseUrl": "https://github.com/can1357/oh-my-pi/releases/tag/v18.18.0",
+  "releaseId": 437249191,
+  "publishedAt": "2026-11-07T01:49:16Z",
+  "upstreamSha": "b5a6b2f7e5b6606b6562e678ead83f21738f34a0",
+  "baseSha": "82bae18f3a70fa6a07636681651e086a783416ad",
+  "mergeBaseSha": "81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b",
+  "branch": "sync/upstream-v18.18.0-82bae18f3a70fa6a07636681651e086a783416ad",
   "workflowPolicy": "Preserve the complete fork .github/workflows tree; upstream workflow changes remain in the upstream parent and require separate review before adoption.",
-  "upstreamWorkflowChanges": [],
-  "reviewedConflictResolutions": null
+  "upstreamWorkflowChanges": [
+    "M\t.github/workflows/bun-cache-warm.yml",
+    "M\t.github/workflows/ci.yml",
+    "M\t.github/workflows/nix.yml"
+  ],
+  "reviewedConflictResolutions": {
+    "path": ".github/upstream-resolutions/v18.18.0.json",
+    "blob": "ccac5666e78fb592da323d1698f9e412f1ae173d",
+    "resolvedPaths": [
+      "crates/pi-shell/src/shell.rs",
+      "packages/agent/src/tokenizer.ts",
+      "packages/agent/test/tokenizer.test.ts",
+      "packages/browser-relay/README.md",
+      "packages/browser-relay/extension/background.ts",
+      "packages/catalog/src/models.json",
+      "packages/catalog/test/generated-policies.test.ts",
+      "packages/coding-agent/src/async/job-manager.ts",
+      "packages/coding-agent/src/task/executor.ts",
+      "packages/coding-agent/src/task/restore.ts",
+      "packages/coding-agent/src/tools/browser/relay/bridge.ts",
+      "packages/coding-agent/src/tools/browser/relay/extension-assets/background.js.txt",
+      "packages/coding-agent/src/tools/browser/relay/protocol.ts",
+      "packages/coding-agent/src/tools/browser/screenshot.ts",
+      "packages/coding-agent/src/tools/browser/tab-supervisor.ts",
+      "packages/coding-agent/src/tools/browser/tab-worker.ts",
+      "packages/coding-agent/test/task/restore.test.ts",
+      "packages/coding-agent/test/tools/browser-attach.test.ts",
+      "packages/coding-agent/test/tools/browser-op-tracking.test.ts",
+      "packages/coding-agent/test/tools/browser-open-options.test.ts",
+      "packages/coding-agent/test/tools/browser-relay-bridge.test.ts",
+      "packages/coding-agent/test/tools/chromium-probe.ts"
+    ],
+    "postMergeTestPaths": [
+      "packages/coding-agent/test/tools/browser-chromium-probe.test.ts",
+      "packages/coding-agent/test/tools/browser-relay-owned-targets.test.ts",
+      "packages/coding-agent/test/tools/browser-shared-wedge.test.ts"
+    ]
+  }
 }
