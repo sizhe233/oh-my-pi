@@ -192,7 +192,7 @@ describe("optional embeddings", () => {
 			embed: streamRows(texts => texts.map(() => [1, 2, 3])),
 			available: () => true,
 		});
-		const memory = new Mnemopi({ noEmbeddings: true });
+		const memory = new Mnemopi({ noEmbeddings: true, dbPath: ":memory:" });
 		try {
 			const result = await withMnemopiRuntimeOptions(memory.runtimeOptions, () => embed(["hello"]));
 			expect(result).toBeNull();

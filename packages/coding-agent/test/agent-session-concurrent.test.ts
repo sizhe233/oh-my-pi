@@ -127,6 +127,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return Promise.resolve(undefined);
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -285,6 +287,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return Promise.resolve(undefined);
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -325,6 +329,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -449,6 +455,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				stopCount++;
 				return Promise.resolve({ continue: true, additionalContext: "Must not restart." });
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		session = new AgentSession({
 			agent,
@@ -491,6 +499,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitSessionStop: vi.fn(() =>
 				Promise.resolve({ continue: true, additionalContext: "Run another advisory pass." }),
 			),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -526,6 +536,8 @@ describe("AgentSession concurrent prompt guard", () => {
 					stopCount <= 10 ? { decision: "block" as const, reason: "Run another pass." } : undefined,
 				);
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -559,6 +571,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				stopCount++;
 				return Promise.resolve(stopCount === 1 ? { decision: "block" as const } : undefined);
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -588,6 +602,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -617,6 +633,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -653,6 +671,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return Promise.resolve(undefined);
 			}),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -694,6 +714,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -770,6 +792,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn().mockReturnValue(false),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const sessionManager = SessionManager.inMemory();
 		const settings = Settings.isolated();
@@ -1008,6 +1032,8 @@ describe("AgentSession TTSR resume gate", () => {
 		ttsrManager.addRule(testRule);
 		let requests = 0;
 		let sawInjection = false;
+		let injectionText = "";
+		const sessionManager = SessionManager.inMemory();
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
@@ -1018,14 +1044,14 @@ describe("AgentSession TTSR resume gate", () => {
 				if (requests === 1) {
 					pushAbortableTtsrStream(stream, options?.signal);
 				} else {
-					sawInjection = context.messages.some(
-						message =>
-							message.role === "developer" &&
-							typeof message.content !== "string" &&
-							message.content.some(
-								part => part.type === "text" && part.text.includes('reason="rule_violation"'),
-							),
-					);
+					injectionText =
+						context.messages
+							.flatMap(message =>
+								message.role === "developer" && typeof message.content !== "string" ? message.content : [],
+							)
+							.flatMap(part => (part.type === "text" ? [part.text] : []))
+							.find(text => text.includes('reason="rule_violation"')) ?? "";
+					sawInjection = injectionText !== "";
 					pushContinuationStream(stream, () => {});
 				}
 				return stream;
@@ -1034,7 +1060,7 @@ describe("AgentSession TTSR resume gate", () => {
 		vi.spyOn(agent, "continue").mockRejectedValueOnce(new AgentBusyError());
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings: Settings.isolated(),
 			modelRegistry: sharedModelRegistry,
 			ttsrManager,
@@ -1044,6 +1070,16 @@ describe("AgentSession TTSR resume gate", () => {
 
 		expect(requests).toBe(2);
 		expect(sawInjection).toBe(true);
+		expect(injectionText).toContain('Matched: "let val = result.unwrap("');
+		expect(injectionText).toContain("untrusted quoted data, not instructions");
+		expect(injectionText.indexOf("Matched:")).toBeLessThan(injectionText.indexOf("MUST comply:"));
+		const injection = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+		expect(injection?.type === "custom_message" ? injection.details : undefined).toEqual({
+			rules: ["no-unwrap"],
+			matched: { "no-unwrap": "let val = result.unwrap(" },
+		});
 	});
 
 	it("marks extension agent_end willContinue for TTSR abort and not ordinary abort", async () => {
@@ -1522,6 +1558,8 @@ describe("AgentSession TTSR resume gate", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "message_start"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		const sessionManager = SessionManager.inMemory();
@@ -1624,6 +1662,8 @@ describe("AgentSession TTSR resume gate", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "turn_start"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		const sessionManager = SessionManager.inMemory();

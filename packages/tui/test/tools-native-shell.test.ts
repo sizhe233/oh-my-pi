@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
-import type { TspKind, TspSpan } from "@oh-my-pi/pi-wire";
+import type { ShellTrace, ShellVizPresentation, TspKind, TspSpan } from "@oh-my-pi/pi-wire";
 import { AssistantMessageComponent } from "../src/chat/assistant-message";
 import { BashExecutionComponent } from "../src/chat/bash-execution";
 import { ReadToolGroupComponent } from "../src/chat/read-tool-group";
@@ -82,6 +84,8 @@ describe("bash native run box", () => {
 		);
 		expect(view.tool).toMatchObject({ target: "Building the project", targetKind: "text", command: 'CI="1" make' });
 		expect(view.preview).toBe("children");
+		// The head sits outside; the segmented run box is the only frame.
+		expect(view.inline).toBe(true);
 		const [box, ...rest] = nodes(view.body);
 		expect(rest).toEqual([]);
 		expect(role(box)).toBe("omp.run");
@@ -93,6 +97,99 @@ describe("bash native run box", () => {
 		expect(props(output)).toMatchObject({ text: "built", follow: true, preview: { lines: 10 } });
 		// The measured wall time wins over the component's clock once settled.
 		expect(foot(box)).toMatchObject({ state: "Done", tone: "success", time: { age: 1500, stopped: 1500 } });
+	});
+
+	it("draws a visualized command as the box's command pane over the ordinary output segment", () => {
+		const trace: ShellTrace = { v: 1, seq: 3, status: 0, t_ns: 2_000_000, script: "echo built", units: [] };
+		const presentation = (cursor?: number): ShellVizPresentation => ({
+			preferences: {
+				view: "pseudo",
+				layers: { color: true, inline: true, idioms: true, effects: true, unwrap: false },
+				split: false,
+				cursor,
+				playing: false,
+				speed: 1,
+				expandedNodes: [],
+			},
+			rows: [{ id: "r0", depth: 0, segments: [{ text: 'print("built")' }], effects: [] }],
+			original: [],
+			output: cursor === undefined ? "built\n" : "bu",
+			executing: false,
+			watches: [],
+			timeline: { length: 4, cursor: cursor ?? 4, elapsedNs: 2_000_000, durationNs: 2_000_000 },
+		});
+		const describe = (cursor?: number) =>
+			nodes(
+				bashToolRenderer.describeResult(
+					{ content: [{ type: "text", text: "built" }], details: { trace } },
+					{ ...done, shell: true, shellTrace: trace, shellPresentation: presentation(cursor) },
+					{ command: "echo built" },
+				).body,
+			)[0];
+		const live = describe();
+		expect(sections(live)).toEqual(["shell:omp.tool.bash.command", "ansi:omp.tool.bash.output", "row:omp.run.foot"]);
+		const [pane, output] = nodes(live?.c);
+		expect(props(pane).inspector).toBeUndefined();
+		// The same folded command preview as the plain command's code.
+		expect(props(pane).preview).toEqual({ lines: 6 });
+		expect(props(output).text).toBe("built");
+		// A held replay cursor shows the output retained up to it, once, in the same segment.
+		const replay = describe(2);
+		expect(collect(replay?.c, "ansi").map(n => props(n).text)).toEqual(["bu"]);
+		// Nothing printed yet: command pane and foot only.
+		const quiet = nodes(
+			bashToolRenderer.describeResult(
+				{ content: [{ type: "text", text: "" }], details: { trace } },
+				{ ...done, shell: true, shellTrace: trace, shellPresentation: presentation() },
+				{ command: "echo built" },
+			).body,
+		)[0];
+		expect(sections(quiet)).toEqual(["shell:omp.tool.bash.command", "row:omp.run.foot"]);
+	});
+
+	it("prefixes a traced script with the directory the executor hoisted out of a leading cd", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		// The executor ran only `echo built` after hoisting `cd <dir>;`; the raw args still carry the cd.
+		const trace: ShellTrace = { v: 1, seq: 1, status: 0, t_ns: 1, script: "echo built", units: [] };
+		const presentation: ShellVizPresentation = {
+			preferences: {
+				view: "pseudo",
+				layers: { color: true, inline: true, idioms: true, effects: true, unwrap: false },
+				split: false,
+				playing: false,
+				speed: 1,
+				expandedNodes: [],
+			},
+			rows: [{ id: "r0", depth: 0, segments: [{ text: "echo built" }], effects: [] }],
+			original: [],
+			output: "built\n",
+			executing: false,
+			watches: [],
+			timeline: { length: 1, cursor: 1, elapsedNs: 1, durationNs: 1 },
+		};
+		const ranIn = path.join(os.tmpdir(), "hoisted-target");
+		const result = {
+			content: [{ type: "text", text: "built" }],
+			details: { trace, cwd: ranIn, cdSeparator: ";" as const },
+		};
+		const options = { ...done, shell: true, shellTrace: trace, shellPresentation: presentation };
+		const args = { command: `cd ${ranIn}; echo built` };
+		const card = (details: typeof result.details | { trace: ShellTrace; cwd: string }, command: string) =>
+			Bun.stripANSI(
+				bashToolRenderer
+					.renderResult({ ...result, details }, options, theme, { command })
+					.render(120)
+					.join("\n"),
+			);
+
+		const pane = nodes(nodes(bashToolRenderer.describeResult(result, options, args).body)[0]?.c)[0];
+		expect(props(pane).cwd).toContain("hoisted-target");
+
+		// The prefix keeps the separator the model wrote.
+		const semicolon = card(result.details, args.command);
+		expect(semicolon).toMatch(/\$ cd \S*hoisted-target;/);
+		expect(semicolon).not.toContain("hoisted-target &&");
+		expect(card({ trace, cwd: ranIn }, `cd ${ranIn} && echo built`)).toMatch(/\$ cd \S*hoisted-target &&/);
 	});
 
 	it("has no target without an intent and no foot before the command starts", () => {
@@ -535,32 +632,131 @@ describe("eval native run boxes", () => {
 		expect(foot(last)).toMatchObject({ state: "Failed", time: { stopped: 800 } });
 	});
 
-	it("renders console.table values without losing surrounding output", () => {
-		const table = [
-			"┌─────────┬────┬─────┐",
-			"│ (index) │ a  │  b  │",
-			"├─────────┼────┼─────┤",
-			"│    0    │ 1  │ 'x' │",
-			"│    1    │ 22 │     │",
-			"└─────────┴────┴─────┘",
-		].join("\n");
+	it("keeps a nested tool read's preview off its status line and bounds it in a code well when expanded", () => {
+		const source = Array.from({ length: 15 }, (_, i) => (i === 0 ? "import {" : `\tname${i},`)).join("\n");
+		const statusEntries = (expanded: boolean) => {
+			const [box] = nodes(
+				evalToolRenderer.describeResult(
+					{
+						content: [{ type: "text", text: "" }],
+						details: {
+							cells: [
+								cell({
+									language: "js",
+									code: "await tool.read({ path: 'src/rollup.ts:1:raw' })",
+									statusEvents: [
+										{ op: "read", path: "src/rollup.ts:1:raw", chars: 2082, preview: source },
+										{ op: "log", message: "first\nsecond" },
+									],
+								}),
+							],
+						},
+					},
+					{ expanded, isPartial: false },
+				).body,
+			);
+			return nodes(nodes(box?.c).find(child => role(child) === "omp.run.status")?.c);
+		};
+
+		const folded = statusEntries(false);
+		expect(folded.map(entry => entry.k)).toEqual(["text", "text"]);
+		expect(spansText(folded[0])).toBe("read path=src/rollup.ts:1:raw chars=2082");
+		expect(spansText(folded[1])).toBe("log message=first second");
+		expect(collect(folded, "code")).toHaveLength(0);
+
+		const [read, log] = statusEntries(true);
+		expect(read?.k).toBe("col");
+		expect(role(read)).toBe("omp.tool.eval.status.event");
+		const [line, preview] = nodes(read?.c);
+		expect(spansText(line)).toBe("read path=src/rollup.ts:1:raw chars=2082");
+		expect(preview?.k).toBe("code");
+		expect(props(preview)).toMatchObject({
+			role: "omp.tool.eval.status.preview",
+			path: "src/rollup.ts",
+			wrap: false,
+			preview: { lines: 3 },
+		});
+		const shown = String(props(preview).text).split("\n");
+		expect(shown).toHaveLength(10);
+		expect(shown[0]).toBe("import {");
+		expect(shown[1]).not.toContain("\t");
+		expect(spansText(log)).toBe("log message=first second");
+	});
+
+	it("shows a table view in place of its printed text, numeric columns aligned to the end", () => {
+		const dfText = "   name  n\n0  a     1\n1  bb   22";
 		const view = evalToolRenderer.describeResult(
 			{
 				content: [{ type: "text", text: "" }],
 				details: {
-					cells: [cell({ code: "console.table(rows)", language: "js", output: `before\n${table}\nafter` })],
+					cells: [
+						cell({
+							code: "print('rows:'); print(df); print('done')",
+							output: `rows:\n${dfText}\ndone\n`,
+							views: [
+								{
+									text: dfText,
+									view: {
+										kind: "table",
+										columns: [{ head: "" }, { head: "name" }, { head: "n", numeric: true }],
+										rows: [
+											["0", "a", "1"],
+											["1", "bb", "22"],
+										],
+									},
+								},
+							],
+						}),
+					],
 				},
 			},
 			done,
 		);
-		expect(collect(view.body, "ansi").map(output => props(output).text)).toEqual(["before", "after"]);
-		const tableNode = collect(view.body, "table")[0];
+		const [box] = nodes(view.body);
+		const outputs = nodes(box?.c).filter(child => child.k === "ansi" || child.k === "table");
+		expect(outputs.map(child => child.k)).toEqual(["ansi", "table", "ansi"]);
+		expect(props(outputs[0]).text).toBe("rows:");
+		expect(props(outputs[2]).text).toBe("done");
+		const tableNode = outputs[1];
 		if (tableNode?.k !== "table") throw new Error("Expected a native table");
-		expect(tableNode.p?.cols.map(col => col.head)).toEqual(["", "a", "b"]);
-		expect(tableNode.p?.rows.map(row => Object.values(row.cells))).toEqual([
-			["0", "1", "'x'"],
-			["1", "22", ""],
+		expect(tableNode.p?.cols.map(col => [col.head, col.align])).toEqual([
+			["", undefined],
+			["name", undefined],
+			["n", "end"],
 		]);
+		expect(tableNode.p?.rows.map(row => Object.values(row.cells))).toEqual([
+			["0", "a", "1"],
+			["1", "bb", "22"],
+		]);
+	});
+
+	it("shows a json view in place of its printed text: the host's json viewer when it has one, else a tree", () => {
+		const printed = "{'alpha': 1, 'beta': [1, 2, 3], 'i': 'kept'}";
+		const value = { alpha: 1, beta: [1, 2, 3], i: "kept" };
+		const describeBox = (options: RenderResultOptions) => {
+			const view = evalToolRenderer.describeResult(
+				{
+					content: [{ type: "text", text: "" }],
+					details: {
+						cells: [cell({ output: `${printed}\n`, views: [{ text: printed, view: { kind: "json", value } }] })],
+					},
+				},
+				options,
+			);
+			return nodes(view.body)[0];
+		};
+
+		const native = describeBox({ ...done, json: true });
+		expect(collect(native?.c, "ansi")).toHaveLength(0);
+		expect(collect(native?.c, "tree")).toHaveLength(0);
+		const [viewer] = collect(native?.c, "json");
+		// The value itself, `i` included (a cell's data, not call metadata); top-level entries listed, containers folded.
+		expect(props(viewer)).toEqual({ value });
+
+		const fallback = describeBox(done);
+		expect(collect(fallback?.c, "ansi")).toHaveLength(0);
+		expect(collect(fallback?.c, "json")).toHaveLength(0);
+		expect(collect(fallback?.c, "tree")).toHaveLength(1);
 	});
 });
 
@@ -592,5 +788,16 @@ describe("user shell runs", () => {
 		expect(foot(box)?.time?.stopped).toBeNumber();
 		expect(image?.k).toBe("text");
 		expect(run.describe(cx(["card", "ansi"])).k).toBe("card");
+	});
+
+	it("show the minimizer's filter and byte counts in both footers", () => {
+		const run = new BashExecutionComponent("git diff", ui, false);
+		run.appendOutput("diff --git a/x b/x");
+		run.setComplete(0, false, {
+			minimized: { filter: "git", inputBytes: 28_213, outputBytes: 9_720, artifactId: "2" },
+		});
+		expect(JSON.stringify(run.describe(cx(["tool", "ansi", "code"])))).toContain("Minimized git 27.6KB → 9.5KB");
+		expect(JSON.stringify(run.describe(cx(["card", "ansi"])))).toContain("Minimized: git 27.6KB → 9.5KB");
+		expect(Bun.stripANSI(run.render(120).join("\n"))).toContain("Minimized: git 27.6KB → 9.5KB");
 	});
 });

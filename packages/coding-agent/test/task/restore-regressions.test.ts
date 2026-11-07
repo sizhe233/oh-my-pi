@@ -114,8 +114,13 @@ beforeEach(() => {
 	mainFile = path.join(tempDir.path(), "root.jsonl");
 	AgentLifecycleManager.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
-	registry = AgentRegistry.global();
-	lifecycle = AgentLifecycleManager.global();
+	const localRegistry = AgentRegistry.global();
+	const localLifecycle = AgentLifecycleManager.global();
+	if (!(localRegistry instanceof AgentRegistry) || !(localLifecycle instanceof AgentLifecycleManager)) {
+		throw new Error("Expected local registry and lifecycle");
+	}
+	registry = localRegistry;
+	lifecycle = localLifecycle;
 	manager = new AsyncJobManager({ maxRunningJobs: 1 });
 	vi.spyOn(persistedRoster, "ensurePersistedRoster").mockResolvedValue(mainFile);
 });
@@ -153,6 +158,15 @@ function fixture(tree: Record<string, SessionEntry[]>) {
 				...messages,
 			],
 		};
+		// Real transcripts have unique ids, linked ancestry and an explicit selected leaf.
+		for (const [index, entry] of subs[key]!.entries.entries()) {
+			subs[key]!.entries[index] = {
+				...entry,
+				id: `${key}-${index}`,
+				parentId: index === 0 ? null : `${key}-${index - 1}`,
+			};
+		}
+		subs[key]!.leafId = subs[key]!.entries.at(-1)!.id;
 		registry.register({
 			id,
 			displayName: id,
@@ -562,9 +576,9 @@ it("explicit kill overrides a delivery hold, while an old hold cannot alter a re
 it("releases delivery holds if manager disposal races owner revival before registration", async () => {
 	const { root } = fixture({ Parent: done, "Parent/Child": cutOff });
 	installOwner(5, []);
-	const ensure = lifecycle.ensureLive.bind(lifecycle);
-	vi.spyOn(lifecycle, "ensureLive").mockImplementation(async id => {
-		const session = await ensure(id);
+	const ensure = lifecycle.ensureLiveForRestore.bind(lifecycle);
+	vi.spyOn(lifecycle, "ensureLiveForRestore").mockImplementation(async (id, expected) => {
+		const session = await ensure(id, expected);
 		await manager.dispose({ timeoutMs: 100 });
 		return session;
 	});
@@ -765,4 +779,70 @@ it("cancels the staged subtree before admission without prompting terminal owner
 	expect(followUp).not.toHaveBeenCalled();
 	for (const id of ["Grand", "Parent", "Child"]) expect(manager.getJob(id)?.status).toBe("cancelled");
 	await waitUntil(() => registry.get("Grand")?.status === "parked" && registry.get("Parent")?.status === "parked");
+});
+
+it.each(["success", "failure"] as const)(
+	"holds the admitted leaf generation until restore %s settles",
+	async outcome => {
+		const reject = outcome === "failure";
+		const { root } = fixture({ Child: cutOff });
+		installOwner(0, []);
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => {
+			await lifecycle.ensureLive(id);
+			started.resolve();
+			await finish.promise;
+			if (reject) throw new Error("restore failed");
+			return result(id);
+		});
+		await restoreSession(root);
+		await started.promise;
+		const ref = registry.get("Child")!;
+		await lifecycle.park("Child");
+		expect(ref.session).not.toBeNull();
+		finish.resolve();
+		await manager.waitForAll();
+		expect(manager.getJob("Child")?.status).toBe(reject ? "failed" : "completed");
+		await lifecycle.park("Child");
+		expect(ref.session).toBeNull();
+		expect(ref.status).toBe("parked");
+	},
+);
+
+it("a cancelled queued leaf never acquires a lifecycle hold", async () => {
+	const blocked = Promise.withResolvers<string>();
+	manager.register("task", "existing", () => blocked.promise, { id: "existing" });
+	const { root } = fixture({ Child: cutOff });
+	installOwner(0, []);
+	await lifecycle.ensureLive("Child");
+	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => result(id));
+	await restoreSession(root);
+	expect(manager.getJob("Child")?.queued).toBe(true);
+	await lifecycle.park("Child");
+	expect(registry.get("Child")?.session).toBeNull();
+	manager.cancel("Child");
+	blocked.resolve("done");
+	await manager.waitForAll();
+	expect(followUp).not.toHaveBeenCalled();
+	expect(manager.getJob("Child")?.status).toBe("cancelled");
+});
+
+it("reports an unsupported existing remote owner without scheduling its subtree or leaking the hold", async () => {
+	const { root } = fixture({ Parent: done, "Parent/Child": cutOff });
+	const ref = registry.get("Parent")!;
+	const dispose = vi.fn(async () => {});
+	const remote = {
+		dispose,
+		isStreaming: false,
+		sessionManager: { getUsageStatistics: () => ({ cost: 0, subagentCost: 0 }) },
+	} as unknown as AgentSession;
+	registry.attachSession(ref.id, remote, ref.sessionFile, ref);
+	registry.setStatus(ref.id, "idle", ref);
+	lifecycle.adopt(ref.id, { idleTtlMs: 5 }, ref);
+	await expect(restoreSession(root)).rejects.toThrow("existing remote owner");
+	expect(manager.getJob("Parent")).toBeUndefined();
+	expect(manager.getJob("Child")).toBeUndefined();
+	await waitUntil(() => ref.status === "parked");
+	expect(dispose).toHaveBeenCalledTimes(1);
 });
