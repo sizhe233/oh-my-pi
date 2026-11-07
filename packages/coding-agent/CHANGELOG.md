@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Reject disabled JavaScript environment provisioning before creating package-install directories.
+
 - Preserve newly queued memory items in input order when one retain call produces identical file timestamps, without rewriting legacy queued events.
 
 - Restored subagent owners retain lifecycle protection when worker execution is enabled.

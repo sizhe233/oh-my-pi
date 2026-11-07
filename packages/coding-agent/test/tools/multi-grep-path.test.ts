@@ -91,20 +91,24 @@ describe.skipIf(isWindows)("search across unrelated filesystem trees", () => {
 	let dirA: string;
 	let dirB: string;
 	let cwd: string;
+	const createdDirectories: string[] = [];
 
 	beforeEach(async () => {
 		// Place fixtures in two unrelated top-level subtrees so their only shared
 		// ancestor is the filesystem root. Without the multi-target fanout, the
 		// search tool would scan from `/` and walk the entire filesystem.
 		dirA = await fs.mkdtemp(path.join("/tmp", "pi-search-multi-A-"));
+		createdDirectories.push(dirA);
 		dirB = await fs.mkdtemp(path.join("/var/tmp", "pi-search-multi-B-"));
+		createdDirectories.push(dirB);
 		cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pi-search-multi-cwd-"));
+		createdDirectories.push(cwd);
 		await Bun.write(path.join(dirA, "alpha.txt"), "shared-needle alpha\n");
 		await Bun.write(path.join(dirB, "beta.txt"), "shared-needle beta\n");
 	});
 
 	afterEach(async () => {
-		await Promise.all([removeWithRetries(dirA), removeWithRetries(dirB), removeWithRetries(cwd)]);
+		await Promise.all(createdDirectories.splice(0).map(directory => removeWithRetries(directory)));
 	});
 
 	it("returns matches from both trees without rooting the scan at /", async () => {

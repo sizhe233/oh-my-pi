@@ -1,13 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { ptree, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { executeJs } from "../../src/eval/js/executor";
 import type { JsExecutorOptions } from "../../src/eval/js/executor";
-import { resolveJsPackageEnvironment } from "../../src/eval/js/package-installer";
+import { installJsPackages, resolveJsPackageEnvironment } from "../../src/eval/js/package-installer";
 import type { ToolSession } from "../../src/tools";
 import { beginSettingsTest, restoreSettingsTestState } from "../helpers/settings-test-state";
 
@@ -80,19 +80,95 @@ describe("persistent JavaScript package environments", () => {
 
 	it("refuses an implicit managed environment bootstrap when auto-provisioning is disabled", async () => {
 		using workspace = TempDir.createSync("@omp-js-package-policy-");
-		const sessionId = `js-package-policy:${crypto.randomUUID()}`;
-		const session = makeSession(workspace.path(), sessionId, { autoProvision: false });
-		const environment = resolveJsPackageEnvironment(workspace.path());
-		managedRoots.push(environment.root);
+		const settingsState = beginSettingsTest();
+		const agentDir = workspace.join("agent");
+		setAgentDir(agentDir);
+		try {
+			const sessionId = `js-package-policy:${crypto.randomUUID()}`;
+			const session = makeSession(workspace.path(), sessionId, { autoProvision: false });
+			const environment = resolveJsPackageEnvironment(workspace.path());
+			managedRoots.push(environment.root);
 
-		const result = await executeJs("", {
-			...executorOptions(session, sessionId),
-			packages: ["package-that-must-not-be-fetched"],
-		});
-		expect(result.exitCode).toBe(1);
-		expect(result.output).toContain("eval.autoProvision is disabled");
-		await expect(fs.access(path.join(environment.root, "package.json"))).rejects.toBeDefined();
+			const result = await executeJs("", {
+				...executorOptions(session, sessionId),
+				packages: ["package-that-must-not-be-fetched"],
+			});
+			expect(result.exitCode).toBe(1);
+			expect(result.output).toContain("eval.autoProvision is disabled");
+			await expect(fs.access(path.join(environment.root, "package.json"))).rejects.toBeDefined();
+			await expect(fs.access(agentDir)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			restoreSettingsTestState(settingsState);
+		}
 	});
+
+	it("keeps explicit installs into an existing managed environment available with auto-provisioning disabled", async () => {
+		using workspace = TempDir.createSync("@omp-js-existing-policy-");
+		const settingsState = beginSettingsTest();
+		setAgentDir(workspace.join("agent"));
+		try {
+			const environment = resolveJsPackageEnvironment(workspace.path());
+			const packageDir = workspace.join("fixture-package");
+			await Bun.write(
+				path.join(packageDir, "package.json"),
+				JSON.stringify({ name: "omp-test-local-policy", version: "1.0.0" }),
+			);
+			await Bun.write(
+				path.join(environment.root, "package.json"),
+				JSON.stringify({ private: true, dependencies: {} }),
+			);
+			await installJsPackages({ cwd: workspace.path(), packages: [`file:${packageDir}`], autoProvision: false });
+			const installed = await Bun.file(
+				path.join(environment.root, "node_modules/omp-test-local-policy/package.json"),
+			).json();
+			expect(installed.name).toBe("omp-test-local-policy");
+			expect(installed.version).toBe("1.0.0");
+		} finally {
+			restoreSettingsTestState(settingsState);
+		}
+	});
+
+	it.each(["manifest disappears", "request is cancelled"] as const)(
+		"does not start an install when %s after the read-only provisioning check",
+		async scenario => {
+			using workspace = TempDir.createSync("@omp-js-policy-race-");
+			const settingsState = beginSettingsTest();
+			setAgentDir(workspace.join("agent"));
+			try {
+				const environment = resolveJsPackageEnvironment(workspace.path());
+				const manifest = path.join(environment.root, "package.json");
+				await Bun.write(manifest, JSON.stringify({ private: true, dependencies: {} }));
+				const controller = new AbortController();
+				const access = fsSync.promises.access;
+				let intercepted = false;
+				vi.spyOn(fsSync.promises, "access").mockImplementation(async (...args) => {
+					await access(...args);
+					if (args[0] !== manifest || intercepted) return;
+					intercepted = true;
+					if (scenario === "manifest disappears") await fs.rm(manifest);
+					else controller.abort(new Error("cancelled after policy read"));
+				});
+				const mkdir = vi.spyOn(fsSync.promises, "mkdir");
+				const install = vi.spyOn(ptree, "exec").mockRejectedValue(new Error("unexpected package installer"));
+				await expect(
+					installJsPackages({
+						cwd: workspace.path(),
+						packages: ["package-that-must-not-be-fetched"],
+						autoProvision: false,
+						signal: controller.signal,
+					}),
+				).rejects.toThrow(
+					scenario === "manifest disappears" ? "eval.autoProvision is disabled" : "cancelled after policy read",
+				);
+				expect(intercepted).toBe(true);
+				expect(install).not.toHaveBeenCalled();
+				if (scenario === "request is cancelled") expect(mkdir).not.toHaveBeenCalled();
+				await expect(access(`${environment.root}.install.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+			} finally {
+				restoreSettingsTestState(settingsState);
+			}
+		},
+	);
 
 	it("resolves file imports from the filename while preserving cwd and repeat execution", async () => {
 		using workspace = TempDir.createSync("@omp-js-file-workspace-");

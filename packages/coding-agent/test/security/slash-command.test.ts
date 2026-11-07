@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { refreshDirsFromEnv } from "@oh-my-pi/pi-utils";
+import * as dirs from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import { SecurityStore } from "../../src/security";
 import { handleSecurityCommand } from "../../src/slash-commands/helpers/security";
@@ -15,7 +15,6 @@ import { cfgSecurityEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 const SARIF_FIXTURE = path.join(import.meta.dir, "..", "fixtures", "security", "generic-results.sarif");
 let temporaryRoot = "";
 let repositoryRoot = "";
-let previousStateHome: string | undefined;
 let settings: Settings;
 let output: string[] = [];
 
@@ -23,18 +22,16 @@ beforeEach(async () => {
 	temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-security-slash-"));
 	repositoryRoot = path.join(temporaryRoot, "repo");
 	await fs.mkdir(repositoryRoot);
-	previousStateHome = process.env.XDG_STATE_HOME;
-	process.env.XDG_STATE_HOME = path.join(temporaryRoot, "xdg-state");
-	refreshDirsFromEnv();
+	vi.spyOn(dirs, "getSecurityProjectDir").mockImplementation(projectKey =>
+		path.join(temporaryRoot, "state", projectKey),
+	);
 	settings = Settings.isolated({ "security.enabled": true });
 	output = [];
 });
 
 afterEach(async () => {
 	settings.cancelPendingSaves();
-	if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
-	else process.env.XDG_STATE_HOME = previousStateHome;
-	refreshDirsFromEnv();
+	vi.restoreAllMocks();
 	await fs.rm(temporaryRoot, { recursive: true, force: true });
 });
 
