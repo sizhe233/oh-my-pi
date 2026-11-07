@@ -33,6 +33,8 @@ const LINT_EXEMPT_FORK_EXCLUDES = [
 	"--exclude",
 	"grep-searcher",
 ] as const satisfies readonly string[];
+// Share the exact doctest scope with the full gate; standalone diagnostics do not replace it.
+const RUST_DOCTEST_COMMAND = ["cargo", "test", "--doc", "--workspace", ...VENDORED_FORK_EXCLUDES] as const;
 const TASK_COMMANDS = {
 	"check:rs": [
 		["cargo", "fmt", "--all", "--", "--check"],
@@ -72,8 +74,9 @@ const TASK_COMMANDS = {
 		// vendored uutils docs. `--doc` overrides a crate's own
 		// `doctest = false`, so a vendored crate whose examples do not compile
 		// (napi-rs's) has to be in VENDORED_FORK_EXCLUDES.
-		["cargo", "test", "--doc", "--workspace", ...VENDORED_FORK_EXCLUDES],
+		RUST_DOCTEST_COMMAND,
 	],
+	"test:rs:doc": [RUST_DOCTEST_COMMAND],
 } as const satisfies Record<string, readonly (readonly string[])[]>;
 
 type RustTaskName = keyof typeof TASK_COMMANDS;

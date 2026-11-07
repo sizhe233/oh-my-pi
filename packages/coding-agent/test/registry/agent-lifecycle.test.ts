@@ -1,8 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import {
+	type AgentLifecycleApi,
+	type AgentReviveOptions,
+	AgentLifecycleManager,
+} from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import {
+	AgentRegistry,
+	type AgentRef,
+	type AgentRegistryApi,
+	MAIN_AGENT_ID,
+} from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
@@ -60,6 +69,108 @@ describe("AgentLifecycleManager", () => {
 	function registerIdleSub(id: string, session: AgentSession | null, sessionFile: string | null = `/tmp/${id}.jsonl`) {
 		return registry.register({ id, displayName: "task", kind: "sub", session, sessionFile, status: "idle" });
 	}
+
+	it("restore revival coalesces with ordinary requests and does not persist local placement", async () => {
+		if (!(lifecycle instanceof AgentLifecycleManager)) throw new Error("Expected local lifecycle");
+		const ref = registerIdleSub("Restore-Local", null);
+		registry.setStatus(ref.id, "parked", ref);
+		const entered = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const placements: Array<"local" | undefined> = [];
+		const revived = makeSessionStub();
+		lifecycle.setPersistedSubagentReviverFactory(
+			async () => async (_expected, options) => {
+				placements.push(options?.placement);
+				entered.resolve();
+				await finish.promise;
+				return revived.session;
+			},
+			() => 0,
+		);
+		const restoring = lifecycle.ensureLiveForRestore(ref.id, ref);
+		await entered.promise;
+		const ordinary = lifecycle.ensureLive(ref.id);
+		finish.resolve();
+		expect(await restoring).toBe(await ordinary);
+		expect(placements).toEqual(["local"]);
+		await lifecycle.park(ref.id);
+		await lifecycle.ensureLive(ref.id);
+		expect(placements).toEqual(["local", undefined]);
+		await lifecycle.dispose();
+	});
+
+	it("restore joins an ordinary revival already in flight without starting a local duplicate", async () => {
+		if (!(lifecycle instanceof AgentLifecycleManager)) throw new Error("Expected local lifecycle");
+		const ref = registerIdleSub("Ordinary-First", null);
+		registry.setStatus(ref.id, "parked", ref);
+		const entered = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const revived = makeSessionStub();
+		const revive = vi.fn(async (_ref: AgentRef, options?: AgentReviveOptions) => {
+			expect(options).toBeUndefined();
+			entered.resolve();
+			await finish.promise;
+			return revived.session;
+		});
+		lifecycle.setPersistedSubagentReviverFactory(
+			async () => revive,
+			() => 0,
+		);
+		const ordinary = lifecycle.ensureLive(ref.id);
+		await entered.promise;
+		const restoring = lifecycle.ensureLiveForRestore(ref.id, ref);
+		finish.resolve();
+		expect(await restoring).toBe(await ordinary);
+		expect(revive).toHaveBeenCalledTimes(1);
+		await lifecycle.dispose();
+	});
+
+	it.each(["aborted", "replaced"] as const)(
+		"restore refuses a %s generation during factory preparation",
+		async change => {
+			if (!(lifecycle instanceof AgentLifecycleManager)) throw new Error("Expected local lifecycle");
+			const ref = registerIdleSub("Restore-Race", null);
+			registry.setStatus(ref.id, "parked", ref);
+			const entered = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			const revive = vi.fn(async () => makeSessionStub().session);
+			lifecycle.setPersistedSubagentReviverFactory(
+				async () => {
+					entered.resolve();
+					await finish.promise;
+					return revive;
+				},
+				() => 0,
+			);
+			const restoring = lifecycle.ensureLiveForRestore(ref.id, ref);
+			const rejected = restoring.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await entered.promise;
+			if (change === "aborted") registry.setStatus(ref.id, "aborted", ref);
+			else {
+				registry.unregister(ref.id, ref);
+				registerIdleSub(ref.id, null);
+			}
+			finish.resolve();
+			await rejected;
+			expect(revive).not.toHaveBeenCalled();
+			await lifecycle.dispose();
+		},
+	);
+
+	it("restore never reopens a tombstoned generation", async () => {
+		if (!(lifecycle instanceof AgentLifecycleManager)) throw new Error("Expected local lifecycle");
+		const ref = registerIdleSub("Restore-Killed", null);
+		registry.setStatus(ref.id, "aborted", ref);
+		const factory = vi.fn(async () => undefined);
+		lifecycle.setPersistedSubagentReviverFactory(factory, () => 0);
+		await expect(lifecycle.ensureLiveForRestore(ref.id, ref)).rejects.toThrow("generation");
+		expect(factory).not.toHaveBeenCalled();
+		expect(registry.get(ref.id)).toBe(ref);
+		expect(ref.status).toBe("aborted");
+	});
 
 	it("registerIfAvailable never replaces a collision and reuses only the exact expected ref", () => {
 		const parked = registerIdleSub("generation-Sub", null);

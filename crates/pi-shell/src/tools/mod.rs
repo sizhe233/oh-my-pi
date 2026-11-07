@@ -58,6 +58,8 @@ const EXTRA: ToolRef = ToolRef(4);
 /// registers its builtins once per shell.
 #[derive(Clone, Default)]
 pub struct ToolConfig {
+	/// Withhold the in-process env wrapper at the embedded Shell boundary.
+	pub withhold_env:   bool,
 	/// `nohup` is the tool (off with `PI_DISABLE_NOHUP_BUILTIN`: the system
 	/// binary runs).
 	pub nohup:          bool,
@@ -92,6 +94,7 @@ impl ToolConfig {
 				.and_then(|(_, v)| v.to_str().ok())
 		};
 		Self {
+			withhold_env: false,
 			nohup: !flag_on(var("PI_DISABLE_NOHUP_BUILTIN")),
 			git: GitLayers::from_env(var),
 			vfs,
@@ -104,6 +107,9 @@ impl ToolConfig {
 	/// The tool `name` resolves to, if it is one of these.
 	pub fn lookup(&self, name: &BStr) -> Option<ToolRef> {
 		match name.as_bytes() {
+			// Preserve the fork embedding policy through the shell-engine migration.
+			// Use the system env until the new in-process path is independently validated.
+			b"env" if self.withhold_env => None,
 			b"timeout" => Some(TIMEOUT),
 			b"nohup" if self.nohup => Some(NOHUP),
 			b"git" if self.git.any() => Some(GIT),

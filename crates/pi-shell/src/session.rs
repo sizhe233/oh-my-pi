@@ -310,12 +310,21 @@ impl Session {
 	///
 	/// [`SessionError::Create`] when the engine refuses the initial state.
 	pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
+		Self::new_with_env_policy(config, false)
+	}
+
+	/// The embedded Shell keeps env external until its replacement is validated.
+	pub(crate) fn new_with_env_policy(
+		config: SessionConfig,
+		withhold_env: bool,
+	) -> Result<Self, SessionError> {
 		let SessionConfig { env, cwd, fs, vfs, runtime, output_decoding } = config;
 		let (jobs, rx) = flume::unbounded();
 		let children = Children::default();
 		let bell = Arc::new(Bell::default());
 		let waker = Waker::from(Arc::clone(&bell));
-		let tools = ToolConfig::from_env(&env, vfs.clone(), runtime.clone());
+		let mut tools = ToolConfig::from_env(&env, vfs.clone(), runtime.clone());
+		tools.withhold_env = withhold_env;
 		let mut host = PiHost::new(fs, runtime.clone());
 		if output_decoding.is_some() {
 			host.set_output_decoding(output_decoding);

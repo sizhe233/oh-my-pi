@@ -25,7 +25,7 @@ fn sig_name(n: i64, platform: Platform) -> String {
 	u8::try_from(n)
 		.ok()
 		.and_then(|n| Signal::from_number(n, platform))
-		.map_or_else(|| format!("SIG{n}"), |s| s.to_string())
+		.map_or_else(|| format!("SIG{n}"), |s| s.zsh_name(platform))
 }
 
 /// The signal number `name` (without `SIG`) names in `sigs`, then zsh's

@@ -96,6 +96,8 @@ describe("AgentSession.fork(entryId)", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const { session, forkAt } = await createSeededSession(extensionRunner);
 		const sourceFile = session.sessionFile!;
@@ -135,6 +137,8 @@ describe("AgentSession.fork(entryId)", () => {
 				startUserEval(session!, userEval);
 				return undefined;
 			},
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const { session: seeded, forkAt } = await createSeededSession(extensionRunner);
 		const sourceFile = seeded.sessionFile!;
@@ -206,6 +210,8 @@ describe("AgentSession.fork(entryId)", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const { session } = await createSeededSession(extensionRunner);
 		const manager = session.sessionManager;

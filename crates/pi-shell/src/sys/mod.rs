@@ -49,6 +49,7 @@ mod spawn;
 pub mod tty;
 pub mod uname;
 pub mod utmp;
+pub mod zsh;
 
 pub use crate::sys::{
 	fs::{StdFile, StdFs, std_stream},

@@ -88,6 +88,8 @@ describe("AgentSession session_stop willContinue", () => {
 				}
 				return undefined;
 			},
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		session = new AgentSession({

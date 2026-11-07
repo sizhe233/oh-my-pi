@@ -280,3 +280,48 @@ fn history_write_reports_an_unremovable_stale_lock() {
 	assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
 	assert!(!history.exists(), "failed lock must not overwrite history");
 }
+
+/// Host function discovery must not override a caller's explicit FPATH,
+/// including an empty value that intentionally disables system autoloads.
+#[cfg(unix)]
+#[test]
+fn zsh_autoload_respects_explicit_fpath() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::write(dir.path().join("caller_fn"), "print -r -- caller-function\n").unwrap();
+	let out = output(obash().arg0("zsh").env("FPATH", dir.path()).args([
+		"-f",
+		"-c",
+		"autoload -Uz caller_fn; caller_fn",
+	]));
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	assert_eq!(out.stdout, b"caller-function\n");
+	assert!(out.stderr.is_empty());
+
+	let out = output(obash().arg0("zsh").env("FPATH", "").args([
+		"-f",
+		"-c",
+		"autoload -Uz compinit; compinit",
+	]));
+	assert_eq!(out.status.code(), Some(1));
+	assert!(out.stdout.is_empty());
+	assert!(String::from_utf8_lossy(&out.stderr).contains("function definition file not found"));
+}
+
+/// Completion's signal names and kill's accepted operands must agree without
+/// changing bash's canonical signal names.
+#[cfg(target_os = "linux")]
+#[test]
+fn zsh_signal_names_round_trip_through_kill() {
+	let out = output(obash().arg0("zsh").args([
+		"-f",
+		"-c",
+		"print -r -- $signals[7] $signals[30]; kill -l 6 29; kill -l IOT IO POLL",
+	]));
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	assert_eq!(out.stdout, b"IOT POLL\nIOT\nPOLL\n6\n29\n29\n");
+	assert!(out.stderr.is_empty());
+	let out = output(obash().args(["-c", "kill -l 6 29"]));
+	assert!(out.status.success());
+	assert_eq!(out.stdout, b"ABRT\nIO\n");
+	assert!(out.stderr.is_empty());
+}

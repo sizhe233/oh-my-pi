@@ -35,6 +35,8 @@ export interface OutboxEvent {
 	content: string;
 	context: string;
 	sessionId: string;
+	/** Stable same-call tie break for equal publication mtimes; absent on legacy v1 events. */
+	deliveryOrder?: { batch: string; index: number };
 }
 
 export interface RetainCall {
@@ -75,6 +77,33 @@ interface Pending {
 
 type SendOutcome = "accepted" | "rejected" | { error: string };
 
+/** A total order: only equal mtimes use the persisted batch/item tie break.
+ * Legacy ties are deterministic but their lost original input order cannot be recovered.
+ */
+function comparePending(a: Pending, b: Pending): number {
+	const time = a.published - b.published;
+	if (time) return time;
+	const aBatch = a.event.deliveryOrder?.batch ?? a.event.id;
+	const bBatch = b.event.deliveryOrder?.batch ?? b.event.id;
+	if (aBatch !== bBatch) return aBatch < bBatch ? -1 : 1;
+	const index = (a.event.deliveryOrder?.index ?? 0) - (b.event.deliveryOrder?.index ?? 0);
+	if (index) return index;
+	return a.event.id === b.event.id ? 0 : a.event.id < b.event.id ? -1 : 1;
+}
+
+function validDeliveryOrder(value: unknown): boolean {
+	if (value === undefined) return true;
+	if (typeof value !== "object" || value === null) return false;
+	const order = value as { batch?: unknown; index?: unknown };
+	return (
+		typeof order.batch === "string" &&
+		/^[a-f0-9]{64}$/.test(order.batch) &&
+		typeof order.index === "number" &&
+		Number.isSafeInteger(order.index) &&
+		order.index >= 0
+	);
+}
+
 /**
  * Durable queue of tool-initiated retains: one immutable file per memory under
  * `<agentDir>/hindsight-outbox/<destination>/`. A 2xx response deletes the event; it
@@ -108,6 +137,10 @@ export class HindsightOutbox {
 	async enqueue(call: RetainCall, items: RetainInput[]): Promise<number> {
 		if (!call.sessionId || !call.toolCallId) throw new Error("Hindsight retain requires a session and tool call id.");
 		const events = items.map((item, index) => this.#event(call, item, index));
+		// Compute from the complete call before deduplication. Existing files are
+		// never rewritten, so retries preserve their metadata and publication time.
+		const batch = new Bun.CryptoHasher("sha256").update(JSON.stringify(events.map(event => event.id))).digest("hex");
+		for (const [index, event] of events.entries()) event.deliveryOrder = { batch, index };
 		await fs.mkdir(this.#dir, { recursive: true, mode: 0o700 });
 		return withFileLock(path.join(this.#dir, "queue"), async () => {
 			const existing = new Set(await eventFiles(this.#dir));
@@ -200,7 +233,7 @@ export class HindsightOutbox {
 		// Hindsight unions a request's item tags onto its document(s): one request per tag set, so
 		// untagged global memories never share a request with project-tagged ones.
 		const groups = new Map<string, Pending[]>();
-		for (const entry of pending.sort((a, b) => a.published - b.published)) {
+		for (const entry of pending.sort(comparePending)) {
 			const key = JSON.stringify(entry.event.tags.toSorted());
 			const group = groups.get(key);
 			if (group) group.push(entry);
@@ -319,6 +352,7 @@ async function readEvent(file: string, now: number): Promise<Pending | undefined
 		const event = (await Bun.file(file).json()) as OutboxEvent;
 		const valid =
 			event.version === 1 &&
+			validDeliveryOrder(event.deliveryOrder) &&
 			eventFile(event.id) === path.basename(file) &&
 			(event.scope === "project" || event.scope === "global") &&
 			Array.isArray(event.tags) &&

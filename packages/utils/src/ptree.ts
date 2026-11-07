@@ -61,6 +61,18 @@ delete Bun.env.${LINUX_SUBREAPER_BUN_BE_BUN_ENV};
 if (callerBunBeBun === undefined) delete Bun.env.BUN_BE_BUN;
 else Bun.env.BUN_BE_BUN = callerBunBeBun;
 const command = JSON.parse(commandJson);
+// EOF before explicit parent authorization must not execute the command.
+await new Promise((resolve) => {
+ const disconnected = () => process.exit(1);
+ process.once("disconnect", disconnected);
+ process.once("message", (message) => {
+  if (message !== "omp-subreaper-start") process.exit(1);
+  process.removeListener("disconnect", disconnected);
+  process.disconnect();
+  resolve();
+ });
+ if (!process.connected) process.exit(1);
+});
 const child = Bun.spawn(command, {
 	stdin: "inherit",
 	stdout: "pipe",
@@ -202,6 +214,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	#subreaperStop?: { escalate: () => void };
 	#terminateGroup: boolean;
 	#hardKillTree: boolean;
+	#startCancelled = false;
 	// Windows has no process groups. Retaining the root's native handle pins
 	// its PID after exit so killTree() can still enumerate its original children.
 	#windowsRootProcess?: Process;
@@ -214,6 +227,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	) {
 		this.#terminateGroup = terminateGroup;
 		this.#hardKillTree = hardKillTree;
+		if (hardKillTree) queueMicrotask(() => this.#releaseSubreaperStart());
 		this.#windowsRootProcess = process.platform === "win32" ? (Process.fromPid(proc.pid) ?? undefined) : undefined;
 		if (retainFullStderr) this.#stderrChunks = [];
 		// Eagerly drain stderr into a truncated tail, retaining raw chunks only for explicit full capture.
@@ -339,7 +353,18 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this;
 	}
 
+	/** @internal Release only after synchronous cancellation has had its chance. */
+	#releaseSubreaperStart() {
+		if (this.#startCancelled) return;
+		try {
+			this.proc.send("omp-subreaper-start");
+		} catch (error) {
+			this.kill(new AbortError(error, "<start failed>"), -1);
+		}
+	}
+
 	kill(reason?: Exception, gracefulMs?: number) {
+		this.#startCancelled = true;
 		if (reason && !this.#exitReasonPending) {
 			this.#exitReasonPending = reason;
 			// The normalized exit promise may already have resolved from a dead
@@ -773,6 +798,7 @@ function spawnInternal<In extends InMask = InMask>(
 		windowsHide: true,
 		detached,
 		...rest,
+		ipc: useSubreaper ? (rest.ipc ?? (() => {})) : rest.ipc,
 		env: useSubreaper
 			? {
 					...commandEnv,

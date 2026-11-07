@@ -365,6 +365,9 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 			const extensionRunner = {
 				hasHandlers: (eventType: string) => eventType === "session_tree",
 				emit: async () => undefined,
+				getSessionApprovalEpoch: () => 0,
+				clearSessionApprovals: () => {},
+				invalidatePendingApprovals: () => {},
 			} as unknown as ExtensionRunner;
 			session = new AgentSession({
 				agent: new Agent({

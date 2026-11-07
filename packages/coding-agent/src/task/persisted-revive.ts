@@ -213,7 +213,7 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 			parentId = registry.get(parentId)?.parentId;
 		}
-		return async expectedRef => {
+		return async (expectedRef, options) => {
 			// Live root state is read per revive, so a later `/new` or cwd move is followed.
 			const spec: PersistedReviveSpec = {
 				id: ref.id,
@@ -236,7 +236,7 @@ export function createPersistedSubagentReviverFactory(
 				subagentEventBus: ctx.subagentEventBus,
 			};
 			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker).
-			const pool = subagentWorkerPool(ctx.settings);
+			const pool = options?.placement === "local" ? undefined : subagentWorkerPool(ctx.settings);
 			return pool
 				? revivePersistedPlaced(pool, spec, expectedRef, revivePersistedSubagent)
 				: revivePersistedSubagent(spec, expectedRef);

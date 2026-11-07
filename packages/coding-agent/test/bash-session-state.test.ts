@@ -119,6 +119,18 @@ it.skipIf(process.platform === "win32")(
 	10_000,
 );
 
+// A follow-up may also be promoted under load; assert its completed output.
+async function completedText(tool: BashTool, command: string): Promise<string> {
+	const result = await run(tool, command);
+	if (result.async?.state !== "running") return result.text;
+	const job = manager.getJob(result.async.jobId);
+	if (!job) throw new Error("Backgrounded shell call has no registered job");
+	await job.promise;
+	expect(job.status).toBe("completed");
+	if (job.resultText === undefined) throw new Error("Completed shell call has no output");
+	return job.resultText;
+}
+
 it.skipIf(process.platform === "win32")(
 	"runs a call in the shell of the session it started in when the session changes first",
 	async () => {
@@ -140,10 +152,10 @@ it.skipIf(process.platform === "win32")(
 			heldAllocation.resolve({});
 			await manager.waitForAll();
 
-			expect((await run(tool, 'printf "[%s]" "$PI_STATE_VAR"')).text).toBe("[]");
+			expect(await completedText(tool, 'printf "[%s]" "$PI_STATE_VAR"')).toBe("[]");
 			// The left session's shell was dropped when that call finished.
 			sessionId = first;
-			expect((await run(tool, 'printf "[%s]" "$PI_STATE_VAR"')).text).toBe("[]");
+			expect(await completedText(tool, 'printf "[%s]" "$PI_STATE_VAR"')).toBe("[]");
 		} finally {
 			releaseShellSessions(first);
 			releaseShellSessions(second);

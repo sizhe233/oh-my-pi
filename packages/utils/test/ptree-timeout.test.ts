@@ -176,10 +176,12 @@ sleep 30
 					'process.stdout.write("libc-fallback-ok")',
 				]),
 			},
+			ipc: () => {},
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
 		});
+		child.send("omp-subreaper-start");
 		const [exitCode, stdout, stderr] = await Promise.all([
 			child.exited,
 			new Response(child.stdout).text(),
@@ -229,6 +231,7 @@ ${createLinuxSubreaperScript()}
 				script,
 			],
 			{
+				ipc: () => {},
 				cwd: "/tmp",
 				env: {
 					...Bun.env,
@@ -240,6 +243,7 @@ ${createLinuxSubreaperScript()}
 				stderr: "pipe",
 			},
 		);
+		child.send("omp-subreaper-start");
 		const [exitCode, stdout, stderr] = await Promise.all([
 			child.exited,
 			new Response(child.stdout).text(),

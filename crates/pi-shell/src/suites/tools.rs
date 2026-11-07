@@ -70,10 +70,11 @@ async fn run(s: &mut Session, command: &str) -> Ran {
 	run_with(s, command, CancellationToken::new()).await
 }
 
-fn alive(pid: i32) -> bool {
-	// SAFETY: signal 0 only probes existence.
-	unsafe { libc::kill(pid, 0) == 0 }
-}
+#[path = "../../test-support/child_reaper.rs"]
+mod child_reaper;
+#[cfg(target_os = "linux")]
+use child_reaper::ChildReaper;
+use child_reaper::alive;
 
 /// Waits (bounded) for `pid` to be gone; whether it is.
 async fn gone(pid: i32, within: Duration) -> bool {
@@ -160,6 +161,8 @@ async fn timeout_signals_and_statuses_follow_gnu() {
 /// grandchildren included.
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_after_ends_a_command_that_ignores_the_signal() {
+	#[cfg(target_os = "linux")]
+	let _reaper = ChildReaper::new();
 	let mut s = session();
 	let dir = tempfile::tempdir().unwrap();
 	let file = dir.path().join("pid");

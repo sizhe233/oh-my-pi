@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+mod comp_support;
 mod pty_support;
 
 use std::{io, time::Duration};
@@ -160,8 +161,10 @@ fn history_beginning_search_with_histfindnodups() {
 
 #[test]
 fn history_beginning_search_end_functions() {
+	let dirs = comp_support::compsys_fpath().expect("installed zsh completion functions required");
+	let fpath = comp_support::fpath_words(&dirs);
 	let rc = format!(
-		"{SHOW}fpath=(/usr/share/zsh/5.9/functions)\nautoload -Uz history-search-end\nzle -N \
+		"{SHOW}fpath=( {fpath} )\nautoload -Uz history-search-end\nzle -N \
 		 history-beginning-search-backward-end history-search-end\nzle -N \
 		 history-beginning-search-forward-end history-search-end\nbindkey '^T' \
 		 history-beginning-search-backward-end\nbindkey '^Y' history-beginning-search-forward-end\n"

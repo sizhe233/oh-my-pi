@@ -68,13 +68,13 @@ fn both(
 	drive: impl Fn(&mut Pty) -> io::Result<()>,
 ) -> io::Result<(Vec<String>, Option<Vec<String>>)> {
 	let mut ours = shell(false)?;
-	drive(&mut ours)?;
+	drive(&mut ours).map_err(|e| io::Error::new(e.kind(), format!("obash: {e}")))?;
 	let ours = job_lines(&ours.output());
 	if !have_real_zsh() {
 		return Ok((ours, None));
 	}
 	let mut real = shell(true)?;
-	drive(&mut real)?;
+	drive(&mut real).map_err(|e| io::Error::new(e.kind(), format!("real-zsh: {e}")))?;
 	Ok((ours, Some(job_lines(&real.output()))))
 }
 

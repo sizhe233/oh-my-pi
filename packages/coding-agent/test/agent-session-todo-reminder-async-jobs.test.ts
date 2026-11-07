@@ -129,6 +129,8 @@ describe("AgentSession todo reminder async-job deferral", () => {
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");

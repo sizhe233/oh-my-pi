@@ -30,7 +30,7 @@ import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
+import type { ExtensionAgentIdentity, ExtensionApprovalAnswer, RegisteredTool, ToolCallEventResult } from "./types";
 
 /**
  * Second `renderCall` argument that satisfies both the omp and the upstream-pi
@@ -249,6 +249,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
+		const executionSessionId = this.runner.sessionId;
+		const executionApprovalEpoch = this.runner.getSessionApprovalEpoch();
+		const contextSessionId = context?.sessionManager?.getSessionId();
 		// The agent loop emits `tool_call` at arg-prep time (session
 		// `beforeToolCall` wiring) so a handler revision lands before concurrency
 		// scheduling and `tool_execution_start`. Consume the marker
@@ -303,6 +306,22 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const cancelPreflight = (): void => {
 			if (!loopDispatchedToolCall) this.runner.cancelToolCallPreflight?.(toolCallId);
 		};
+		const assertCurrentExecution = (): void => {
+			try {
+				signal?.throwIfAborted();
+				if (
+					this.runner.sessionId !== executionSessionId ||
+					this.runner.getSessionApprovalEpoch() !== executionApprovalEpoch ||
+					context?.sessionManager?.getSessionId() !== contextSessionId
+				) {
+					throw new Error("Tool call cancelled because its session changed");
+				}
+			} catch (error) {
+				cancelPreflight();
+				throw error;
+			}
+		};
+		assertCurrentExecution();
 		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
 			try {
 				const callResult = (await this.runner.emitToolCall(
@@ -351,6 +370,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
 			}
 		}
+
+		assertCurrentExecution();
 
 		// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
 		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
@@ -474,27 +495,33 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const safetyAppendix =
 				pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
 			let approved: boolean;
+			let answer: ExtensionApprovalAnswer;
 			try {
-				const answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
-					reason: approvalCheck.reason,
-					appendix: safetyAppendix,
-					sessionSubject: sessionScope?.subject,
-					grants: cacheTargets,
-				});
+				assertCurrentExecution();
+				answer = await untilAborted(signal, () =>
+					requestApproval(uiContext, this.tool, resolvedArgs, {
+						reason: approvalCheck.reason,
+						appendix: safetyAppendix,
+						sessionSubject: sessionScope?.subject,
+						grants: cacheTargets,
+					}),
+				);
+				assertCurrentExecution();
 				approved = answer !== "deny";
-				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
-				if (typeof answer === "object" && approvalGrants) {
-					recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
-				}
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				cancelPreflight();
 				throw err;
 			}
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+			assertCurrentExecution();
 			if (!approved) {
 				cancelPreflight();
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
+			}
+			if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
+			if (typeof answer === "object" && approvalGrants) {
+				recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
 			}
 			if (pendingSafetyChecks.length > 0) {
 				if (!context) {
@@ -504,6 +531,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				context.providerSafetyApproved = true;
 			}
 		}
+
+		assertCurrentExecution();
 
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;

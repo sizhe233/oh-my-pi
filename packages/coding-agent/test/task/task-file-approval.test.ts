@@ -118,6 +118,35 @@ describe("taskFile approval binding", () => {
 		return { wrapper, context, runner, tool };
 	}
 
+	it.each(["pending", "resolved"])(
+		"rejects task-file dispatch and session grants when approval expires during %s",
+		async phase => {
+			const taskFile = path.join(directory, "approved.md");
+			await Bun.write(taskFile, "Approved assignment.");
+			const { wrapper, context, runner } = await createWrapper(async (_title, options) => {
+				if (phase === "pending") runner.clearSessionApprovals();
+				const answer = options.find(
+					(option): option is string => typeof option === "string" && option.endsWith("for this session"),
+				);
+				expect(answer).toBeDefined();
+				return answer;
+			});
+			if (phase === "resolved") {
+				vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === "tool_approval_resolved");
+				const originalEmit: typeof runner.emit = runner.emit.bind(runner);
+				vi.spyOn(runner, "emit").mockImplementation(event => {
+					if (event.type === "tool_approval_resolved") runner.clearSessionApprovals();
+					return originalEmit(event);
+				});
+			}
+			await expect(
+				wrapper.execute(`expired-task-file-${phase}`, { taskFile }, undefined, undefined, context),
+			).rejects.toThrow("session changed");
+			expect(executions).toEqual([]);
+			expect(runner.sessionApprovalKeys()).toEqual([]);
+		},
+	);
+
 	async function linkedFiles(local = false) {
 		const safe = path.join(directory, "safe.md");
 		const restricted = path.join(directory, "restricted", "task.md");

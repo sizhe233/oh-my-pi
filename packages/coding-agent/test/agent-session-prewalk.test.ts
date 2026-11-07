@@ -5,6 +5,7 @@ import { Agent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { CustomToolAdapter } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/wrapper";
 import { DeferredMCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
@@ -305,6 +306,8 @@ describe("AgentSession prewalk", () => {
 	});
 
 	it("/new restores automatic effort after a prewalk handoff pins target effort", async () => {
+		// Exercise session restoration without invoking the live per-turn classifier.
+		const classifier = vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.High);
 		const created = createLifecycleSession([
 			toolCall("old-todo", "todo"),
 			toolCall("old-write", "write"),
@@ -323,6 +326,7 @@ describe("AgentSession prewalk", () => {
 		await created.session.prompt("fresh task");
 		expect(created.requested.slice(boundary)).toEqual([created.primary.id, created.primary.id, created.target.id]);
 		expect(created.session.isAutoThinking).toBe(false);
+		expect(classifier).toHaveBeenCalledTimes(2);
 	});
 
 	it("/new restores planning effort after an effort-only prewalk on the same model", async () => {
@@ -1762,6 +1766,7 @@ describe("AgentSession prewalk", () => {
 	});
 
 	it("switches when a same-model target clears auto mode even though efforts both resolve to undefined", async () => {
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
 		// Review edge case: session in `auto`, same-model prewalk target `:inherit`.
 		// Both selectors resolve to an `undefined` effort, but `:inherit` clears
 		// per-turn classification, so this is a real change and must switch — not

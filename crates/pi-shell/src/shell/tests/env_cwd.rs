@@ -390,3 +390,91 @@ async fn run_cwd_moves_the_shell_and_rejects_missing_directories() {
 		.expect_err("a missing cwd fails the run");
 	assert!(err.to_string().contains("Failed to set cwd"), "{err}");
 }
+
+/// These integration tests require the standard Linux/macOS binaries.
+/// Missing dependencies fail the supported-platform gate rather than skip
+/// it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_system_env_test_dependencies(paths: &[&str]) {
+	for binary in paths {
+		assert!(
+			std::path::Path::new(binary).is_file(),
+			"system env integration requires {binary} on Linux/macOS"
+		);
+	}
+}
+
+/// The system wrapper removes both exported function definitions and the
+/// shell-synthesized underscore entry when the caller requests env -i.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_env_clear_removes_synthesized_exports() {
+	assert_system_env_test_dependencies(&["/usr/bin/env"]);
+	let (result, output) = run_command_capture(
+		"PATH=/usr/bin:/bin; f() { :; }; export -f f; env -i /usr/bin/env",
+		None,
+		None,
+		CancelToken::default(),
+	)
+	.await;
+	assert_eq!(result.exit_code, Some(0));
+	assert_eq!(output, "");
+}
+
+/// Unsetting an exported function's environment entry must prevent a
+/// child bash from importing it, even without clearing other variables.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_env_unset_prevents_function_import() {
+	assert_system_env_test_dependencies(&["/usr/bin/env", "/bin/bash"]);
+	let (result, output) = run_command_capture(
+		"PATH=/usr/bin:/bin; f() { :; }; export -f f; env -u BASH_FUNC_f%% /bin/bash --noprofile \
+		 --norc -c 'if declare -F f >/dev/null; then echo leaked; else echo absent; fi'",
+		None,
+		None,
+		CancelToken::default(),
+	)
+	.await;
+	assert_eq!(result.exit_code, Some(0));
+	assert_eq!(output, "absent\n");
+}
+
+/// No-op env changes must not expose the invoking shell's hash table to
+/// the operand command, or make its resolution differ from changed env.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_env_ignores_operand_hash_for_noop_changes() {
+	assert_system_env_test_dependencies(&["/usr/bin/env", "/bin/false"]);
+	for prefix in ["", "PATH=/usr/bin:/bin", "-u OMP_ENV_ABSENT", "OMP_ENV_CHANGED=x"] {
+		let (result, _) = run_command_capture(
+			&format!(
+				"PATH=/usr/bin:/bin; unset OMP_ENV_ABSENT OMP_ENV_CHANGED; hash -p /bin/false \
+				 omp-env-probe-missing; env {prefix} omp-env-probe-missing"
+			),
+			None,
+			None,
+			CancelToken::default(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(127), "env prefix: {prefix}");
+	}
+}
+
+/// A missing or unexported PATH uses the system env's child lookup. Pin
+/// the wrapper itself, since the invoking shell must locate env first.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_env_child_lookup_ignores_unexported_path() {
+	assert_system_env_test_dependencies(&["/usr/bin/env", "/bin/sh"]);
+	for setup in ["unset PATH", "PATH=/omp-env-absent; export -n PATH"] {
+		let (result, output) = run_command_capture(
+			&format!("{setup}; hash -p /usr/bin/env env; env -i sh -c 'printf default-found'"),
+			None,
+			None,
+			CancelToken::default(),
+		)
+		.await;
+		assert_eq!(result.exit_code, Some(0), "PATH setup: {setup}");
+		assert_eq!(output, "default-found");
+	}
+}

@@ -2906,3 +2906,72 @@ describe("runGcCommand session compression", () => {
 		expect(await snapshot(file)).toEqual(before);
 	});
 });
+
+describe("runGcCommand compression path boundary", () => {
+	afterEach(() => {
+		compressionMethodSpy?.mockRestore();
+		candidateSpy?.mockRestore();
+	});
+	let compressionMethodSpy: { mockRestore(): void } | undefined;
+	let candidateSpy: { mockRestore(): void } | undefined;
+
+	test.each([
+		"root-link",
+		"directory-link",
+		"file-link",
+		"dangling-link",
+		"directory-loop",
+		"missing-root",
+		"file-root",
+		"nested-hidden-files",
+		"scratch-subtree",
+	] as const)("enumerates owned compression candidates without crossing %s", async boundary => {
+		// Exercise real enumeration on Linux too. No compression backend or native lease is claimed here.
+		compressionMethodSpy = spyOn(gcCompress, "compressMethod").mockResolvedValue("ntfs");
+		const probed: string[] = [];
+		candidateSpy = spyOn(gcCompress, "compressCandidate").mockImplementation(async file => {
+			probed.push(file);
+			return undefined;
+		});
+		const transcript = await writeSession(root, "project", Bun.randomUUIDv7(), "complete", { ageDays: 30 });
+		const artifacts = transcript.slice(0, -6);
+		const expected = [transcript];
+		const outside = path.join(root, "external-data");
+		await fs.mkdir(outside);
+		const secret = path.join(outside, "untouched.txt");
+		await Bun.write(secret, "outside bytes");
+		if (boundary === "root-link") await fs.symlink(outside, artifacts, "dir");
+		else if (boundary === "file-root") await Bun.write(artifacts, "not a directory");
+		else if (boundary !== "missing-root") {
+			await fs.mkdir(artifacts);
+			const ownFile = path.join(artifacts, "owned-output");
+			await Bun.write(ownFile, "owned bytes");
+			expected.push(ownFile);
+			if (boundary === "directory-link") await fs.symlink(outside, path.join(artifacts, "linked-directory"), "dir");
+			else if (boundary === "file-link") await fs.symlink(secret, path.join(artifacts, "linked-file"), "file");
+			else if (boundary === "dangling-link")
+				await fs.symlink(path.join(outside, "missing"), path.join(artifacts, "dangling"), "file");
+			else if (boundary === "directory-loop") await fs.symlink(artifacts, path.join(artifacts, "loop"), "dir");
+			else if (boundary === "nested-hidden-files") {
+				const hidden = path.join(artifacts, ".hidden", ".output");
+				await Bun.write(hidden, "nested owned bytes");
+				expected.push(hidden);
+			} else {
+				await Bun.write(path.join(artifacts, ".omp-gc-compress-stale", "scratch.txt"), "staged bytes");
+				const ordinary = path.join(artifacts, ".ordinary-output", "keep.txt");
+				await Bun.write(ordinary, "ordinary bytes");
+				expected.push(ordinary);
+			}
+		}
+		const result = await runGcCommand({ flags: { agentDir: root, compress: true } });
+		if (boundary === "root-link" || boundary === "file-root") {
+			expect(probed).toEqual([]);
+			expect(result.compress?.errors).toEqual([expect.stringContaining(transcript)]);
+		} else {
+			expect(probed.sort()).toEqual(expected.sort());
+			expect(result.compress?.errors).toEqual([]);
+		}
+		expect(result.compress?.compressed).toBe(0);
+		expect(await Bun.file(secret).text()).toBe("outside bytes");
+	});
+});

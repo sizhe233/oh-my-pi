@@ -396,7 +396,9 @@ async fn every_utility_builtin_is_registered_under_its_own_name() {
 	names.sort_unstable();
 	assert_eq!(names, expected, "the utility builtin registry changed");
 
-	for name in names {
+	// env remains offered by pi-builtins but is withheld by the embedding
+	// policy.
+	for name in names.into_iter().filter(|name| *name != "env") {
 		// The session resolves the name as a builtin of its own, not a file
 		// on a search path.
 		let exec = session

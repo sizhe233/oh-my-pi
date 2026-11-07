@@ -4,8 +4,12 @@
 
 ### Fixed
 
+- Match rsync second boundaries for keepalive scheduling and connection timeout checks.
+- Find installed zsh completion functions on Linux while preserving an explicitly configured FPATH.
+- Match Linux zsh signal names in signal completion and `kill -l` without changing Bash signal names.
+
 - Native `chmod` rejects effective `-h`/`--no-dereference` requests before changing any files because symlink-safe permission changes are not yet supported.
-- Embedded shells use the external `env` command again while the native implementation's child-environment and executable-lookup behavior remains incomplete. A system `env` executable is required, as before 18.10.2.
+- Embedded shells keep the external `env` command through the shell-engine migration, preserving exact child-environment and executable-lookup behavior. A system `env` executable is required, as before 18.10.2.
 - Native `dd` rejects unsupported `direct` and `nocache` flags before opening its input or output operands rather than silently performing buffered I/O.
 ## [18.18.0] - 2026-11-07
 

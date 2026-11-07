@@ -552,6 +552,8 @@ describe("AgentSession handoff", () => {
 					: undefined,
 			),
 			clearManagedTimers: vi.fn(),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
 		vi.spyOn(compactionModule, "compact").mockResolvedValue({
@@ -623,6 +625,8 @@ describe("AgentSession handoff", () => {
 					: undefined,
 			),
 			clearManagedTimers: vi.fn(),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockResolvedValue({

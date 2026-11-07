@@ -119,6 +119,8 @@ pub(crate) struct LogConfig {
 	/// -h level: 0 = --no-h, 1 = default (separators), 2 = -h (1000), 3 = -hh (1024).
 	pub human_readable: u8,
 	pub eight_bit_output: bool,
+	/// The shell's C/POSIX charset rejects high bytes even when they form valid UTF-8.
+	pub ascii_output: bool,
 	/// [`STDERR_ERRORS`], [`STDERR_ALL`], or [`STDERR_CLIENT`].
 	pub stderr_mode: u8,
 	pub am_server: bool,
@@ -738,7 +740,7 @@ impl Logger {
 			to_stderr = true;
 		}
 		let escape_8bit = !cfg.eight_bit_output;
-		let validate_utf8 = escape_8bit && !cfg.am_server && inner.remote.is_none();
+		let validate_output = escape_8bit && !cfg.am_server && inner.remote.is_none();
 		let mut line = Vec::with_capacity(buf.len() + 8);
 		if inner.needs_newline.swap(0, Ordering::Relaxed) != 0 {
 			line.push(b'\n');
@@ -754,7 +756,17 @@ impl Logger {
 			}
 			_ => body,
 		};
-		if validate_utf8 {
+		if validate_output && cfg.ascii_output {
+			for chunk in body.chunk_by(|a, b| a.is_ascii() == b.is_ascii()) {
+				if chunk[0].is_ascii() {
+					filter_into(&mut line, chunk, false, false);
+				} else {
+					for &byte in chunk {
+						push_octal(&mut line, byte);
+					}
+				}
+			}
+		} else if validate_output {
 			for chunk in body.utf8_chunks() {
 				filter_into(&mut line, chunk.valid().as_bytes(), false, false);
 				for &byte in chunk.invalid() {
@@ -1032,6 +1044,20 @@ mod tests {
 			err.text(),
 			format!("rsync: [Receiver] mkdir \"/x\" failed: Read-only file system ({})\n", libc::EROFS)
 		);
+	}
+
+	#[test]
+	fn c_locale_escapes_high_bytes_unless_eight_bit_output_is_requested() {
+		let (logger, out, _) = client(LogConfig { ascii_output: true, ..LogConfig::default() });
+		logger.rprintf(LogCode::Info, "caf\u{e9}\t\u{7f}\\#123\u{1}\n".as_bytes());
+		assert_eq!(out.bytes(), b"caf\\#303\\#251\t\x7f\\#134#123\\#001\n");
+		let (logger, out, _) = client(LogConfig {
+			ascii_output: true,
+			eight_bit_output: true,
+			..LogConfig::default()
+		});
+		logger.rprintf(LogCode::Info, "caf\u{e9}\t\u{7f}\\#123\u{1}\n".as_bytes());
+		assert_eq!(out.bytes(), "caf\u{e9}\t\u{7f}\\#134#123\\#001\n".as_bytes());
 	}
 
 	#[test]

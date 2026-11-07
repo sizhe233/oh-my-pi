@@ -4,9 +4,14 @@
 
 ### Fixed
 
-- Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
+- Preserve newly queued memory items in input order when one retain call produces identical file timestamps, without rewriting legacy queued events.
 
-## [18.10.3] - 2026-10-12
+- Restored subagent owners retain lifecycle protection when worker execution is enabled.
+- Session approval grants remain visible in worker-backed session views and expire on session changes.
+- Approval dialogs from an abandoned session or tree branch no longer authorize tools after navigation, reset, or disposal ([#64](https://github.com/sizhe233/oh-my-pi/pull/64) by [@sizhe233](https://github.com/sizhe233)).
+- Browser tabs reject competing ownership claims during concurrent closes and after their creating worker adopts them ([#64](https://github.com/sizhe233/oh-my-pi/pull/64) by [@sizhe233](https://github.com/sizhe233)).
+- Session restore resumes interrupted tasks only from their selected branches, and session compression refuses symlinked artifact roots ([#64](https://github.com/sizhe233/oh-my-pi/pull/64) by [@sizhe233](https://github.com/sizhe233)).
+- Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
 ## [18.18.0] - 2026-11-07
 
 ### Added

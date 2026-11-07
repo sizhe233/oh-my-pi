@@ -3,6 +3,8 @@
 
 #![cfg(unix)]
 
+#[path = "../test-support/child_reaper.rs"]
+mod child_reaper;
 mod pty_support;
 
 use std::{io, os::unix::process::CommandExt, path::Path, process::Command};
@@ -128,6 +130,8 @@ fn command_strings_and_exit_statuses_match_zsh() {
 /// a background job without `nohup` gets `TERM` and is gone shortly after.
 #[test]
 fn a_standalone_exit_ends_running_background_externals() {
+	#[cfg(target_os = "linux")]
+	let _reaper = child_reaper::ChildReaper::new();
 	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
 		.args(["-c", "/bin/sleep 31 >/dev/null 2>&1 </dev/null & echo $!"])
 		.output()
@@ -139,8 +143,9 @@ fn a_standalone_exit_ends_running_background_externals() {
 		.parse()
 		.expect("the job's pid");
 	let deadline = std::time::Instant::now() + TIMEOUT;
-	// SAFETY: signal 0 only checks that the process exists.
-	while unsafe { libc::kill(pid, 0) } == 0 {
+	// Reap only this already-exited child; a live process still fails the
+	// original deadline.
+	while child_reaper::alive(pid) {
 		assert!(std::time::Instant::now() < deadline, "sleep {pid} still runs after obash exited");
 		std::thread::sleep(std::time::Duration::from_millis(20));
 	}

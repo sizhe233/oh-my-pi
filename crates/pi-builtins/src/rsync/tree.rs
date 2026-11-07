@@ -853,7 +853,7 @@ impl Tree {
 						}
 						let path = self.inner.root.join(OsStr::from_bytes(at.name.as_bytes()));
 						sys::bind_socket_at(at.dir.fd(), &at.name, &path)?;
-						chmod_nofollow(at.dir.fd(), &at.name, perm)?;
+						chmod_nofollow(at.dir.fd(), &at.name, perm, false)?;
 					}
 				},
 				NodeKind::CharDevice(rdev) => {
@@ -882,7 +882,7 @@ impl Tree {
 		let current = sys::st_mode(&st) & 0o7777;
 		let wanted = (current & 0o7000) | (mode & 0o777 & !mask);
 		if current != wanted {
-			let _ = chmod_nofollow(at.dir.fd(), &at.name, wanted);
+			let _ = chmod_nofollow(at.dir.fd(), &at.name, wanted, false);
 		}
 	}
 
@@ -942,14 +942,23 @@ impl Tree {
 
 	/// Never follows a final symlink (lchmod semantics; Unsupported where impossible).
 	pub(crate) fn chmod(&self, rel: &Path, mode: u32) -> io::Result<()> {
+		self.chmod_impl(rel, mode, false)
+	}
+
+	/// Rejects a final symlink when the expected object is not a symlink.
+	pub(crate) fn chmod_nonlink(&self, rel: &Path, mode: u32) -> io::Result<()> {
+		self.chmod_impl(rel, mode, true)
+	}
+
+	fn chmod_impl(&self, rel: &Path, mode: u32, reject_symlink: bool) -> io::Result<()> {
 		#[cfg(unix)]
 		if let Some(root) = self.native_root() {
 			let at = self.locate(root, rel)?;
-			return chmod_nofollow(at.dir.fd(), &at.name, mode & 0o7777);
+			return chmod_nofollow(at.dir.fd(), &at.name, mode & 0o7777, reject_symlink);
 		}
 		let path = self.path_of(rel)?;
 		if self.inner.fs.symlink_metadata(&path)?.is_symlink() {
-			return Err(err::unsupported());
+			return Err(if reject_symlink { err::looped() } else { err::unsupported() });
 		}
 		self.inner.fs.set_permissions(&path, Permissions::from_mode(mode & 0o7777))
 	}
@@ -1212,9 +1221,12 @@ impl Tree {
 /// `fchmodat(AT_SYMLINK_NOFOLLOW)`. On macOS a FIFO is never opened (that
 /// would make us a reader); an ungrantable setgid is retried without it.
 #[cfg(unix)]
-fn chmod_nofollow(dir: BorrowedFd<'_>, name: &std::ffi::CStr, mode: u32) -> io::Result<()> {
+fn chmod_nofollow(dir: BorrowedFd<'_>, name: &std::ffi::CStr, mode: u32, reject_symlink: bool) -> io::Result<()> {
 	let st = sys::fstatat(Some(dir), name, true)?;
 	if sys::is_lnk(&st) {
+		if reject_symlink {
+			return Err(err::looped());
+		}
 		return sys::fchmodat(Some(dir), name, mode, true);
 	}
 	let fifo = sys::is_fifo(&st);
@@ -1608,6 +1620,19 @@ mod tests {
 		}
 
 		#[test]
+		fn chmod_nonlink_refuses_a_symlink_without_changing_its_target() {
+			let (_guard, base) = tempdir();
+			std::fs::write(base.join("file"), b"").unwrap();
+			std::fs::set_permissions(base.join("file"), std::fs::Permissions::from_mode(0o600)).unwrap();
+			symlink("file", base.join("link")).unwrap();
+			let tree = open_tree(&base, &TreeOpts::default());
+			assert_eq!(tree.chmod_nonlink(Path::new("link"), 0o777).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+			assert_eq!(std::fs::metadata(base.join("file")).unwrap().permissions().mode() & 0o7777, 0o600);
+			tree.chmod_nonlink(Path::new("file"), 0o640).unwrap();
+			assert_eq!(std::fs::metadata(base.join("file")).unwrap().permissions().mode() & 0o7777, 0o640);
+		}
+
+		#[test]
 		fn operator_named_root_symlink_trust() {
 			let (_guard, base) = tempdir();
 			std::fs::create_dir(base.join("disk")).unwrap();
@@ -1655,7 +1680,10 @@ mod tests {
 			let root = base.join("a".repeat(120));
 			std::fs::create_dir(&root).unwrap();
 			assert!(root.join("sk0").as_os_str().len() > 108);
-			let tree = open_tree(&root, &TreeOpts::default());
+			// Exercise exact creation permissions without depending on or changing
+			// the process-wide umask of the runner. The temporary root is private.
+			let fs = pi_vfs::Fs::native().with_creation_mask(Some(0o027)).blocking();
+			let tree = Tree::open(&fs, &root, &TreeOpts::default()).unwrap();
 			tree.mknod(Path::new("sk0"), NodeKind::Socket, 0o640).unwrap();
 			let meta = std::fs::symlink_metadata(root.join("sk0")).unwrap();
 			assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));

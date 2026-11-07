@@ -1254,7 +1254,7 @@ pub fn zsh_startup_values(
 	let mut signals = vec![BString::from("EXIT")];
 	for n in 1..=31u8 {
 		match crate::bash::signal::Signal::from_number(n, platform) {
-			Some(s) => signals.push(BString::from(s.to_string())),
+			Some(s) => signals.push(BString::from(s.zsh_name(platform))),
 			None => signals.push(BString::from(format!("SIG{n}"))),
 		}
 	}

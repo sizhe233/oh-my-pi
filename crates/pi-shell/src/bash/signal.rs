@@ -153,6 +153,15 @@ pub enum DefaultAction {
 }
 
 impl Signal {
+	/// Canonical zsh signal name on the selected platform.
+	pub fn zsh_name(self, platform: Platform) -> String {
+		match (platform, self) {
+			(Platform::Linux, Self::Abrt) => "IOT".to_owned(),
+			(Platform::Linux, Self::Io) => "POLL".to_owned(),
+			_ => self.to_string(),
+		}
+	}
+
 	/// Signal number on `platform`, or zero when the platform has no such
 	/// signal.
 	pub const fn number(self, platform: Platform) -> u8 {

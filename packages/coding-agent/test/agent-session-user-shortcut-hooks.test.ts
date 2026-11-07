@@ -75,6 +75,8 @@ describe("AgentSession user shortcut hooks", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
 			emitUserBash,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash");
 
@@ -114,6 +116,8 @@ describe("AgentSession user shortcut hooks", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_python"),
 			emitUserPython,
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		const executePythonSpy = vi.spyOn(pythonExecutor, "executePython");
 
@@ -141,6 +145,8 @@ describe("AgentSession user shortcut hooks", () => {
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash" || eventType === "user_python"),
 			emitUserBash: vi.fn().mockResolvedValue({}),
 			emitUserPython: vi.fn().mockResolvedValue(undefined),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
 			output: "bash fallback",
@@ -192,6 +198,8 @@ describe("AgentSession user shortcut hooks", () => {
 			outputBytes: 2,
 		};
 		const extensionRunner = {
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash" || eventType === "user_python"),
 			emitUserBash: vi.fn().mockResolvedValue({ result: { ...hookResult, output: "sh" } }),
 			emitUserPython: vi

@@ -413,6 +413,8 @@ describe("pre-approval refusal gate", () => {
 			sessionId: "bash-approval-test",
 			cwd: process.cwd(),
 			runScoped: <T>(fn: () => T): T => fn(),
+			getSessionApprovalEpoch: () => 0,
+			clearSessionApprovals: () => {},
 		} as unknown as ExtensionRunner;
 		return new ExtensionToolWrapper(tool as Tool, runner);
 	};

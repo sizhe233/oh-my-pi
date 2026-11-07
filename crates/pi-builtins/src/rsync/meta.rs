@@ -506,7 +506,12 @@ pub(crate) fn set_file_attrs_with(
 		let changed = if opts.fake_super || opts.dry_run {
 			true
 		} else {
-			match tree.chmod(rel, new_mode & CHMOD_BITS) {
+			let result = if mode_is_lnk(new_mode) {
+				tree.chmod(rel, new_mode & CHMOD_BITS)
+			} else {
+				tree.chmod_nonlink(rel, new_mode & CHMOD_BITS)
+			};
+			match result {
 				Ok(()) => true,
 				// Symlink modes are best effort unless permissions are preserved.
 				Err(_) if mode_is_lnk(new_mode) && !opts.perms && !opts.executability => true,

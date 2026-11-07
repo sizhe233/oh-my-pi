@@ -916,7 +916,7 @@ return { observed, window: measured.window, diagnostic: {
 		async () => {
 			const launched = sharedHeadless;
 			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
-			const endpoint = new URL(launched.browser.wsEndpoint());
+			const endpoint = new URL(launched.wsEndpoint);
 			const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`;
 			const targetTitle = `adopt-me-${suffix}`;
 			const targetPage = await launched.browser.newPage();

@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+mod comp_support;
 mod pty_support;
 
 use std::{io, time::Duration};
@@ -323,10 +324,18 @@ fn bracketed_paste_magic() {
 	// `bracketed-paste-magic` replays the paste through `zle -U`,
 	// `.read-command` and `.self-insert`, with `split-undo` and `.undo`.
 	// Sourced: the file only defines the functions.
-	let rc = "source /usr/share/zsh/5.9/functions/bracketed-paste-magic\nzle -N bracketed-paste \
-	          bracketed-paste-magic\nzstyle ':bracketed-paste-magic' active-widgets '.self-*' \
-	          'backward-kill-word'\n";
-	same(rc, BPM_KEYS);
+	let function = comp_support::compsys_fpath()
+		.expect("installed zsh functions required")
+		.into_iter()
+		.map(|dir| dir.join("bracketed-paste-magic"))
+		.find(|file| file.is_file())
+		.expect("installed bracketed-paste-magic required");
+	let rc = format!(
+		"source {}\nzle -N bracketed-paste bracketed-paste-magic\nzstyle ':bracketed-paste-magic' \
+		 active-widgets '.self-*' 'backward-kill-word'\n",
+		function.display()
+	);
+	same(&rc, BPM_KEYS);
 }
 
 /// Pastes with an active widget inside, then one undone.

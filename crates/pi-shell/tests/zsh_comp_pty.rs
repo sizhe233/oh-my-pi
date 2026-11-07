@@ -171,8 +171,9 @@ fn options_of_ls_ask_then_list() {
 
 #[test]
 fn options_and_values_of_arguments() {
-	let rc = "_fx() { _arguments '-a[show all]' '-l[long listing]' \
-	          '--color=[colourize]:when:(always never auto)' '*:file:_files' }\ncompdef _fx fxtool";
+	let rc = "unset LC_ALL; export LC_COLLATE=C\n_fx() { _arguments '-a[show all]' '-l[long \
+	          listing]' '--color=[colourize]:when:(always never auto)' '*:file:_files' }\ncompdef \
+	          _fx fxtool";
 	check(
 		"options_and_values_of_arguments",
 		Setup::Compsys,

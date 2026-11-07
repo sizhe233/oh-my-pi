@@ -56,7 +56,7 @@ pub(crate) fn locale_charset(env: &dyn Fn(&str) -> Option<String>) -> String {
 }
 
 /// What `nl_langinfo(CODESET)` returns for the C locale.
-fn ascii_codeset() -> &'static str {
+pub(crate) fn ascii_codeset() -> &'static str {
 	if cfg!(target_os = "linux") { "ANSI_X3.4-1968" } else { "US-ASCII" }
 }
 

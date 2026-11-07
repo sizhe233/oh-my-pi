@@ -36,7 +36,11 @@ import {
 } from "./agent-registry";
 import { getAgentTombstonePath } from "./agent-tombstone";
 
-export type AgentReviver = (expected: AgentRef) => Promise<AgentSessionHandle>;
+export interface AgentReviveOptions {
+	placement?: "local";
+}
+
+export type AgentReviver = (expected: AgentRef, options?: AgentReviveOptions) => Promise<AgentSessionHandle>;
 
 const AGENT_RELEASE_GRACE_MS = 5000;
 
@@ -491,6 +495,26 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * cancelled (session still live) or awaited to completion before revive.
 	 */
 	async ensureLive(id: string): Promise<AgentSessionHandle> {
+		return this.#ensureLive(id);
+	}
+
+	/** Request local placement for a new cold revival without reopening a killed generation.
+	 * Existing/in-flight sessions are joined; the caller checks their restore capabilities. */
+	async ensureLiveForRestore(id: string, expected: AgentRef): Promise<AgentSessionHandle> {
+		const session = await this.#ensureLive(id, expected);
+		if (this.#registry.get(id) !== expected || expected.status === "aborted" || expected.session !== session) {
+			throw new Error("Restored agent changed session generation");
+		}
+		return session;
+	}
+
+	async #ensureLive(id: string, expected?: AgentRef): Promise<AgentSessionHandle> {
+		const checkExpected = () => {
+			if (expected && (this.#registry.get(id) !== expected || expected.status === "aborted")) {
+				throw new Error("Restored agent changed session generation");
+			}
+		};
+		checkExpected();
 		const park = this.#parks.get(id);
 		if (park) {
 			const parked = this.#registry.get(id);
@@ -498,6 +522,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			// thrashing dispose + revive.
 			if (parked?.session && !park.detached && park.cancel()) {
 				await park.promise;
+				checkExpected();
 				const kept = this.#registry.get(id)?.session;
 				if (kept) {
 					// Park cleared the idle timer; re-arm so TTL park still works.
@@ -512,6 +537,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			}
 		}
 
+		checkExpected();
 		let ref = this.#registry.get(id);
 		if (!ref) {
 			throw new Error(
@@ -524,7 +550,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		const inflight = this.#revivals.get(id);
 		if (inflight?.ref === ref) return inflight.promise;
 		if (ref.session) return ref.session;
-		const revival = this.#resolveAndRevive(id, ref);
+		const revival = this.#resolveAndRevive(id, ref, expected ? { placement: "local" } : undefined);
 		const pending: RevivingAgent = { ref, promise: revival };
 		this.#revivals.set(id, pending);
 		try {
@@ -590,7 +616,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * adopt it so the agent rejoins the normal idle↔parked lifecycle. Throws
 	 * when the agent is not revivable or no reviver can be produced.
 	 */
-	async #resolveAndRevive(id: string, ref: AgentRef): Promise<AgentSessionHandle> {
+	async #resolveAndRevive(id: string, ref: AgentRef, options?: AgentReviveOptions): Promise<AgentSessionHandle> {
 		let adoption = this.#adopted.get(id);
 		// A reviver-less adoption of this ref (its warm reviver's thread died) keeps
 		// its release hook through cold revival and restores it if that fails.
@@ -627,7 +653,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			);
 		}
 		try {
-			return await this.#revive(id, revive, ref, adoption);
+			return await this.#revive(id, revive, ref, adoption, options);
 		} catch (error) {
 			// A failed cold revive (stale ctx, missing cwd, bad MCP) must not leave a
 			// poisoned reviver stuck in #adopted — drop it so a later ensureLive
@@ -750,8 +776,14 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		if (AgentLifecycleManager.#global === this) AgentLifecycleManager.#global = undefined;
 	}
 
-	async #revive(id: string, revive: AgentReviver, ref: AgentRef, adopted: AdoptedAgent): Promise<AgentSessionHandle> {
-		const session = await revive(ref);
+	async #revive(
+		id: string,
+		revive: AgentReviver,
+		ref: AgentRef,
+		adopted: AdoptedAgent,
+		options?: AgentReviveOptions,
+	): Promise<AgentSessionHandle> {
+		const session = await revive(ref, options);
 		if (this.#disposed) {
 			// The owning lifecycle tore down while the reviver was in flight; dispose
 			// the freshly built session instead of attaching it, and fail the waiter.

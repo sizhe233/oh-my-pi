@@ -119,6 +119,15 @@ fn corpus() -> Vec<String> {
 			walk(&Path::new(&home).join(sub), &shell_file, &mut files);
 		}
 	}
+	if files.is_empty() {
+		// Distribution packages install the same function corpus without the
+		// developer's source checkout. Never let compilation pass vacuously.
+		walk(Path::new("/usr/share/zsh/functions"), &|p| p.extension().is_none(), &mut files);
+		if files.is_empty() {
+			walk(Path::new("/usr/share/zsh/5.9/functions"), &|p| p.extension().is_none(), &mut files);
+		}
+	}
+	assert!(files.len() >= 3, "zcompile requires an installed or PI_ZSH_SRC function corpus");
 	files
 }
 

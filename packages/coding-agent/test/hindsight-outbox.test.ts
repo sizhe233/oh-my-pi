@@ -328,3 +328,133 @@ describe("Hindsight retain outbox", () => {
 		expect(requests).toHaveLength(0);
 	});
 });
+
+describe("Hindsight outbox equal-mtime ordering", () => {
+	async function reversePublicationOrder(contents: string[]): Promise<void> {
+		const files = await eventFiles();
+		const rank = new Map<string, number>();
+		const when = new Date(Date.now() - 1000);
+		for (const file of files) {
+			const event = (await Bun.file(file).json()) as OutboxEvent;
+			rank.set(path.basename(file), contents.indexOf(event.content));
+			await fs.utimes(file, when, when);
+		}
+		const dir = path.dirname(files[0]);
+		const original = fs.readdir;
+		vi.spyOn(fs, "readdir").mockImplementation((async (...args: Parameters<typeof fs.readdir>) => {
+			const entries = await original(...args);
+			if (String(args[0]) !== dir) return entries;
+			return entries.toSorted((a, b) => (rank.get(String(b)) ?? -1) - (rank.get(String(a)) ?? -1));
+		}) as typeof fs.readdir);
+	}
+
+	it("retains exact input order after restart with identical mtimes and reversed enumeration", async () => {
+		const { tool, state } = fixture();
+		const contents = ["first equal-time item", "second equal-time item", "third equal-time item"];
+		await tool.execute("same-time-call", { items: contents.map(content => ({ content })) });
+		await reversePublicationOrder(contents);
+		state.dispose();
+		const restarted = fixture();
+		await restarted.state.flushRetainQueue();
+		expect(requests).toHaveLength(1);
+		expect(requests[0].map(item => item.content)).toEqual(contents);
+		expect(await eventFiles()).toEqual([]);
+	});
+
+	it("does not rewrite order metadata, ids or publication time on a retried call", async () => {
+		const { tool } = fixture();
+		const items = [{ content: "retry first" }, { content: "retry second" }];
+		await tool.execute("retry-order", { items });
+		const files = await eventFiles();
+		const before = await Promise.all(
+			files.map(async file => ({ raw: await Bun.file(file).text(), mtime: (await fs.stat(file)).mtimeMs })),
+		);
+		await tool.execute("retry-order", { items });
+		expect(await eventFiles()).toEqual(files);
+		expect(
+			await Promise.all(
+				files.map(async file => ({ raw: await Bun.file(file).text(), mtime: (await fs.stat(file)).mtimeMs })),
+			),
+		).toEqual(before);
+	});
+
+	it("keeps the complete-call batch identity when only a missing event is republished", async () => {
+		const { tool } = fixture();
+		const items = [{ content: "partial first" }, { content: "partial second" }, { content: "partial third" }];
+		await tool.execute("partial-order", { items });
+		const files = await eventFiles();
+		const records = await Promise.all(
+			files.map(async file => ({
+				file,
+				event: (await Bun.file(file).json()) as OutboxEvent,
+				raw: await Bun.file(file).text(),
+				mtime: (await fs.stat(file)).mtimeMs,
+			})),
+		);
+		const missing = records.find(record => record.event.content === "partial second")!;
+		await fs.rm(missing.file);
+		await tool.execute("partial-order", { items });
+		const restored = (await Bun.file(missing.file).json()) as OutboxEvent;
+		expect(restored.id).toBe(missing.event.id);
+		expect(restored.deliveryOrder).toEqual(missing.event.deliveryOrder);
+		expect(restored.deliveryOrder?.index).toBe(1);
+		for (const record of records.filter(record => record.file !== missing.file)) {
+			expect(await Bun.file(record.file).text()).toBe(record.raw);
+			expect((await fs.stat(record.file)).mtimeMs).toBe(record.mtime);
+		}
+		expect(await eventFiles()).toHaveLength(3);
+	});
+
+	it("accepts legacy events alongside multiple tied new batches without mixing tag scopes", async () => {
+		const { tool, state } = fixture();
+		await tool.execute("legacy-order", { items: [{ content: "legacy" }] });
+		const [legacyFile] = await eventFiles();
+		const legacy = (await Bun.file(legacyFile).json()) as OutboxEvent;
+		delete legacy.deliveryOrder;
+		await Bun.write(legacyFile, JSON.stringify(legacy));
+		await tool.execute("batch-a", { items: [{ content: "a-first" }, { content: "a-second" }] });
+		await tool.execute("batch-b", {
+			items: [
+				{ content: "b-first", scope: "global" },
+				{ content: "b-second", scope: "global" },
+			],
+		});
+		await reversePublicationOrder(["legacy", "a-first", "a-second", "b-first", "b-second"]);
+		await state.flushRetainQueue();
+		expect(requests).toHaveLength(2);
+		const project = requests.find(items => items.some(item => item.content === "a-first"))!;
+		const global = requests.find(items => items.some(item => item.content === "b-first"))!;
+		expect(project.filter(item => item.content !== "legacy").map(item => item.content)).toEqual([
+			"a-first",
+			"a-second",
+		]);
+		expect(project.map(item => item.content).toSorted()).toEqual(["a-first", "a-second", "legacy"]);
+		expect(project.every(item => JSON.stringify(item.tags) === JSON.stringify(["project:alpha"]))).toBe(true);
+		expect(global.map(item => ({ content: item.content, tags: item.tags }))).toEqual([
+			{ content: "b-first", tags: undefined },
+			{ content: "b-second", tags: undefined },
+		]);
+		expect(await eventFiles()).toEqual([]);
+	});
+
+	it.each([
+		null,
+		{},
+		{ batch: "0".repeat(64) },
+		{ batch: "bad", index: 0 },
+		{ batch: "0".repeat(64), index: -1 },
+		{ batch: "0".repeat(64), index: 1.5 },
+		{ batch: "0".repeat(64), index: Number.MAX_SAFE_INTEGER + 1 },
+	])("quarantines invalid delivery metadata %#", async deliveryOrder => {
+		const { tool, state } = fixture();
+		await tool.execute("bad-order", { items: [{ content: "kept for review" }] });
+		const [file] = await eventFiles();
+		const event = await Bun.file(file).json();
+		event.deliveryOrder = deliveryOrder;
+		await Bun.write(file, JSON.stringify(event));
+		await state.flushRetainQueue();
+		expect(requests).toEqual([]);
+		expect(await eventFiles()).toEqual([]);
+		expect(await fs.readdir(quarantineDir())).toEqual([path.basename(file)]);
+	});
+});

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { buildAnthropicClientOptions } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { stream } from "@oh-my-pi/pi-ai/stream";
 import { resolveAnthropicPrewarmTarget } from "@oh-my-pi/pi-ai/providers/anthropic-http-options";
 import { prewarmModelConnection, resetConnectionPrewarmForTesting } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
@@ -53,16 +53,25 @@ describe("prewarmModelConnection", () => {
 		const { calls, fetch } = captureFetch();
 		await prewarmModelConnection(ANTHROPIC, { fetch });
 
-		const real = buildAnthropicClientOptions({
-			model: ANTHROPIC,
-			apiKey: "sk-ant-oat-test",
-			isOAuth: true,
-			extraBetas: [],
-		});
+		// Capture an actual inference request after the public stream entry point's
+		// transport processing, including inherited NODE_EXTRA_CA_CERTS. The mock
+		// 404 terminates the request without network access or retryable errors.
+		const real = captureFetch();
+		const result = await stream(
+			ANTHROPIC,
+			{ messages: [{ role: "user", content: "Hi", timestamp: 0 }] },
+			{ apiKey: "sk-ant-oat-test", fetch: real.fetch },
+		).result();
+		expect(result.stopReason).toBe("error");
+		expect(real.calls).toHaveLength(1);
+		expect(new URL(real.calls[0].url).origin).toBe("https://api.anthropic.com");
+		expect(real.calls[0].init.method).toBe("POST");
+		expect(new Headers(real.calls[0].init.headers).get("authorization")).toBe("Bearer sk-ant-oat-test");
 		expect(calls).toHaveLength(1);
 		expect(calls[0].url).toBe("https://api.anthropic.com");
 		expect(calls[0].init.method).toBe("HEAD");
-		expect(calls[0].init.tls).toEqual(real.fetchOptions?.tls);
+		expect(calls[0].init.tls).toEqual(real.calls[0].init.tls);
+		expect(calls[0].init.tls).toMatchObject({ rejectUnauthorized: true, serverName: "api.anthropic.com" });
 		const headers = new Headers(calls[0].init.headers);
 		expect([headers.get("authorization"), headers.get("x-api-key")]).toEqual([null, null]);
 	});

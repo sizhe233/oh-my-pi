@@ -78,10 +78,11 @@ fn clock_ms() -> u64 {
 	u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX - 1) + 1
 }
 
-/// Whole seconds elapsed between two clock readings; a clock that never
-/// ticked (0) counts as idle forever (upstream's epoch-0 `time_t`).
+/// Difference between individually quantized second-resolution clocks, as in
+/// upstream's `time_t` activity timestamps. A clock that never ticked (0)
+/// counts as idle forever; valid timestamps in the first second do not.
 fn idle_secs(now: u64, since: u64) -> u64 {
-	if since == 0 { u64::MAX } else { now.saturating_sub(since) / 1000 }
+	if since == 0 { u64::MAX } else { (now / 1000).saturating_sub(since / 1000) }
 }
 
 fn who(role: Option<Role>) -> &'static str {
@@ -2606,6 +2607,20 @@ mod tests {
 		assert_eq!(sink.take(), [0, 0, 0, 7, 0, 0, 0, 7]);
 	}
 
+	/// rsync records each activity clock as time_t seconds before subtracting.
+	/// A write just after one second must not defer the next bucket's keepalive.
+	#[test]
+	fn keepalive_quantizes_activity_timestamps_before_subtraction() {
+		let sink = Sink::default();
+		let w = writer(&sink, WriteConfig { timeout: Some(Duration::from_secs(2)), ..WriteConfig::default() });
+		w.start_multiplex().unwrap();
+		w.shared.counters.last_out.store(1002, Ordering::Relaxed);
+		w.keepalive_for(Some(Role::Sender), 0, 1999, true).unwrap();
+		assert!(sink.take().is_empty());
+		w.keepalive_for(Some(Role::Sender), 0, 2001, true).unwrap();
+		assert_eq!(sink.take(), [0, 0, 0, 7]);
+	}
+
 	#[test]
 	fn reader_follows_timeout_set_on_linked_writer() {
 		let (mut r, _tx, _) = blocking_reader(None);
@@ -2868,28 +2883,55 @@ mod tests {
 		assert_eq!(*lock(&calls), [false]);
 	}
 
-	/// `--timeout=2`: keepalives go out every second (lull 1), so the idle check at
-	/// each second sees at most 1 s of silence. (At `--timeout=1` lull equals the
-	/// timeout and upstream itself times out on the second check, because a queued
-	/// keepalive stamps `last_io_out` only once it is written.)
+	/// A blocked sender stays live until two keepalives have actually been written.
+	/// The output worker stamps its clock asynchronously, so a fixed cancellation
+	/// delay cannot reliably observe two writes across whole-second idle checks.
 	#[test]
 	fn blocked_sender_sends_keepalives_instead_of_timing_out() {
+		struct ObservedSink {
+			sink: Sink,
+			written: flume::Sender<usize>,
+		}
+		impl Write for ObservedSink {
+			fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+				let n = self.sink.write(bytes)?;
+				let _ = self.written.send(n);
+				Ok(n)
+			}
+			fn flush(&mut self) -> io::Result<()> {
+				self.sink.flush()
+			}
+		}
 		let (mut r, _tx, cancel) = blocking_reader(Some(Duration::from_secs(2)));
 		let sink = Sink::default();
-		let w = writer(&sink, WriteConfig { timeout: Some(Duration::from_secs(2)), ..WriteConfig::default() });
+		let (written, writes) = flume::unbounded();
+		let w = MuxWriter::new(
+			Box::new(ObservedSink { sink: sink.clone(), written }),
+			IoCounters::default(),
+			WriteConfig { timeout: Some(Duration::from_secs(2)), ..WriteConfig::default() },
+		);
 		w.start_multiplex().unwrap();
 		r.set_role(Role::Sender);
 		r.link_writer(w);
 		let flag = Arc::clone(&cancel);
 		let t = thread::spawn(move || {
-			thread::sleep(Duration::from_millis(2300));
+			// This deadline bounds a broken implementation; it does not trigger
+			// successful cancellation. Only two written frames do that.
+			let deadline = Instant::now() + Duration::from_secs(5);
+			let mut observed = 0;
+			while observed < 8 {
+				let Ok(n) = writes.recv_deadline(deadline) else { break };
+				observed += n;
+			}
 			flag.store(true, Ordering::Relaxed);
+			observed
 		});
 		let err = r.read(&mut [0u8; 1]).unwrap_err();
-		t.join().unwrap();
+		let observed = t.join().unwrap();
 		assert_eq!(RsyncError::from_io(&err, RERR_STREAMIO).code, RERR_SIGNAL);
 		let out = sink.take();
 		assert!(out.len() >= 8 && out.chunks(4).all(|c| c == [0, 0, 0, 7]), "{out:?}");
+		assert!(observed >= 8, "two frames were not written before the deadline: {observed}");
 	}
 
 	#[test]

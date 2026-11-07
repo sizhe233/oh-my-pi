@@ -585,6 +585,21 @@ pub fn shell_init(
 				.map(|&(opt, on)| (BString::from(<&'static str>::from(opt)), on)),
 		)
 		.collect();
+	let mut zsh_params = zsh_params(args);
+	if args.mode.dialect() == Dialect::Zsh
+		&& !env.iter().any(|(name, _)| name.as_slice() == b"FPATH")
+		&& let Some(dirs) = crate::sys::zsh::function_dirs()
+	{
+		let mut fpath =
+			BString::from("/usr/local/share/zsh/site-functions:/usr/share/zsh/site-functions");
+		for dir in dirs {
+			fpath.push(b':');
+			fpath.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+		}
+		// Host installation defaults are unexported, like zsh's compiled-in
+		// FPATH. An explicit value (including empty) always wins.
+		zsh_params.push((BString::from("FPATH"), fpath));
+	}
 	ShellInit {
 		mode: args.mode,
 		argv0,
@@ -595,7 +610,7 @@ pub fn shell_init(
 		options,
 		shell_pid: std::process::id(),
 		startup,
-		zsh_params: zsh_params(args),
+		zsh_params,
 		profile: Profile::User,
 	}
 }

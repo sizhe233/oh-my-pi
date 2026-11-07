@@ -190,7 +190,12 @@ fn eof_on_an_empty_line_exits() {
 		Ok(p) => p,
 		Err(e) => panic!("spawn failed: {e}"),
 	};
-	let r = keys(&mut pty, "\x04").and_then(|()| pty.wait(TIMEOUT));
+	// Wait until the editor has switched the PTY out of canonical mode;
+	// otherwise the terminal consumes Ctrl-D before the shell can read it.
+	let r = pty
+		.wait_raw(TIMEOUT)
+		.and_then(|()| keys(&mut pty, "\x04"))
+		.and_then(|()| pty.wait(TIMEOUT));
 	match r {
 		Ok(status) => assert_eq!(status.code(), Some(0)),
 		Err(e) => panic!("shell did not exit on ^D: {e}"),

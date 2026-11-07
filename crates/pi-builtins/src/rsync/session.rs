@@ -561,6 +561,7 @@ pub(crate) fn run(host: &mut Host, argv: Vec<OsString>) -> i32 {
 fn startup_logger(io: &HostIo, am_server: bool) -> Logger {
 	let cfg = LogConfig {
 		am_server,
+		ascii_output: iconv::locale_charset(&|key| io.getenv(key)) == iconv::ascii_codeset(),
 		human_readable: 1,
 		time_zone: Some(io.tz.clone()),
 		..LogConfig::default()
@@ -572,6 +573,7 @@ fn startup_logger(io: &HostIo, am_server: bool) -> Logger {
 fn log_config(io: &HostIo, opts: &Options, am_server: bool, local_server: bool) -> LogConfig {
 	LogConfig {
 		levels: opts.levels.clone(),
+		ascii_output: iconv::locale_charset(&|key| io.getenv(key)) == iconv::ascii_codeset(),
 		out_format: opts.stdout_format.clone(),
 		// An empty name means syslog (upstream log_init), not the directory.
 		log_file: opts.logfile_name.as_deref().map(|p| if p.is_empty() { PathBuf::new() } else { io.resolve(p) }),

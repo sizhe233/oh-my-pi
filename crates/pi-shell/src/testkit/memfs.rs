@@ -88,15 +88,16 @@ struct Faults {
 /// In-memory filesystem.
 #[derive(Clone)]
 pub struct MemFs {
-	nodes:     Arc<Mutex<BTreeMap<BString, Node>>>,
-	rng:       Arc<Mutex<Rng>>,
-	p_pending: f64,
-	max_ms:    u64,
-	faults:    Option<Faults>,
-	pending:   Arc<AtomicU64>,
-	temp_seq:  Arc<AtomicU64>,
+	nodes:              Arc<Mutex<BTreeMap<BString, Node>>>,
+	rng:                Arc<Mutex<Rng>>,
+	p_pending:          f64,
+	pending_first_poll: bool,
+	max_ms:             u64,
+	faults:             Option<Faults>,
+	pending:            Arc<AtomicU64>,
+	temp_seq:           Arc<AtomicU64>,
 	/// Paths with a [`Fs::lock`] held.
-	locks:     Arc<Mutex<std::collections::BTreeSet<BString>>>,
+	locks:              Arc<Mutex<std::collections::BTreeSet<BString>>>,
 }
 
 impl Default for MemFs {
@@ -123,12 +124,21 @@ impl MemFs {
 			nodes: Arc::new(Mutex::new(nodes)),
 			rng: Arc::new(Mutex::new(Rng::new(seed))),
 			p_pending,
+			pending_first_poll: false,
 			max_ms,
 			faults: None,
 			pending: Arc::new(AtomicU64::new(0)),
 			temp_seq: Arc::new(AtomicU64::new(0)),
 			locks: Arc::default(),
 		}
+	}
+
+	/// Force each delayed answer to yield once even when its timer has elapsed.
+	/// Use this when testing the engine's deferred-operation path independently
+	/// of scheduling.
+	pub const fn with_pending_first_poll(mut self) -> Self {
+		self.pending_first_poll = true;
+		self
 	}
 
 	/// Fail operations and writes with probability `p`, with a kind drawn
@@ -204,7 +214,7 @@ impl MemFs {
 			rng.below(self.max_ms + 1)
 		};
 		self.pending.fetch_add(1, Ordering::Relaxed);
-		FsPoll::Pending(Box::new(Delayed::start(res, delay)))
+		FsPoll::Pending(Box::new(Delayed::start(res, delay, self.pending_first_poll)))
 	}
 
 	/// The node at `path`, following symbolic links.
@@ -352,13 +362,14 @@ const fn trim(path: &[u8]) -> &[u8] {
 
 /// A `Pending` answer that becomes ready on a timer thread.
 struct Delayed<T> {
-	res:   Option<io::Result<T>>,
-	ready: Arc<AtomicBool>,
-	waker: Arc<Mutex<Option<Waker>>>,
+	pending_first_poll: bool,
+	res:                Option<io::Result<T>>,
+	ready:              Arc<AtomicBool>,
+	waker:              Arc<Mutex<Option<Waker>>>,
 }
 
 impl<T> Delayed<T> {
-	fn start(res: io::Result<T>, delay_ms: u64) -> Self {
+	fn start(res: io::Result<T>, delay_ms: u64, pending_first_poll: bool) -> Self {
 		let ready = Arc::new(AtomicBool::new(false));
 		let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
 		let (r, w) = (Arc::clone(&ready), Arc::clone(&waker));
@@ -370,12 +381,16 @@ impl<T> Delayed<T> {
 				waker.wake();
 			}
 		});
-		Self { res: Some(res), ready, waker }
+		Self { res: Some(res), ready, waker, pending_first_poll }
 	}
 }
 
 impl<T: Send> FsPending<T> for Delayed<T> {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+		if std::mem::take(&mut self.pending_first_poll) {
+			cx.waker().wake_by_ref();
+			return Poll::Pending;
+		}
 		if !self.ready.load(Ordering::Acquire) {
 			*self.waker.lock() = Some(cx.waker().clone());
 			if !self.ready.load(Ordering::Acquire) {
@@ -869,6 +884,26 @@ mod tests {
 				}
 			},
 		}
+	}
+
+	#[test]
+	fn forced_pending_poll_yields_and_wakes_even_after_the_timer_is_ready() {
+		struct CountWake(AtomicU64);
+		impl Wake for CountWake {
+			fn wake(self: Arc<Self>) {
+				self.0.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+		let wakes = Arc::new(CountWake(AtomicU64::new(0)));
+		let waker = Waker::from(Arc::clone(&wakes));
+		let mut cx = Context::from_waker(&waker);
+		let mut delayed = Delayed::start(Ok(7), 0, true);
+		// Model a timer that completed before the engine's first poll, without
+		// sleeping.
+		delayed.ready.store(true, Ordering::Release);
+		assert!(delayed.poll(&mut cx).is_pending());
+		assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+		assert!(matches!(delayed.poll(&mut cx), Poll::Ready(Ok(7))));
 	}
 
 	#[test]

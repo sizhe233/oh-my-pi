@@ -728,6 +728,8 @@ exit 64
 		if (!zshPath) {
 			return;
 		}
+		// A fresh HOME otherwise enters zsh-newuser-install before our command's prompt.
+		await Bun.write(path.join(tempDir, ".zshrc"), "# Test user's startup file.\n");
 		cfgShellPath.set(Settings.instance, zshPath);
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: zshPath,

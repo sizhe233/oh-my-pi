@@ -267,14 +267,17 @@ fn apply(w: &Path, tweak: &str) {
 			write_file(&j("dst/big-1.bin"), &big, 0o644, OLD, 0);
 		}
 		// A destination symlink to a directory inside the destination (`-K`).
-		"keepdir" => {
+		"keepdir" | "keepdir_chmod" => {
 			fs::create_dir_all(j("dst/realsub")).unwrap();
+			// Pin the intended scenario independently of the runner's umask.
+			chmod(&j("dst/realsub"), if tweak == "keepdir_chmod" { 0o700 } else { 0o755 });
 			symlink("realsub", j("dst/sub")).unwrap();
 			set_time(&j("dst/sub"), OLD, 0);
 		}
 		// A destination symlink to a directory outside the destination.
 		"keepdir_out" => {
 			fs::create_dir_all(j("elsewhere")).unwrap();
+			chmod(&j("elsewhere"), 0o755);
 			fs::create_dir_all(j("dst")).unwrap();
 			symlink("../elsewhere", j("dst/sub")).unwrap();
 			set_time(&j("dst/sub"), OLD, 0);

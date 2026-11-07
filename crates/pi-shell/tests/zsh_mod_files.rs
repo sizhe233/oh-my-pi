@@ -16,7 +16,10 @@ use crate::obash_support::{command, obash, output};
 /// directory: stdout, stderr, status.
 fn run_in_tempdir(mut shell: Command, script: &str) -> (String, String, i32) {
 	let dir = tempfile::tempdir().unwrap();
-	let out = output(shell.current_dir(dir.path()).args(["-f", "-c", script]));
+	// The expected mode bytes below describe a 022 creation mask, independent
+	// of the test runner's inherited mask. Only the child shell changes it.
+	let script = format!("umask 022; {script}");
+	let out = output(shell.current_dir(dir.path()).args(["-f", "-c", &script]));
 	(
 		String::from_utf8_lossy(&out.stdout).into_owned(),
 		String::from_utf8_lossy(&out.stderr).into_owned(),
