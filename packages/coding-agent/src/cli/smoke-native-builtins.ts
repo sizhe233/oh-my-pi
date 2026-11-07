@@ -61,7 +61,7 @@ function expectExit(result: ProbeResult, expected: number, label: string): void 
 	}
 }
 
-/** Force the native builtin so a system chmod cannot mask a broken bundled implementation. */
+/** Empty PATH in the owned fixture prevents a system utility from masking the native tool. */
 export async function smokeTestNativeChmod(): Promise<boolean> {
 	if (process.platform === "win32") return false;
 	return withShellFixture("chmod", async (shell, dir) => {
@@ -74,7 +74,7 @@ export async function smokeTestNativeChmod(): Promise<boolean> {
 			}
 		};
 		const chmod = async (args: string, expectedExit: number) => {
-			const result = await run(shell, dir, "chmod", `builtin chmod ${args}`);
+			const result = await run(shell, dir, "chmod", `PATH= chmod ${args}`);
 			expectExit(result, expectedExit, "chmod");
 			if (expectedExit !== 0 && !result.output.includes("--no-dereference is not supported")) {
 				throw new Error("native chmod smoke: missing unsupported-option diagnostic");
@@ -143,7 +143,7 @@ export async function smokeTestNativeDd(): Promise<void> {
 				["input open", `if=missing of=unopened ${operand} status=none`],
 			]) {
 				const label = `dd ${operand}, ${boundary}`;
-				const result = await run(shell, cwd, label, `builtin dd ${args}`);
+				const result = await run(shell, cwd, label, `PATH= dd ${args}`);
 				expectExit(result, 1, label);
 				if (!result.output.includes(`${kind} flag: '${flag}'`)) {
 					throw new Error(`native builtin smoke (${label}): missing unsupported-flag diagnostic`);
@@ -169,7 +169,7 @@ export async function smokeTestNativeDd(): Promise<void> {
 			],
 			["append", "if=input of=copy bs=2 count=1 oflag=append conv=notrunc status=none", "CD12aB"],
 		]) {
-			const result = await run(shell, cwd, `dd ${label}`, `builtin dd ${args}`);
+			const result = await run(shell, cwd, `dd ${label}`, `PATH= dd ${args}`);
 			expectExit(result, 0, `dd ${label}`);
 			if (result.output !== "" || (await Bun.file(path.join(cwd, "copy")).text()) !== expected) {
 				throw new Error(`native dd smoke: supported ${label} behavior changed`);
@@ -180,9 +180,9 @@ export async function smokeTestNativeDd(): Promise<void> {
 
 export async function smokeTestEnvBuiltinDisabled(): Promise<void> {
 	await withShellFixture("env-boundary", async (shell, dir) => {
-		const result = await run(shell, dir, "env builtin registration", "builtin env -i OMP_ENV_ONLY=1");
-		expectExit(result, 1, "env builtin registration");
-		if (!result.output.includes("not a shell builtin: env")) {
+		const result = await run(shell, dir, "env builtin registration", "PATH= env -i OMP_ENV_ONLY=1");
+		expectExit(result, 127, "env builtin registration");
+		if (!result.output.includes("env: command not found")) {
 			throw new Error("native env smoke: expected the native builtin to be unregistered");
 		}
 	});

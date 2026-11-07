@@ -1,16 +1,33 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Shell } from "../native";
 
 describe("embedded shell env policy across the native boundary", () => {
 	it("keeps env external even when shell code enables builtins", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-env-policy-"));
 		const shell = new Shell();
 		try {
-			const result = await shell.run({ command: "enable env; builtin env -i", timeoutMs: 5000 });
-			expect(result.exitCode).not.toBe(0);
+			let output = "";
+			const result = await shell.run(
+				{ command: "enable env; PATH= env -i OMP_ENV_ONLY=1", cwd, timeoutMs: 5000 },
+				(error, chunk) => {
+					if (error) throw error;
+					output += chunk;
+				},
+			);
+			expect(result.exitCode).toBe(127);
+			expect(output).toContain("env: command not found");
+			expect(output).not.toContain("OMP_ENV_ONLY=1");
 			expect(result.cancelled).toBe(false);
 			expect(result.timedOut).toBe(false);
 		} finally {
-			await shell.abort();
+			try {
+				await shell.abort();
+			} finally {
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
 		}
 	});
 
