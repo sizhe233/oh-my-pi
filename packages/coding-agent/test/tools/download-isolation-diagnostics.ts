@@ -49,7 +49,10 @@ function location(file: string, directories: OwnedDirectories): DownloadLocation
 	const resolved = path.resolve(file);
 	for (const label of ["first", "second"] as const) {
 		const relative = path.relative(directories[label], resolved);
-		if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))) {
+		if (
+			relative === "" ||
+			(!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+		) {
 			return { directory: label, basename: safeName(path.basename(resolved)) };
 		}
 	}
@@ -91,9 +94,8 @@ async function snapshotEntry(directory: string, name: string, signal: AbortSigna
 			bytesRead: read.bytesRead,
 			stableSizeAndMtime: stableSize,
 			hashScope: complete ? "observed-full-file" : "first-up-to-128-bytes",
-			sha256: Array.from(
-				new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(prefix))),
-				byte => byte.toString(16).padStart(2, "0"),
+			sha256: Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(prefix))), byte =>
+				byte.toString(16).padStart(2, "0"),
 			).join(""),
 			...(knownFixture ? { fixtureText: text } : {}),
 		};
@@ -105,7 +107,8 @@ async function snapshotEntry(directory: string, name: string, signal: AbortSigna
 async function snapshotDirectory(label: DirectoryLabel, directory: string, signal: AbortSignal) {
 	signal.throwIfAborted();
 	const stat = await fs.promises.lstat(directory);
-	if (!stat.isDirectory() || stat.isSymbolicLink()) return { directory: label, observation: "owned-directory-changed" };
+	if (!stat.isDirectory() || stat.isSymbolicLink())
+		return { directory: label, observation: "owned-directory-changed" };
 	signal.throwIfAborted();
 	const handle = await fs.promises.opendir(directory, { bufferSize: 1 });
 	const entries: unknown[] = [];

@@ -416,6 +416,13 @@ function sanitizeToolName(name: string): string | null {
 	return candidate.length > 0 ? candidate : null;
 }
 
+/** A call the agent loop skipped carries a synthetic `executed: false` result: it never ran, so it is no tool error. */
+function isToolExecutionError(message: { isError?: unknown; details?: unknown }): boolean {
+	if (message.isError !== true) return false;
+	const details = message.details as { __synthetic?: unknown; executed?: unknown } | null | undefined;
+	return !(details?.__synthetic === true && details.executed === false);
+}
+
 /**
  * Build the result linkage for a `toolResult` entry: text characters fed back
  * into context plus the error flag, keyed to the originating call.
@@ -435,7 +442,7 @@ function extractToolResultLink(sessionFile: string, entry: SessionMessageEntry):
 		sessionFile,
 		toolCallId: msg.toolCallId,
 		resultChars,
-		isError: msg.isError === true,
+		isError: isToolExecutionError(msg),
 	};
 }
 
@@ -553,6 +560,8 @@ export async function parseSessionFile(
 	const userLinks: UserMessageLink[] = [];
 	const toolCalls: ToolCallStats[] = [];
 	const toolResults: ToolResultLink[] = [];
+	// First call per id: the row `INSERT OR IGNORE` keeps, so it can be written with its result.
+	const callsById = new Map<string, ToolCallStats>();
 
 	// Reduce each entry immediately so full replays do not retain tool-output/message bodies.
 	const visit = (entry: SessionEntry): void => {
@@ -567,7 +576,13 @@ export async function parseSessionFile(
 		}
 		if (isToolResultMessage(entry)) {
 			const link = extractToolResultLink(sessionPath, entry);
-			if (link) toolResults.push(link);
+			if (!link) return;
+			toolResults.push(link);
+			const call = callsById.get(link.toolCallId);
+			if (call && call.resultChars === undefined) {
+				call.resultChars = link.resultChars;
+				call.isError = link.isError;
+			}
 			return;
 		}
 		if (isModelUsage(entry)) {
@@ -578,7 +593,10 @@ export async function parseSessionFile(
 		if (isAssistantMessage(entry)) {
 			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier, agentType);
 			if (msgStats) stats.push(msgStats);
-			toolCalls.push(...extractToolCalls(sessionPath, folder, entry, agentType));
+			for (const call of extractToolCalls(sessionPath, folder, entry, agentType)) {
+				toolCalls.push(call);
+				if (!callsById.has(call.toolCallId)) callsById.set(call.toolCallId, call);
+			}
 			// Persist links even when the user entry was ingested in an earlier tail read.
 			const parentId = entry.parentId;
 			const msg = entry.message;
@@ -672,12 +690,33 @@ export async function listSessionFolders(): Promise<string[]> {
 }
 
 /**
- * List all session files in a folder.
+ * Name prefix of the scratch directories `omp gc --compress` creates beside
+ * the files it copies on APFS. Their `.jsonl` files are transient copies of
+ * transcripts, never transcripts of their own; a killed run can leave one
+ * behind until the next `omp gc --compress --apply` removes it.
+ */
+export const COMPRESS_SCRATCH_PREFIX = ".omp-gc-compress-";
+
+/** Whether `relativePath` (from any ancestor directory) lies inside a compress scratch directory. */
+export function isCompressScratchPath(relativePath: string): boolean {
+	return relativePath.split(/[\\/]/).some(part => part.startsWith(COMPRESS_SCRATCH_PREFIX));
+}
+
+/**
+ * List all session files in a folder, excluding copies inside
+ * `omp gc --compress` scratch directories.
  */
 export async function listSessionFiles(folderPath: string): Promise<string[]> {
 	try {
 		const entries = await fs.readdir(folderPath, { recursive: true, withFileTypes: true });
-		return entries.filter(e => e.isFile() && e.name.endsWith(".jsonl")).map(e => path.join(e.parentPath, e.name));
+		return entries
+			.filter(
+				e =>
+					e.isFile() &&
+					e.name.endsWith(".jsonl") &&
+					!isCompressScratchPath(path.relative(folderPath, e.parentPath)),
+			)
+			.map(e => path.join(e.parentPath, e.name));
 	} catch {
 		return [];
 	}

@@ -120,6 +120,9 @@ function newSession(
 			? ({
 					emitBeforeAgentStart: async () => ({ systemPrompt: options.beforeAgentStartSystemPrompt }),
 					emit: async () => undefined,
+					getSessionApprovalEpoch: () => 0,
+					clearSessionApprovals: () => {},
+					invalidatePendingApprovals: () => {},
 				} as unknown as ExtensionRunner)
 			: undefined,
 		rebuildSystemPrompt: async toolNames => ({
