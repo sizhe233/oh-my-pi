@@ -700,5 +700,296 @@ class SyncFixture(unittest.TestCase):
         self.assert_no_push()
 
 
-if __name__ == "__main__":
+class OverlayTests(SyncFixture):
+    def build_overlay(self):
+        manifest = {'manifest_version': 3, 'version': '1.0.0', 'permissions': ['debugger', 'tabs']}
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.write(self.work, path, json.dumps(manifest))
+        self.base = self.commit(self.work, 'trusted original permissions')
+        self.write(self.work, 'packages/example.txt', 'upstream clean merge\n')
+        self.write(self.work, 'packages/delete.txt', 'unwanted code\n')
+        expanded = dict(manifest, permissions=['debugger', 'tabs', 'scripting'], host_permissions=['<all_urls>'])
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.write(self.work, path, json.dumps(expanded))
+        merged = self.commit(self.work, 'unpublished intermediate input')
+        desired = {path: json.dumps(manifest) for path in SYNC.EXTENSION_MANIFESTS}
+        desired.update({'packages/example.txt': 'reviewed repair\n', 'packages/delete.txt': None,
+                        'packages/new/subfile.txt': 'reviewed new source\n',
+                        'docs/tools/browser.md': 'restricted relay download documentation\n',
+                        'docs/tools/ask.md': 'restricted inline form media documentation\n'})
+        entries = []
+        for path, content in desired.items():
+            original = SYNC.tree_file(merged, path)
+            entries.append({'path': path, 'mergedBlob': original[1] if original else None,
+                            'content': content, 'resolvedSha256': hashlib.sha256(content.encode()).hexdigest() if content is not None else None})
+            if content is None:
+                (self.work / path).unlink()
+            else:
+                self.write(self.work, path, content)
+        self.run_git(self.work, 'add', '--all')
+        final = self.run_git(self.work, 'write-tree').stdout.strip()
+        self.run_git(self.work, 'reset', '--hard', merged)
+        self.data = {'schemaVersion': 1, 'releaseTag': 'v1.1.0', 'upstreamSha': self.upstream_sha,
+                     'mergeBaseSha': self.base, 'mergedProductSha256': SYNC.product_digest(merged),
+                     'finalProductSha256': SYNC.product_digest(final), 'entries': entries}
+        self.final = final
+        self.merged = merged
+        self.trusted_base = self.base
+        self.save_review()
+
+    def save_review(self):
+        # Add reviewed data on the trusted base, without publishing or executing product files.
+        self.run_git(self.work, 'reset', '--hard', self.trusted_base)
+        self.write(self.work, f'{SYNC.OVERLAYS}/v1.1.0.json', json.dumps(self.data))
+        self.base = self.commit(self.work, 'reviewed data only')
+        self.run_git(self.work, 'reset', '--hard', self.merged)
+
+    def apply(self):
+        return SYNC.apply_product_overlay(self.base, self.upstream_sha, self.trusted_base, 'v1.1.0')
+
+    def reject(self):
+        before = self.run_git(self.work, 'write-tree').stdout
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.apply()
+        self.assertEqual(self.run_git(self.work, 'write-tree').stdout, before)
+
+    def test_overlay_atomic_safe_result(self):
+        self.build_overlay()
+        result = self.apply()
+        self.assertEqual(self.run_git(self.work, 'write-tree').stdout.strip(), self.final)
+        self.assertEqual(result['finalProductSha256'], self.data['finalProductSha256'])
+        self.assertEqual((self.work / 'packages/example.txt').read_text(), 'upstream clean merge\n')
+        self.assertFalse((self.work / 'packages/new/subfile.txt').exists())
+        self.assertFalse(any(call[0][0] == 'push' for call in self.calls))
+
+    def test_overlay_rejects_wrong_input_without_index_changes(self):
+        self.build_overlay(); self.data['entries'][-1]['mergedBlob'] = 'a' * 40; self.save_review(); self.reject()
+
+    def test_overlay_rejects_wrong_output_without_index_changes(self):
+        self.build_overlay(); self.data['finalProductSha256'] = '0' * 64; self.save_review(); self.reject()
+
+    def test_overlay_rejects_wrong_release(self):
+        self.build_overlay(); self.data['upstreamSha'] = 'a' * 40; self.save_review(); self.reject()
+
+    def test_overlay_rejects_wrong_content_digest(self):
+        self.build_overlay(); self.data['entries'][-1]['resolvedSha256'] = '0' * 64; self.save_review(); self.reject()
+
+    def test_overlay_rejects_duplicate_path(self):
+        self.build_overlay(); self.data['entries'].append(self.data['entries'][0]); self.save_review(); self.reject()
+
+    def test_overlay_rejects_workflow_and_importer_paths(self):
+        self.build_overlay()
+        for path in ['.github/workflows/test.yml', 'scripts/fork-sync-upstream.py', 'scripts/test_fork_sync_upstream.py', 'packages/../escape', 'docs/other.md', 'docs/tools/browser.md/child', 'docs/tools/browserXmd', 'docs/tools/ask.md/child', 'docs/tools/askXmd', 'docs/tools/ask-extra.md']:
+            with self.subTest(path=path):
+                self.data['entries'][-1]['path'] = path; self.save_review(); self.reject()
+
+    def test_overlay_rejects_executable_input(self):
+        self.build_overlay()
+        self.run_git(self.work, 'update-index', '--chmod=+x', 'packages/example.txt')
+        self.data['mergedProductSha256'] = SYNC.product_digest(self.run_git(self.work, 'write-tree').stdout.strip())
+        # Save adjusted trusted data without replacing the hostile index fixture.
+        tree = self.run_git(self.work, 'write-tree').stdout.strip(); self.save_review(); self.run_git(self.work, 'read-tree', tree)
+        self.reject()
+
+    def test_overlay_rejects_symlink_ancestor(self):
+        self.build_overlay()
+        symlink_blob = self.run_git(self.work, 'rev-parse', 'HEAD:packages/example.txt').stdout.strip()
+        self.run_git(self.work, 'update-index', '--add', '--cacheinfo', '120000', symlink_blob, 'packages/new')
+        tree = self.run_git(self.work, 'write-tree').stdout.strip(); self.data['mergedProductSha256'] = SYNC.product_digest(tree)
+        self.save_review(); self.run_git(self.work, 'read-tree', tree); self.reject()
+
+    def test_overlay_rejects_permission_growth_without_overlay(self):
+        self.build_overlay()
+        with self.assertRaisesRegex(RuntimeError, 'manifest fields changed'):
+            SYNC.apply_product_overlay(self.trusted_base, self.upstream_sha, self.trusted_base, 'v1.1.0')
+
+    def test_overlay_rejects_permission_growth_even_with_matching_digest(self):
+        self.build_overlay()
+        for entry in self.data['entries'][:2]:
+            value = json.loads(entry['content']); value['optional_host_permissions'] = ['<all_urls>']; entry['content'] = json.dumps(value); entry['resolvedSha256'] = hashlib.sha256(entry['content'].encode()).hexdigest()
+        self.run_git(self.work, 'read-tree', self.final)
+        for entry in self.data['entries'][:2]:
+            self.write(self.work, entry['path'], entry['content'])
+            blob = self.run_git(self.work, 'hash-object', '-w', '--no-filters', entry['path']).stdout.strip()
+            self.run_git(self.work, 'update-index', '--add', '--cacheinfo', '100644', blob, entry['path'])
+        self.data['finalProductSha256'] = SYNC.product_digest(self.run_git(self.work, 'write-tree').stdout.strip())
+        self.save_review()
+        before = self.run_git(self.work, 'write-tree').stdout
+        with self.assertRaisesRegex(RuntimeError, 'manifest fields changed'):
+            self.apply()
+        self.assertEqual(self.run_git(self.work, 'write-tree').stdout, before)
+
+
+
+    def test_overlay_complete_prepare_merge_commits_safe_index(self):
+        manifest = json.dumps({'manifest_version': 3, 'permissions': ['tabs']})
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.write(self.work, path, manifest)
+        common = self.commit(self.work, 'common manifests')
+        self.run_git(self.work, 'checkout', '-b', 'overlay-upstream')
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.write(self.work, path, json.dumps({'manifest_version': 3, 'permissions': ['tabs', 'scripting']}))
+        upstream = self.commit(self.work, 'expanded upstream')
+        self.run_git(self.work, 'checkout', '-b', 'overlay-fork', common)
+        self.write(self.work, 'packages/fork.txt', 'fork content')
+        base = self.commit(self.work, 'fork content')
+        self.run_git(self.work, 'merge', '--no-commit', '--no-ff', upstream)
+        raw = self.run_git(self.work, 'write-tree').stdout.strip()
+        entries = []
+        for path in SYNC.EXTENSION_MANIFESTS:
+            entries.append(dict(path=path, mergedBlob=SYNC.tree_file(raw, path)[1], content=manifest,
+                                resolvedSha256=hashlib.sha256(manifest.encode()).hexdigest()))
+            self.write(self.work, path, manifest)
+            self.run_git(self.work, 'add', path)
+        final = self.run_git(self.work, 'write-tree').stdout.strip()
+        self.run_git(self.work, 'merge', '--abort')
+        review = dict(schemaVersion=1, releaseTag='v1.1.0', upstreamSha=upstream, mergeBaseSha=common,
+                      mergedProductSha256=SYNC.product_digest(raw), finalProductSha256=SYNC.product_digest(final), entries=entries)
+        self.write(self.work, '.github/upstream-overlays/v1.1.0.json', json.dumps(review))
+        base = self.commit(self.work, 'trusted review')
+        candidate = SYNC.prepare_merge(base, upstream, self.release, f'sync/upstream-v1.1.0-{base}')
+        self.assertEqual(SYNC.product_digest(candidate), SYNC.product_digest(final))
+        self.assertEqual(self.run_git(self.work, 'show', '-s', '--format=%P', candidate).stdout.strip().split(), [base, upstream])
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.assertEqual(self.run_git(self.work, 'show', f'{candidate}:{path}').stdout, manifest)
+        self.assertFalse(any(args[0] == 'push' for args, _ in self.calls))
+
+
+    def main_overlay_fixture(self):
+        self.safe_manifest = json.dumps({'manifest_version': 3, 'permissions': ['tabs']})
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.write(self.work, path, self.safe_manifest)
+        common = self.commit(self.work, 'overlay common')
+        self.run_git(self.work, 'checkout', '-b', 'overlay-release')
+        for path in SYNC.EXTENSION_MANIFESTS:
+            self.write(self.work, path, json.dumps({'manifest_version': 3, 'permissions': ['tabs', 'scripting']}))
+        self.write(self.work, 'packages/browser-relay/extension/foreign-frames.ts', 'unwanted injection code')
+        self.write(self.work, 'packages/coding-agent/package.json', '{"version":"1.1.0"}\n')
+        self.upstream_sha = self.commit(self.work, 'new upstream permissions')
+        self.run_git(self.work, 'push', str(self.upstream), 'HEAD:refs/heads/fixture-release')
+        self.run_git(self.upstream, 'tag', '-fa', 'v1.1.0', self.upstream_sha, '-m', 'fixture release')
+        self.tag_sha = self.run_git(self.upstream, 'rev-parse', 'v1.1.0').stdout.strip()
+        self.run_git(self.work, 'checkout', 'main')
+        self.write(self.work, 'packages/fork.txt', 'reviewed fork')
+        self.commit(self.work, 'fork divergence')
+        self.run_git(self.work, 'merge', '--no-commit', '--no-ff', self.upstream_sha)
+        raw = self.run_git(self.work, 'write-tree').stdout.strip()
+        entries = []
+        for path in SYNC.EXTENSION_MANIFESTS:
+            entries.append(dict(path=path, mergedBlob=SYNC.tree_file(raw, path)[1], content=self.safe_manifest,
+                                resolvedSha256=hashlib.sha256(self.safe_manifest.encode()).hexdigest()))
+            self.write(self.work, path, self.safe_manifest)
+            self.run_git(self.work, 'add', path)
+        path = 'packages/browser-relay/extension/foreign-frames.ts'
+        entries.append(dict(path=path, mergedBlob=SYNC.tree_file(raw, path)[1], content=None, resolvedSha256=None))
+        self.run_git(self.work, 'rm', '-f', path)
+        final = self.run_git(self.work, 'write-tree').stdout.strip()
+        self.run_git(self.work, 'merge', '--abort')
+        self.overlay_review = dict(schemaVersion=1, releaseTag='v1.1.0', upstreamSha=self.upstream_sha,
+            mergeBaseSha=common, mergedProductSha256=SYNC.product_digest(raw),
+            finalProductSha256=SYNC.product_digest(final), entries=entries)
+        self.write(self.work, '.github/upstream-overlays/v1.1.0.json', json.dumps(self.overlay_review))
+        self.publish_fixture_main()
+        self.calls.clear()
+
+    def assert_safe_overlay_candidate(self, candidate):
+        self.assertEqual(SYNC.product_digest(candidate), self.overlay_review['finalProductSha256'])
+        SYNC.check_extension_boundary(self.base, candidate)
+        self.assertIsNone(SYNC.tree_file(candidate, 'packages/browser-relay/extension/foreign-frames.ts'))
+        self.assertEqual(self.run_git(self.work, 'show', '-s', '--format=%P', candidate).stdout.strip().split(),
+                         [self.base, self.upstream_sha])
+
+    def test_overlay_main_publish_and_manual_schedule_reuse(self):
+        self.main_overlay_fixture()
+        first = self.invoke()
+        self.assert_safe_overlay_candidate(first['candidate_sha'])
+        self.assertEqual(len([args for args, _ in self.calls if args[0] == 'push']), 1)
+        for event, changed in [('workflow_dispatch', 'true'), ('schedule', 'false')]:
+            self.checkout()
+            self.calls.clear()
+            os.environ['GITHUB_EVENT_NAME'] = event
+            result = self.invoke()
+            self.assertEqual(result['candidate_sha'], first['candidate_sha'])
+            self.assertEqual(result['changed'], changed)
+            self.assertFalse(any(args[0] == 'push' for args, _ in self.calls))
+            self.assert_safe_overlay_candidate(result['candidate_sha'])
+
+    def test_overlay_main_rejects_forged_product_reuse(self):
+        self.main_overlay_fixture()
+        first = self.invoke()
+        # Fresh checkout of the safe candidate: never stage the raw import worktree.
+        self.run_git(self.work, 'reset', '--hard', first['candidate_sha'])
+        self.write(self.work, 'packages/fork.txt', 'forged repair')
+        self.run_git(self.work, 'add', 'packages/fork.txt')
+        self.run_git(self.work, 'commit', '--amend', '--no-edit')
+        forged = self.run_git(self.work, 'rev-parse', 'HEAD').stdout.strip()
+        self.run_git(self.work, 'push', str(self.remote), f'{forged}:refs/fixture/overlay-forged')
+        self.run_git(self.remote, 'update-ref', 'refs/heads/' + first['sync_branch'], forged)
+        self.checkout()
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, 'reproducible merge tree'):
+            self.invoke()
+        self.assertFalse(any(args[0] == 'push' for args, _ in self.calls))
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', first['sync_branch']).stdout.strip(), forged)
+
+    def test_overlay_main_rejects_expanded_manifest_reuse(self):
+        self.main_overlay_fixture()
+        first = self.invoke()
+        self.run_git(self.work, 'reset', '--hard', first['candidate_sha'])
+        self.write(self.work, SYNC.EXTENSION_MANIFESTS[0], '{"manifest_version":3,"permissions":["tabs","scripting"]}')
+        self.run_git(self.work, 'add', SYNC.EXTENSION_MANIFESTS[0])
+        self.run_git(self.work, 'commit', '--amend', '--no-edit')
+        forged = self.run_git(self.work, 'rev-parse', 'HEAD').stdout.strip()
+        self.run_git(self.work, 'push', str(self.remote), f'{forged}:refs/fixture/overlay-permissions')
+        self.run_git(self.remote, 'update-ref', 'refs/heads/' + first['sync_branch'], forged)
+        self.checkout()
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, 'manifest fields changed'):
+            self.invoke()
+        self.assertFalse(any(args[0] == 'push' or 'commit' in args for args, _ in self.calls))
+
+    def test_overlay_main_push_failure_never_emits_candidate_or_retries(self):
+        self.main_overlay_fixture()
+        attempted = []
+        def reject(*args, check=True, env=None):
+            if args[0] == 'push':
+                attempted.append(args)
+                self.assert_safe_overlay_candidate(args[2].split(':', 1)[0])
+                return subprocess.CompletedProcess(args, 1, '', 'fixture protection rejected push')
+            return self.route_git(*args, check=check, env=env)
+        stream = io.StringIO()
+        with patch.object(SYNC, 'git', side_effect=reject), redirect_stdout(stream):
+            with self.assertRaisesRegex(RuntimeError, 'Non-forced sync-branch push failed'):
+                SYNC.main()
+        self.assertEqual(len(attempted), 1)
+        self.assertNotIn('--force', attempted[0])
+        self.assertNotIn('candidate_sha=', stream.getvalue())
+        self.assertNotIn('changed=true', stream.getvalue())
+        self.assert_no_push()
+        self.assert_safe_overlay_candidate(self.run_git(self.work, 'rev-parse', 'HEAD').stdout.strip())
+
+    def test_overlay_main_invalid_output_aborts_before_commit_or_push(self):
+        self.main_overlay_fixture()
+        self.overlay_review['finalProductSha256'] = '0' * 64
+        self.write(self.work, '.github/upstream-overlays/v1.1.0.json', json.dumps(self.overlay_review))
+        self.publish_fixture_main()
+        self.calls.clear()
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            with self.assertRaisesRegex(RuntimeError, 'complete output product mismatch'):
+                SYNC.main()
+        self.assert_no_push()
+        self.assertFalse(any('commit' in args for args, _ in self.calls))
+        self.assertEqual(self.run_git(self.work, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.assertEqual(self.run_git(self.work, 'status', '--porcelain').stdout, '')
+        self.assertNotIn('candidate_sha=', stream.getvalue())
+        self.assertNotIn('changed=true', stream.getvalue())
+
+
+def load_tests(loader, tests, pattern):
+    suite = loader.loadTestsFromTestCase(SyncFixture)
+    suite.addTests(OverlayTests(name) for name in sorted(OverlayTests.__dict__) if name.startswith('test_overlay_'))
+    return suite
+
+if __name__ == '__main__':
     unittest.main(verbosity=2)

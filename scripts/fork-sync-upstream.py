@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 UPSTREAM = "can1357/oh-my-pi"
@@ -222,6 +223,112 @@ def apply_resolutions(review: dict | None, conflicts: list[str]) -> list[str]:
     return sorted(conflicts)
 
 
+OVERLAYS = ".github/upstream-overlays"
+EXTENSION_MANIFESTS = (
+    "packages/browser-relay/extension/manifest.json",
+    "packages/coding-agent/src/tools/browser/relay/extension-assets/manifest.json.txt",
+)
+
+
+def product_digest(tree: str) -> str:
+    rows = git("ls-tree", "-r", "-z", tree).stdout.split("\0")
+    product = [row for row in rows if row and not row.split("\t", 1)[1].startswith(".github/")]
+    return hashlib.sha256(("\0".join(product) + "\0").encode()).hexdigest()
+
+
+def check_extension_boundary(base: str, candidate: str) -> None:
+    # Only version stamps may differ. Unknown/new manifest fields fail closed too.
+    for path in EXTENSION_MANIFESTS:
+        before, after = tree_file(base, path), tree_file(candidate, path)
+        if before is None and after is None:
+            continue
+        if before is None or after is None:
+            raise RuntimeError(f"Extension manifest presence changed: {path}")
+        manifests = []
+        for entry in (before, after):
+            value = json.loads(git("cat-file", "blob", entry[1]).stdout)
+            if not isinstance(value, dict):
+                raise RuntimeError("Invalid extension manifest")
+            for key in ("version", "version_name"):
+                value.pop(key, None)
+            manifests.append(value)
+        if manifests[0] != manifests[1]:
+            raise RuntimeError(f"Extension authority or manifest fields changed: {path}")
+
+
+def apply_product_overlay(base: str, upstream: str, merge_base: str, tag: str) -> dict | None:
+    source = tree_file(base, f"{OVERLAYS}/{tag}.json")
+    merged = git("write-tree").stdout.strip()
+    if source is None:
+        check_extension_boundary(base, merged)
+        return None
+    data = json.loads(git("cat-file", "blob", source[1]).stdout)
+    required = {"schemaVersion", "releaseTag", "upstreamSha", "mergeBaseSha", "mergedProductSha256", "finalProductSha256", "entries"}
+    if (not isinstance(data, dict) or set(data) != required
+            or type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1
+            or (data["releaseTag"], data["upstreamSha"], data["mergeBaseSha"]) != (tag, upstream, merge_base)):
+        raise ValueError("Invalid reviewed product overlay identity")
+    for key in ("mergedProductSha256", "finalProductSha256"):
+        if not isinstance(data[key], str) or not SHA256_PATTERN.fullmatch(data[key]):
+            raise ValueError("Invalid reviewed product digest")
+    if product_digest(merged) != data["mergedProductSha256"]:
+        raise RuntimeError("Reviewed overlay complete input product mismatch")
+    entries = data["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Empty reviewed product overlay")
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "mergedBlob", "content", "resolvedSha256"}:
+            raise ValueError("Invalid reviewed product overlay entry")
+        path = entry["path"]
+        if (not isinstance(path, str) or not re.fullmatch(r"(?:package\.json|docs/tools/(?:browser|ask)\.md|(?:packages|crates|scripts)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)", path)
+                or any(part in (".", "..") or part.lower() == ".git" for part in path.split("/"))
+                or (path.startswith("scripts/") and path not in ("scripts/fork-browser-minimized-e2e.ts", "scripts/fork-browser-relay-e2e.ts", "scripts/run-rs-task.ts")) or path in seen):
+            raise ValueError("Unsafe or duplicate reviewed overlay path")
+        seen.add(path)
+        blob = entry["mergedBlob"]
+        if blob is not None and (not isinstance(blob, str) or not SHA_PATTERN.fullmatch(blob)):
+            raise ValueError("Invalid overlay input blob")
+        expected = None if blob is None else ("100644", blob)
+        if tree_file(merged, path) != expected:
+            raise RuntimeError(f"Overlay input mismatch: {path}")
+        # No checkout writes: reject symlink/gitlink/non-directory ancestors in the Git tree.
+        for parent in Path(path).parents:
+            if str(parent) == ".":
+                continue
+            record = git("ls-tree", "-z", merged, "--", f":(literal){parent.as_posix()}").stdout
+            if record and not record.startswith("040000 tree "):
+                raise RuntimeError(f"Unsafe overlay ancestor: {parent}")
+        if entry["content"] is None:
+            if blob is None or entry["resolvedSha256"] is not None:
+                raise ValueError("Invalid reviewed overlay deletion")
+        else:
+            check_reviewed_content(entry)
+    # Build entirely in a private index. Failure leaves the real index untouched.
+    with tempfile.TemporaryDirectory(prefix="fork-reviewed-overlay-") as directory:
+        environment = dict(os.environ, GIT_INDEX_FILE=str(Path(directory) / "index"))
+        git("read-tree", merged, env=environment)
+        for number, entry in enumerate(entries):
+            if entry["content"] is None:
+                git("update-index", "--force-remove", "--", entry["path"], env=environment)
+            else:
+                file = Path(directory) / str(number)
+                file.write_bytes(entry["content"].encode("utf-8"))
+                blob = git("hash-object", "-w", "--no-filters", "--", str(file)).stdout.strip()
+                git("update-index", "--add", "--cacheinfo", "100644", blob, entry["path"], env=environment)
+        final = git("write-tree", env=environment).stdout.strip()
+        if product_digest(final) != data["finalProductSha256"]:
+            raise RuntimeError("Reviewed overlay complete output product mismatch")
+        if git("diff", "--name-only", merged, final, "--", ".github").stdout.strip():
+            raise RuntimeError("Reviewed overlay changed trusted metadata")
+        check_extension_boundary(base, final)
+        # Only now replace the real index. No intermediate candidate is committed or pushed.
+        git("read-tree", final)
+    return {"path": f"{OVERLAYS}/{tag}.json", "blob": source[1],
+            "mergedProductSha256": data["mergedProductSha256"], "finalProductSha256": data["finalProductSha256"],
+            "paths": sorted(seen)}
+
+
 def prepare_merge(base: str, upstream_sha: str, release: dict, branch: str) -> str:
     tag = release["tag_name"]
     merge_base = git("merge-base", base, upstream_sha).stdout.strip()
@@ -241,6 +348,11 @@ def prepare_merge(base: str, upstream_sha: str, release: dict, branch: str) -> s
         git("merge", "--abort", check=False)
         raise RuntimeError(result.stderr or result.stdout)
     restore_workflows(base)
+    try:
+        overlay = apply_product_overlay(base, upstream_sha, merge_base, tag)
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError):
+        git("merge", "--abort", check=False)
+        raise
     manifest = {
         "schemaVersion": 1,
         "upstreamRepository": UPSTREAM,
@@ -261,6 +373,8 @@ def prepare_merge(base: str, upstream_sha: str, release: dict, branch: str) -> s
             "postMergeTestPaths": sorted(entry["path"] for entry in resolutions[1].get("postMergeTests", [])),
         } if resolutions else None,
     }
+    if overlay is not None:
+        manifest["reviewedProductOverlay"] = overlay
     if Path(".github").is_symlink() or Path(MANIFEST).is_symlink():
         raise RuntimeError("Refusing a symlink in the sync manifest path")
     Path(MANIFEST).parent.mkdir(parents=True, exist_ok=True)
@@ -273,6 +387,7 @@ def prepare_merge(base: str, upstream_sha: str, release: dict, branch: str) -> s
 
 
 def validate_candidate(candidate: str, base: str, upstream_sha: str, tag: str) -> None:
+    check_extension_boundary(base, candidate)
     parents = git("show", "-s", "--format=%P", candidate).stdout.strip().split()
     if parents != [base, upstream_sha]:
         raise RuntimeError("Sync candidate must retain exact fork and upstream parents")
