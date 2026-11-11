@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import copy
 import hashlib
 import importlib.util
 import io
@@ -855,7 +856,11 @@ class OverlayTests(SyncFixture):
         self.assertFalse(any(args[0] == 'push' for args, _ in self.calls))
 
 
-    def main_overlay_fixture(self):
+    def main_overlay_fixture(self, preserve_script=False):
+        script = "scripts/ci-build-upload.ts"
+        if preserve_script:
+            self.write(self.work,script,"old script\n")
+            (self.work/script).chmod(0o755)
         self.safe_manifest = json.dumps({'manifest_version': 3, 'permissions': ['tabs']})
         for path in SYNC.EXTENSION_MANIFESTS:
             self.write(self.work, path, self.safe_manifest)
@@ -875,6 +880,18 @@ class OverlayTests(SyncFixture):
         self.run_git(self.work, 'merge', '--no-commit', '--no-ff', self.upstream_sha)
         raw = self.run_git(self.work, 'write-tree').stdout.strip()
         entries = []
+        if preserve_script:
+            content="reviewed script\n"
+            before=SYNC.script_record(raw,script)
+            self.assertEqual(before['mode'],'100755')
+            proof={key:SYNC.script_record(rev,script) for key,rev in [('base','HEAD'),('upstream',self.upstream_sha),('merged',raw),('source',common)]}
+            proof['outputMode']='100755'
+            entries.append(dict(path=script,mergedBlob=before['blob'],content=content,resolvedSha256=hashlib.sha256(content.encode()).hexdigest(),scriptPreservation=proof))
+            self.write(self.work,script,content)
+            self.run_git(self.work,'add',script)
+            policy=patch.object(SYNC,'SCRIPT_PRESERVATION_RELEASE',('v1.1.0',self.upstream_sha));policy.start();self.addCleanup(policy.stop)
+            source=patch.object(SYNC,'SCRIPT_PRESERVATION_SOURCE',common);source.start();self.addCleanup(source.stop)
+
         for path in SYNC.EXTENSION_MANIFESTS:
             entries.append(dict(path=path, mergedBlob=SYNC.tree_file(raw, path)[1], content=self.safe_manifest,
                                 resolvedSha256=hashlib.sha256(self.safe_manifest.encode()).hexdigest()))
@@ -986,9 +1003,155 @@ class OverlayTests(SyncFixture):
         self.assertNotIn('changed=true', stream.getvalue())
 
 
+class ScriptPreservationTests(OverlayTests):
+    def main_overlay_fixture(self):
+        OverlayTests.main_overlay_fixture(self, preserve_script=True)
+
+    def assert_safe_overlay_candidate(self,candidate):
+        OverlayTests.assert_safe_overlay_candidate(self,candidate)
+        self.assertEqual(SYNC.script_record(candidate,'scripts/ci-build-upload.ts')['mode'],'100755')
+        self.assertEqual(self.run_git(self.work,'show',candidate+':scripts/ci-build-upload.ts').stdout,'reviewed script\n')
+
+    def test_script_main_publish_and_manual_schedule_reuse(self):
+        OverlayTests.test_overlay_main_publish_and_manual_schedule_reuse(self)
+
+    def test_script_main_rejects_forged_product_reuse(self):
+        OverlayTests.test_overlay_main_rejects_forged_product_reuse(self)
+
+    def test_script_main_rejects_expanded_manifest_reuse(self):
+        OverlayTests.test_overlay_main_rejects_expanded_manifest_reuse(self)
+
+    def test_script_main_push_failure_never_emits_candidate_or_retries(self):
+        OverlayTests.test_overlay_main_push_failure_never_emits_candidate_or_retries(self)
+
+    def test_script_main_invalid_output_aborts_before_commit_or_push(self):
+        OverlayTests.test_overlay_main_invalid_output_aborts_before_commit_or_push(self)
+
+    def fixture(self, mode='100755', path='scripts/ci-build-upload.ts', missing=False):
+        self.build_overlay()
+        self.path=path
+        # Both exact trusted and upstream trees already contain executable input.
+        self.run_git(self.work,'reset','--hard',self.trusted_base)
+        self.write(self.work,self.path,'old code\n')
+        (self.work/self.path).chmod(0o755 if mode=='100755' else 0o644)
+        self.run_git(self.work,'add',self.path)
+        self.run_git(self.work,'update-index','--chmod='+(' +x'.strip() if mode=='100755' else '-x'),self.path)
+        self.trusted_base=self.commit(self.work,'existing script')
+        self.upstream_sha=self.trusted_base
+        policy=patch.object(SYNC,'SCRIPT_PRESERVATION_RELEASE',('v1.1.0',self.upstream_sha)); policy.start(); self.addCleanup(policy.stop)
+        source=patch.object(SYNC,'SCRIPT_PRESERVATION_SOURCE',self.trusted_base); source.start(); self.addCleanup(source.stop)
+        self.run_git(self.work,'reset','--hard',self.merged)
+        self.write(self.work,self.path,'old code\n')
+        (self.work/self.path).chmod(0o755 if mode=='100755' else 0o644)
+        self.run_git(self.work,'add',self.path)
+        self.run_git(self.work,'update-index','--chmod='+('+x' if mode=='100755' else '-x'),self.path)
+        self.merged=self.commit(self.work,'merged script')
+        if missing:
+            self.run_git(self.work,'rm',self.path)
+            self.merged=self.commit(self.work,'upstream removed file')
+        if not missing:
+            self.assertEqual(SYNC.script_record(self.merged,self.path)['mode'],mode)
+        content='reviewed code\n'
+        proof={key: SYNC.script_record(rev,self.path) for key,rev in [('base',self.trusted_base),('upstream',self.upstream_sha),('merged',self.merged),('source',self.trusted_base)]}
+        proof['outputMode']=mode
+        entry={'path':self.path,'mergedBlob':proof['merged']['blob'] if proof['merged'] else None,'content':content,'resolvedSha256':hashlib.sha256(content.encode()).hexdigest(),'scriptPreservation':proof}
+        self.data['entries'].append(entry)
+        self.data['upstreamSha']=self.upstream_sha
+        self.data['mergeBaseSha']=self.trusted_base
+        self.data['mergedProductSha256']=SYNC.product_digest(self.merged)
+        # Expected final tree built independently using ordinary Git staging.
+        for e in self.data['entries']:
+            destination=self.work/e['path']
+            if e['content'] is None: destination.unlink()
+            else:self.write(self.work,e['path'],e['content'])
+        self.run_git(self.work,'add','--all')
+        self.final=self.run_git(self.work,'write-tree').stdout.strip()
+        self.data['finalProductSha256']=SYNC.product_digest(self.final)
+        self.save_review()
+        return self.data['entries'][-1]
+
+    def test_inner_release_scope_is_required(self):
+        self.fixture()
+        with patch.object(SYNC,'SCRIPT_PRESERVATION_RELEASE',('v18.18.8','a'*40)):
+            self.reject()
+
+    def test_nonancestor_source_rejected_atomically(self):
+        e=self.fixture()
+        tree=self.run_git(self.work,'rev-parse',self.trusted_base+'^{tree}').stdout.strip()
+        unrelated=self.run_git(self.work,'commit-tree',tree,'-m','unrelated source').stdout.strip()
+        before=self.run_git(self.work,'write-tree').stdout
+        with patch.object(SYNC,'SCRIPT_PRESERVATION_SOURCE',unrelated):
+            with self.assertRaises(subprocess.CalledProcessError):self.apply()
+        self.assertEqual(self.run_git(self.work,'write-tree').stdout,before)
+
+    def test_restore_historical_test(self):
+        self.fixture('100644', 'scripts/ci-build-upload.test.ts', True)
+        self.apply()
+        self.assertEqual(self.run_git(self.work,'write-tree').stdout.strip(),self.final)
+        self.assertEqual(SYNC.script_record(self.final,self.path)['mode'],'100644')
+
+    def test_cannot_create_non_test(self):
+        self.fixture('100644', missing=True);self.reject()
+
+    def test_cannot_restore_executable_test(self):
+        self.fixture('100755','scripts/ci-build-upload.test.ts',True);self.reject()
+
+    def test_missing_historical_source_is_rejected(self):
+        e=self.fixture('100644','scripts/ci-build-upload.test.ts',True)
+        e['scriptPreservation']['source']=None;self.save_review();self.reject()
+
+    def test_existing_executable_preserves_mode(self):
+        self.fixture();self.apply()
+        self.assertEqual(self.run_git(self.work,'write-tree').stdout.strip(),self.final)
+        self.assertEqual(SYNC.script_record(self.final,self.path)['mode'],'100755')
+        self.assertEqual((self.work/self.path).read_text(),'old code\n')
+        self.assertFalse(any(c[0][0]=='push' for c in self.calls))
+
+    def test_wrong_pins_are_atomic(self):
+        e=self.fixture(); original=copy.deepcopy(e)
+        for key in ['base','upstream','merged','source']:
+            for value in [None,{'mode':'100644','blob':'a'*40},{'mode':'100755','blob':'a'*40}]:
+                with self.subTest(key=key,value=value):
+                    e.clear();e.update(copy.deepcopy(original));e['scriptPreservation'][key]=value
+                    self.save_review();self.reject()
+
+    def test_chmod_rejected(self):
+        e=self.fixture();e['scriptPreservation']['outputMode']='100644';self.save_review();self.reject()
+
+    def test_new_executable_rejected(self):
+        e=self.fixture('100644');e['scriptPreservation']['outputMode']='100755';self.save_review();self.reject()
+
+    def test_script_proof_cannot_authorize_other_paths(self):
+        e=self.fixture()
+        for path in ['scripts/arbitrary.ts','scripts/fork-sync-upstream.py','.github/workflows/ci.yml','packages/example.txt','scripts/../outside']:
+            with self.subTest(path=path):
+                e['path']=path;self.save_review();self.reject()
+
+    def test_wrong_final_tree_is_atomic(self):
+        self.fixture();self.data['finalProductSha256']='0'*64;self.save_review();self.reject()
+
+    def test_wrong_release_is_atomic(self):
+        self.fixture();self.data['releaseTag']='v9.9.9';self.save_review();self.reject()
+
+    def test_duplicate_is_atomic(self):
+        e=self.fixture();self.data['entries'].append(copy.deepcopy(e));self.save_review();self.reject()
+
+    def test_proof_cannot_delete(self):
+        e=self.fixture();e['content']=None;e['resolvedSha256']=None;self.save_review();self.reject()
+
+    def test_symlink_and_gitlink_rejected(self):
+        self.fixture()
+        for mode,blob in [('120000',self.data['entries'][-1]['mergedBlob']),('160000',self.upstream_sha)]:
+            with self.subTest(mode=mode):
+                self.run_git(self.work,'update-index','--add','--cacheinfo',mode,blob,self.path)
+                tree=self.run_git(self.work,'write-tree').stdout.strip()
+                with self.assertRaises(ValueError):SYNC.script_record(tree,self.path)
+
+
 def load_tests(loader, tests, pattern):
     suite = loader.loadTestsFromTestCase(SyncFixture)
     suite.addTests(OverlayTests(name) for name in sorted(OverlayTests.__dict__) if name.startswith('test_overlay_'))
+    suite.addTests(ScriptPreservationTests(name) for name in sorted(ScriptPreservationTests.__dict__) if name.startswith("test_"))
     return suite
 
 if __name__ == '__main__':

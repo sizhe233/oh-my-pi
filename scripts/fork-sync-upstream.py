@@ -256,6 +256,53 @@ def check_extension_boundary(base: str, candidate: str) -> None:
             raise RuntimeError(f"Extension authority or manifest fields changed: {path}")
 
 
+SCRIPT_PRESERVATION_RELEASE = ("v18.18.8", "679691a78141de0dd6ba1b7a5d5c1b1d7d967a63")
+SCRIPT_PRESERVATION_SOURCE = "e325ffc73ab86e03bdd20a91b77d8e2b3964c906"
+
+# Explicit preservation scope; no glob or importer/metadata paths.
+SCRIPT_PRESERVATION_PATHS = frozenset(('scripts/ci-build-upload.test.ts', 'scripts/ci-build-upload.ts', 'scripts/ci-release-build-binaries.test.ts', 'scripts/ci-release-checksums.test.ts', 'scripts/ci-release-checksums.ts', 'scripts/ci-release-publish.test.ts', 'scripts/ci-release-publish.ts', 'scripts/ci-update-brew-formula.test.ts', 'scripts/ci-update-brew-formula.ts', 'scripts/fix-changelogs.test.ts', 'scripts/fix-changelogs.ts', 'scripts/fix-dt-verdef.test.ts', 'scripts/gen-nix-bun.test.ts', 'scripts/gen-nix-bun.ts', 'scripts/inline-functions.test.ts', 'scripts/inline-functions.ts', 'scripts/install-tests/native-version.test.ts', 'scripts/install-tests/native-version.ts', 'scripts/install.test.ts', 'scripts/merge-pr.test.ts', 'scripts/merge-pr.ts', 'scripts/musl-release.test.ts', 'scripts/release.test.ts', 'scripts/release.ts', 'scripts/run-rs-task.test.ts', 'scripts/session-stats/audit.test.ts', 'scripts/session-stats/audit.ts', 'scripts/stamp-native-version.test.ts', 'scripts/stamp-native-version.ts'))
+
+
+def script_record(revision: str, path: str) -> dict | None:
+    rows = [r for r in git("ls-tree", "-z", revision, "--", f":(literal){path}").stdout.split("\0") if r]
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise ValueError("Ambiguous script path")
+    metadata, name = rows[0].split("\t", 1)
+    mode, kind, blob = metadata.split()
+    if name != path or kind != "blob" or mode not in ("100644", "100755") or not SHA_PATTERN.fullmatch(blob):
+        raise ValueError("Invalid script file kind")
+    return {"mode": mode, "blob": blob}
+
+
+def validate_script_preservation(entry: dict, base: str, upstream: str, merged: str, tag: str) -> str:
+    if (tag, upstream) != SCRIPT_PRESERVATION_RELEASE:
+        raise ValueError("Script preservation release mismatch")
+    if entry["path"] not in SCRIPT_PRESERVATION_PATHS:
+        raise ValueError("Script outside explicit preservation scope")
+    proof = entry["scriptPreservation"]
+    if not isinstance(proof, dict) or set(proof) != {"base", "upstream", "merged", "source", "outputMode"}:
+        raise ValueError("Invalid script preservation pins")
+    for key, revision in (("base", base), ("upstream", upstream), ("merged", merged), ("source", SCRIPT_PRESERVATION_SOURCE)):
+        if script_record(revision, entry["path"]) != proof[key]:
+            raise ValueError("Script preservation input mismatch: " + key)
+    git("merge-base", "--is-ancestor", SCRIPT_PRESERVATION_SOURCE, upstream)
+    before = proof["merged"]
+    if entry["mergedBlob"] != (before["blob"] if before else None):
+        raise ValueError("Script merged blob mismatch")
+    mode = proof["outputMode"]
+    if mode not in ("100644", "100755") or entry["content"] is None:
+        raise ValueError("Invalid script preservation output")
+    if before is None and (not entry["path"].endswith(".test.ts") or proof["source"] is None or proof["source"]["mode"] != "100644" or mode != "100644"):
+        raise ValueError("Only pinned historical non-executable tests may be restored")
+    if before and mode != before["mode"]:
+        raise ValueError("Script chmod is forbidden")
+    if mode == "100755" and any(proof[key] is None or proof[key]["mode"] != mode for key in ("base", "upstream", "merged")):
+        raise ValueError("Executable creation or mode transition is forbidden")
+    return mode
+
+
 def apply_product_overlay(base: str, upstream: str, merge_base: str, tag: str) -> dict | None:
     source = tree_file(base, f"{OVERLAYS}/{tag}.json")
     merged = git("write-tree").stdout.strip()
@@ -277,21 +324,27 @@ def apply_product_overlay(base: str, upstream: str, merge_base: str, tag: str) -
     if not isinstance(entries, list) or not entries:
         raise ValueError("Empty reviewed product overlay")
     seen = set()
+    output_modes = {}
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"path", "mergedBlob", "content", "resolvedSha256"}:
+        normal_keys = {"path", "mergedBlob", "content", "resolvedSha256"}
+        if not isinstance(entry, dict) or set(entry) not in (normal_keys, normal_keys | {"scriptPreservation"}):
             raise ValueError("Invalid reviewed product overlay entry")
         path = entry["path"]
         if (not isinstance(path, str) or not re.fullmatch(r"(?:package\.json|docs/tools/(?:browser|ask)\.md|(?:packages|crates|scripts)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)", path)
                 or any(part in (".", "..") or part.lower() == ".git" for part in path.split("/"))
-                or (path.startswith("scripts/") and path not in ("scripts/fork-browser-minimized-e2e.ts", "scripts/fork-browser-relay-e2e.ts", "scripts/run-rs-task.ts")) or path in seen):
+                or (path.startswith("scripts/") and path not in ("scripts/fork-browser-minimized-e2e.ts", "scripts/fork-browser-relay-e2e.ts", "scripts/run-rs-task.ts") and not ("scriptPreservation" in entry and path in SCRIPT_PRESERVATION_PATHS)) or path in seen):
             raise ValueError("Unsafe or duplicate reviewed overlay path")
         seen.add(path)
         blob = entry["mergedBlob"]
         if blob is not None and (not isinstance(blob, str) or not SHA_PATTERN.fullmatch(blob)):
             raise ValueError("Invalid overlay input blob")
         expected = None if blob is None else ("100644", blob)
-        if tree_file(merged, path) != expected:
-            raise RuntimeError(f"Overlay input mismatch: {path}")
+        if "scriptPreservation" in entry:
+            output_modes[path] = validate_script_preservation(entry, base, upstream, merged, tag)
+        else:
+            if tree_file(merged, path) != expected:
+                raise RuntimeError(f"Overlay input mismatch: {path}")
+            output_modes[path] = "100644"
         # No checkout writes: reject symlink/gitlink/non-directory ancestors in the Git tree.
         for parent in Path(path).parents:
             if str(parent) == ".":
@@ -315,7 +368,7 @@ def apply_product_overlay(base: str, upstream: str, merge_base: str, tag: str) -
                 file = Path(directory) / str(number)
                 file.write_bytes(entry["content"].encode("utf-8"))
                 blob = git("hash-object", "-w", "--no-filters", "--", str(file)).stdout.strip()
-                git("update-index", "--add", "--cacheinfo", "100644", blob, entry["path"], env=environment)
+                git("update-index", "--add", "--cacheinfo", output_modes[entry["path"]], blob, entry["path"], env=environment)
         final = git("write-tree", env=environment).stdout.strip()
         if product_digest(final) != data["finalProductSha256"]:
             raise RuntimeError("Reviewed overlay complete output product mismatch")

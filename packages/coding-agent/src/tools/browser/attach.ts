@@ -42,6 +42,7 @@ export interface CdpProbeResponse {
 
 interface RawGetOptions {
 	timeoutMs: number;
+	maxResponseBytes?: number;
 	signal?: AbortSignal;
 	/** Resolve after the body arrives (Content-Length or peer close) instead of on the status line. */
 	readBody: boolean;
@@ -101,6 +102,11 @@ async function rawHttpGet(url: string, opts: RawGetOptions): Promise<CdpProbeRes
 					s.write(`GET ${requestPath} HTTP/1.1\r\nHost: ${target.hostname}:${port}\r\nConnection: close\r\n\r\n`);
 				},
 				data(_s, chunk) {
+					if (settled) return;
+					if (opts.maxResponseBytes !== undefined && buffered.length + chunk.byteLength > opts.maxResponseBytes) {
+						finish(null);
+						return;
+					}
 					buffered += chunk.toString("latin1");
 					if (status === null) {
 						const match = /^HTTP\/\d(?:\.\d)? (\d{3})/.exec(buffered);
@@ -155,7 +161,7 @@ export async function probeCdpStatus(
  */
 export function probeCdpResponse(
 	url: string,
-	opts: { timeoutMs: number; signal?: AbortSignal },
+	opts: { timeoutMs: number; signal?: AbortSignal; maxResponseBytes?: number },
 ): Promise<CdpProbeResponse | null> {
 	return rawHttpGet(url, { ...opts, readBody: true });
 }
