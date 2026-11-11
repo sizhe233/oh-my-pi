@@ -62,6 +62,7 @@ interface CompletedAdvisorHarness {
 }
 
 interface AdvisorTestExtensionRunner {
+	clearSessionApprovals(): void;
 	hasHandlers(eventType: string): boolean;
 	emitBeforeAgentStart(): Promise<undefined>;
 	emit(event: { type: string; message?: AgentMessage }): Promise<void>;
@@ -167,10 +168,15 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		};
 	}
 
+	/** Completed one-answer session whose advisor raises one `severity` note (default `nit`, below the default continue threshold). */
 	async function createCompletedAdvisorSession(
-		severity: "concern" | "blocker" = "concern",
-		extensionRunner?: AdvisorTestExtensionRunner,
+		opts: {
+			severity?: "nit" | "concern" | "blocker";
+			continueSeverity?: "nit" | "concern" | "blocker";
+			extensionRunner?: AdvisorTestExtensionRunner;
+		} = {},
 	): Promise<CompletedAdvisorHarness> {
+		const { severity = "nit", continueSeverity, extensionRunner } = opts;
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			responses: [
@@ -200,7 +206,11 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			streamFn: mock.stream,
 		});
 		const sessionManager = SessionManager.inMemory();
-		const settings = Settings.isolated({ "compaction.enabled": false, "retry.enabled": false });
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			...(continueSeverity ? { "advisor.continueSeverity": continueSeverity } : {}),
+		});
 		settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
@@ -313,8 +323,11 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(advisorCards[0].content).toContain("Final yield needs correction");
 	});
 
-	it("preserves a late advisor concern after a terminal answer without waking the primary", async () => {
-		const { session, sessionManager, mock, advisorMock } = await createCompletedAdvisorSession();
+	it("preserves a late advisor concern below advisor.continueSeverity without waking the primary", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createCompletedAdvisorSession({
+			severity: "concern",
+			continueSeverity: "blocker",
+		});
 		const persisted = capturePersistedAdvice(sessionManager);
 
 		await session.prompt("read five fixture files and answer with exactly one line");
@@ -339,6 +352,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const hookStarted = Promise.withResolvers<void>();
 		const releaseHook = Promise.withResolvers<void>();
 		const extensionRunner: AdvisorTestExtensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: eventType => eventType === "message_end",
 			emitBeforeAgentStart: async () => undefined,
 			emit: async event => {
@@ -347,7 +361,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				await releaseHook.promise;
 			},
 		};
-		const { session, sessionManager, mock } = await createCompletedAdvisorSession("concern", extensionRunner);
+		const { session, sessionManager, mock } = await createCompletedAdvisorSession({ extensionRunner });
 		const persisted = capturePersistedAdvice(sessionManager);
 
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -377,6 +391,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const hookStarted = Promise.withResolvers<void>();
 		const releaseHook = Promise.withResolvers<void>();
 		const extensionRunner: AdvisorTestExtensionRunner = {
+			clearSessionApprovals: () => {},
 			hasHandlers: eventType => eventType === "message_start",
 			emitBeforeAgentStart: async () => undefined,
 			emit: async event => {
@@ -385,7 +400,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				await releaseHook.promise;
 			},
 		};
-		const { session, mock } = await createCompletedAdvisorSession("concern", extensionRunner);
+		const { session, mock } = await createCompletedAdvisorSession({ extensionRunner });
 
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		await session.prompt("answer with exactly one line");
@@ -404,24 +419,27 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(mock.calls).toHaveLength(1);
 	});
 
-	it("steers a late advisor blocker after a terminal answer so the primary corrects it", async () => {
-		const { session, mock } = await createCompletedAdvisorSession("blocker");
+	it.each([{ severity: "concern" }, { severity: "blocker", continueSeverity: "blocker" }] as const)(
+		"steers late advice at advisor.continueSeverity after a terminal answer %j",
+		async opts => {
+			const { session, mock } = await createCompletedAdvisorSession(opts);
 
-		await session.prompt("read five fixture files and answer with exactly one line");
-		await session.waitForIdle();
-		expect(mock.calls.length).toBe(1);
+			await session.prompt("read five fixture files and answer with exactly one line");
+			await session.waitForIdle();
+			expect(mock.calls.length).toBe(1);
 
-		expect(session.setAdvisorEnabled(true)).toBe(true);
-		const advisor = session.getAdvisorAgent();
-		if (!advisor) throw new Error("Expected advisor agent to be live");
+			expect(session.setAdvisorEnabled(true)).toBe(true);
+			const advisor = session.getAdvisorAgent();
+			if (!advisor) throw new Error("Expected advisor agent to be live");
 
-		await advisor.prompt("inspect the completed turn");
-		await session.waitForIdle();
+			await advisor.prompt("inspect the completed turn");
+			await session.waitForIdle();
 
-		expect(mock.calls.length).toBe(2);
-	});
+			expect(mock.calls.length).toBe(2);
+		},
+	);
 
-	it("preserves another late advisor concern after an existing advisor card", async () => {
+	it("preserves another late advisor note after an existing advisor card", async () => {
 		const { session, mock } = await createCompletedAdvisorSession();
 
 		await session.prompt("answer with exactly one line");

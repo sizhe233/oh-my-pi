@@ -10,7 +10,7 @@ Drive real Chromium tabs from JavaScript or Python Eval with the global `browser
 - `open`, `close`, and `run` take `timeout` in seconds (default 30, capped by `tools.maxTimeout` when set, clamped to 1–300); `waitFor*` helpers take `timeout` in milliseconds.
 - Direct tab helpers:
   - Navigation: `url`, `title`, `goto`, `back`, `forward`, `reload`, `pushState`.
-  - Inspection: `observe`, `ariaSnapshot`, `a11y`, `screenshot`, `diffScreenshot`, `pdf`, `extract`, `text`, `html`, `value`, `attr`, `count`, `box`, `styles`, `isVisible`, `isEnabled`, `isChecked`.
+  - Inspection: `observe`, `ariaSnapshot`, `a11y`, `screenshot`, `diffScreenshot`, `pdf`, `extract`, `text`, `html`, `value`, `attr`, `count`, `box`, `styles`, `isVisible`, `isEnabled`, `isChecked`. `text()` and `html()` without a selector read the page `<body>`.
   - Snapshot options: `observe({selector?, compact?, viewportOnly?, includeAll?})` (`viewportOnly`: on-screen elements only, ignored on cmux; `includeAll`: non-interactive nodes too); `ariaSnapshot(selector?, {interactive?, compact?, urls?, diff?})`.
   - Screenshot options: `screenshot({selector?, fullPage?, silent?, annotate?, format?, quality?, ifChanged?, threshold?})`; `diffScreenshot(baselinePath, {threshold?, output?})`; `pdf({path?, format?, landscape?, scale?, printBackground?, margin?, pageRanges?})`.
   - Extraction options: `extract(format?, {selector?, outline?, filter?})`.
@@ -32,7 +32,7 @@ Drive real Chromium tabs from JavaScript or Python Eval with the global `browser
 - JavaScript `await tab.run(fnOrCode, { args?, timeout? })` runs a function or code string. Functions receive `{ tab, page, browser, wait, assert }`; cell closures are not captured. Plain data, functions, and `RegExp` values are supported in `args`.
 - Python `await tab.run(code, timeout=…)` accepts a JavaScript code string only. Direct Python helpers use the same method names; keyword arguments become a trailing JavaScript options object.
 - `tab.run` executes in an isolated JavaScript tab runtime with raw Puppeteer `page`/`browser`, ordinary Eval helpers, and full Bun/Node + tool-bridge access. It is not sandboxed.
-- Direct helpers and `tab.run` return real structured values. Nonempty inner `display` text prints in the outer Eval cell; screenshots surface as Eval images.
+- Direct helpers and `tab.run` return real structured values. Nonempty text printed inside `tab.run` prints in the outer Eval cell; screenshots surface as Eval images.
 - Selectors accept CSS plus Puppeteer `aria/…`, `text/…`, `xpath/…`, `pierce/…`, `label/…`, `placeholder/…`, `testid/…`, `alt/…`, `title/…`, and `role/<role>[name="…"]` query handlers; append ` exact` inside the role name filter for exact matching.
 - Navigation and re-renders invalidate observed ids and refs. Re-observe, then act in the same cell. Use `pushState(url)` for SPA navigation without a document load.
 - Use `tab.select` for `<select>` elements; `tab.fill` does not support them.
