@@ -1,8 +1,8 @@
 import { inflateSync } from "node:zlib";
 
-import { untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type { ElementHandle, ElementScreenshotOptions, Page } from "puppeteer-core";
+import type { CDPSession, ElementHandle, ElementScreenshotOptions, Page } from "puppeteer-core";
 import type { ScreenshotArea } from "../../utils/image-resize";
 import { encodeRawPng } from "../../utils/png-encode";
 
@@ -128,10 +128,8 @@ export function screenshotQuality(opts: ScreenshotOptions): number | undefined {
 }
 
 /**
- * Upper bound on the pre-capture animation-frame wait. A tab whose Chrome
- * window is minimized never runs `requestAnimationFrame`, yet
- * `Page.captureScreenshot` still forces a fresh frame; waiting unbounded would
- * hang the capture until the caller's timeout.
+ * Bound the pre-capture frame wait even if a visible page cannot deliver frames.
+ * Hidden pages and pages hidden mid-wait finish immediately via the page callback.
  */
 const RENDER_FRAME_WAIT_MS = 250;
 
@@ -141,9 +139,21 @@ async function waitForRenderFrame(page: Pick<Page, "evaluate">, signal: AbortSig
 			() =>
 				new Promise<void>(resolve => {
 					const pageGlobal = globalThis as unknown as {
+						document: {
+							visibilityState: string;
+							addEventListener(type: string, listener: () => void): void;
+							removeEventListener(type: string, listener: () => void): void;
+						};
 						requestAnimationFrame(callback: () => void): number;
 					};
-					pageGlobal.requestAnimationFrame(resolve);
+					const { document } = pageGlobal;
+					if (document.visibilityState === "hidden") return resolve();
+					const done = (): void => {
+						document.removeEventListener("visibilitychange", done);
+						resolve();
+					};
+					document.addEventListener("visibilitychange", done);
+					pageGlobal.requestAnimationFrame(done);
 				}),
 		),
 	);
@@ -151,6 +161,40 @@ async function waitForRenderFrame(page: Pick<Page, "evaluate">, signal: AbortSig
 	frame.catch(() => undefined);
 	await Promise.race([frame, Bun.sleep(RENDER_FRAME_WAIT_MS)]);
 	signal?.throwIfAborted();
+}
+
+/**
+ * Run `capture` while `page` is made to draw. Chromium stops drawing a hidden
+ * page (a background tab, a minimized or covered window) shortly after its last
+ * change, and `Page.captureScreenshot` waits for a fresh frame, so capturing such
+ * a page would wait until the op times out. A DevTools screencast makes Chromium
+ * draw the page for capture without showing or activating it and without changing
+ * its visibility. A browser that refuses the screencast is captured without it.
+ */
+export async function whileDrawing<T>(
+	page: Page,
+	signal: AbortSignal | undefined,
+	capture: () => Promise<T>,
+): Promise<T> {
+	let session: CDPSession | undefined;
+	try {
+		try {
+			const screencast = await page.createCDPSession();
+			session = screencast;
+			await untilAborted(signal, () =>
+				screencast.send("Page.startScreencast", { format: "jpeg", quality: 1, maxWidth: 1, maxHeight: 1 }),
+			);
+		} catch (error) {
+			signal?.throwIfAborted();
+			logger.debug("Browser screenshot screencast unavailable; capturing without it", { error: String(error) });
+		}
+		return await capture();
+	} finally {
+		if (session) {
+			await session.send("Page.stopScreencast").catch(() => undefined);
+			await session.detach().catch(() => undefined);
+		}
+	}
 }
 
 /**

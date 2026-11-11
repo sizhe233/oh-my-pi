@@ -120,6 +120,7 @@ function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): 
 		stealth: { browserSession: null, override: null },
 		browser: {
 			connected: true,
+			_connection: { send: session.send, createSession: async () => session },
 			targets: () => [],
 			target: () => ({ createCDPSession: async () => session }),
 			disconnect: () => undefined,
@@ -140,6 +141,7 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 		info: {},
 		pending: new Map(),
 		kindTag: "headless",
+		ownsPage: true,
 		ownerSessionId: "session-wedge",
 		persist: false,
 		lastActivityAt: Date.now(),
@@ -398,7 +400,7 @@ describe("relay cleanup after a failed worker close", () => {
 		const tab = makeWedgeTab(scope, { shared: false });
 		if (tab.backend !== "worker") throw new Error("Expected worker tab fixture");
 		tab.kindTag = "relay";
-		tab.ownsTarget = ownsTarget;
+		tab.ownsPage = ownsTarget;
 		tab.browser.kind = { kind: "relay", cdpUrl: "http://127.0.0.1:9224" };
 		tab.browser.cdpUrl = "http://127.0.0.1:9224";
 		tab.browser.browser.wsEndpoint = () => "ws://127.0.0.1:9224/cdp";
@@ -408,7 +410,7 @@ describe("relay cleanup after a failed worker close", () => {
 
 	it.each([false, true])("retains only unconfirmed relay target ownership after release (closed=%s)", async closed => {
 		const scope = trackedScope();
-		const close = spyOn(relayOwnedTargets, "closeRelayTarget").mockResolvedValue(closed);
+		const close = spyOn(orphanRegistry, "closeRelayTarget").mockResolvedValue(closed);
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
 		await recordSharedTarget(scope, TARGET_ID);
 		getTabsMapForTest().set("logos-b2b", relayTab(scope));
@@ -416,14 +418,14 @@ describe("relay cleanup after a failed worker close", () => {
 		expect(await releaseTab("logos-b2b", { timeoutMs: 60 })).toBe(true);
 
 		expect(close).toHaveBeenCalledTimes(1);
-		expect(close).toHaveBeenCalledWith("ws://127.0.0.1:9224/cdp", TARGET_ID);
+		expect(close).toHaveBeenCalledWith(expect.anything(), TARGET_ID);
 		expect(await ownedTargets(scope)).toEqual(closed ? [] : [TARGET_ID]);
 		expect(healthCheck).not.toHaveBeenCalled();
 	});
 
 	it("force-kills an owned relay tab while retaining a failed close without stopping the user's browser", async () => {
 		const scope = trackedScope();
-		const close = spyOn(relayOwnedTargets, "closeRelayTarget").mockResolvedValue(false);
+		const close = spyOn(orphanRegistry, "closeRelayTarget").mockResolvedValue(false);
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
 		await recordSharedTarget(scope, TARGET_ID);
 		getTabsMapForTest().set("logos-b2b", relayTab(scope));
@@ -433,7 +435,7 @@ describe("relay cleanup after a failed worker close", () => {
 		).rejects.toThrow("hung past grace");
 
 		expect(close).toHaveBeenCalledTimes(1);
-		expect(close).toHaveBeenCalledWith("ws://127.0.0.1:9224/cdp", TARGET_ID);
+		expect(close).toHaveBeenCalledWith(expect.anything(), TARGET_ID);
 		expect(getTabsMapForTest().has("logos-b2b")).toBe(false);
 		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 		expect(healthCheck).not.toHaveBeenCalled();
@@ -441,7 +443,7 @@ describe("relay cleanup after a failed worker close", () => {
 
 	it("leaves an adopted relay target open when its worker is force-killed", async () => {
 		const scope = trackedScope();
-		const close = spyOn(relayOwnedTargets, "closeRelayTarget").mockResolvedValue(true);
+		const close = spyOn(orphanRegistry, "closeRelayTarget").mockResolvedValue(true);
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
 		getTabsMapForTest().set("logos-b2b", relayTab(scope, false));
 
@@ -473,8 +475,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 			await recordSharedTarget(scope, TARGET_ID);
 			const tab = makeWedgeTab(scope);
 			if (tab.backend !== "worker") throw new Error("Expected worker tab fixture");
-			tab.ownsTarget = true;
-			tab.reattached = true;
+			tab.ownsPage = true;
 			acknowledgeClose(tab);
 			getTabsMapForTest().set(tab.name, tab);
 
@@ -492,8 +493,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 		const tab = makeWedgeTab(scope, { shared: false });
 		if (tab.backend !== "worker") throw new Error("Expected worker tab fixture");
 		tab.kindTag = "relay";
-		tab.ownsTarget = ownsTarget;
-		tab.reattached = true;
+		tab.ownsPage = ownsTarget;
 		tab.browser.kind = { kind: "relay", cdpUrl: "http://127.0.0.1:9224" };
 		tab.browser.cdpUrl = "http://127.0.0.1:9224";
 		tab.browser.browser.wsEndpoint = () => "ws://127.0.0.1:9224/cdp";
@@ -505,7 +505,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 		"force-closes only an owned reattached relay target and retains an unconfirmed close (owned=%s)",
 		async ownsTarget => {
 			const scope = trackedScope();
-			const close = spyOn(relayOwnedTargets, "closeRelayTarget").mockResolvedValue(false);
+			const close = spyOn(orphanRegistry, "closeRelayTarget").mockResolvedValue(false);
 			const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
 			if (ownsTarget) await recordSharedTarget(scope, TARGET_ID);
 			const tab = reattachedRelayTab(scope, ownsTarget);
@@ -518,16 +518,16 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 			expect(await releaseTab(tab.name, { timeoutMs: 60 })).toBe(true);
 
 			expect(close).toHaveBeenCalledTimes(ownsTarget ? 1 : 0);
-			if (ownsTarget) expect(close).toHaveBeenCalledWith("ws://127.0.0.1:9224/cdp", TARGET_ID);
+			if (ownsTarget) expect(close).toHaveBeenCalledWith(expect.anything(), TARGET_ID);
 			expect(await ownedTargets(scope)).toEqual(ownsTarget ? [TARGET_ID] : []);
 			expect(healthCheck).not.toHaveBeenCalled();
 			expect(getTabsMapForTest().has(tab.name)).toBe(false);
 		},
 	);
 
-	it("does not repeat a reattached owned relay worker's acknowledged close", async () => {
+	it("retains ownership if an acknowledged relay close cannot be confirmed", async () => {
 		const scope = trackedScope();
-		const close = spyOn(relayOwnedTargets, "closeRelayTarget").mockResolvedValue(false);
+		const close = spyOn(orphanRegistry, "closeRelayTarget").mockResolvedValue(false);
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
 		await recordSharedTarget(scope, TARGET_ID);
 		const tab = reattachedRelayTab(scope, true);
@@ -536,8 +536,8 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 
 		expect(await releaseTab(tab.name, { timeoutMs: 60 })).toBe(true);
 
-		expect(close).not.toHaveBeenCalled();
-		expect(await ownedTargets(scope)).toEqual([]);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 		expect(healthCheck).not.toHaveBeenCalled();
 		expect(getTabsMapForTest().has(tab.name)).toBe(false);
 	});
