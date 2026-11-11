@@ -1,3 +1,5 @@
+> Fork permission policy: this build does not request `downloads`, `scripting`, or all-site host access and does not empty password-manager frames. Upstream 18.18.1 automatic frame recovery and 18.18.2 relay download tracking are omitted; Chrome may refuse a tab while another extension’s frame is present.
+
 # @oh-my-pi/browser-relay
 
 Chrome extension that lets omp's Eval `browser` API drive **your real Chrome tabs** — logged-in sessions included — without relaunching Chrome with `--remote-debugging-port` (which Chrome 136+ refuses on the default profile anyway). By default omp opens its own tab; `app.target` opts into an existing tab.
@@ -6,7 +8,7 @@ The companion relay server lives in the omp CLI (`omp browser-relay`, see `packa
 
 ## Setup
 
-1. `omp browser-relay install` — writes the bundled extension to `~/.omp/browser-relay/extension`, then load it via `chrome://extensions` → Developer mode → *Load unpacked*. (Or grab `omp-browser-relay-extension.zip` from GitHub releases.)
+1. `omp browser-relay install` — writes the bundled extension to `~/.omp/browser-relay/extension`, then load it via `chrome://extensions` → Developer mode → _Load unpacked_. (Or grab `omp-browser-relay-extension.zip` from GitHub releases.)
 2. Opt in, one of two ways:
    - **Per call** — pass `app: { relay: true }` to `browser.open(...)` in Eval. Works without any setting and persists nothing: the configured default for every other call and session stays whatever it already was.
    - **As the default** — `omp config set browser.relay true` makes the relay the default for **every session using this profile, in every project** (project-level settings, `PI_BROWSER_RELAY`, and an explicit `app` choice still take precedence). Each session's `browser.open(...)` creates a separate background tab; an optional `url` navigates only that new tab, not the page you are reading.
@@ -16,6 +18,8 @@ That's it: the relay server auto-starts under omp's profile-independent global d
 Without `app.target`, omp creates a tab it owns and closes it when released. Creation and screenshots leave the foreground tab alone; an explicit `tab.bringToFront()` still activates the agent tab. `app.target` deliberately adopts a tab by URL/title substring instead; only one omp session can drive it at a time, and closing the session leaves that borrowed tab open.
 
 Driven tabs join cyan `omp/<session ID>` groups within each Chrome window (the tab name is used when a caller has no session ID). The initial creation claim may briefly use the default `omp` group before the worker assigns the session group. Group labels are trimmed to 32 characters; groups dissolve on disconnect, and debugger attachments/infobars are released when no session holds the tab. Other tabs, pinned tabs, tabs in unrelated user groups, and tabs deliberately dragged out are left alone. The `omp` and `omp/*` group titles are reserved for the relay and are dissolved on disconnect. Disable grouping with `omp browser-relay --no-group`.
+
+After an omp upgrade, the relay keeps the extension current on its own: when it meets an extension older than itself that Chrome loaded from `~/.omp/browser-relay/extension`, and no omp session is connected to the relay and none of the extension's tabs is attached, it rewrites the files there and asks the extension to reload. Chrome re-reads them under the same extension id, keeping its settings, permissions and the _Allow access to file URLs_ choice; the badge goes off and on. Otherwise run `omp browser-relay install` (with your `--dir`) and click _Reload_ in `chrome://extensions`: after every upgrade for an extension loaded from another folder, once for one installed before omp could update it. A Chrome restart is not enough, as Chrome keeps running the worker it loaded; a relay `browser.open` notes when the loaded extension came from an older omp.
 
 ## Development
 
@@ -27,4 +31,7 @@ Driven tabs join cyan `omp/<session ID>` groups within each Chrome window (the t
 - `chrome://`, DevTools, Web Store, and other-extension pages are not attachable and are hidden from the agent.
 - Chrome shows its "is debugging this browser" infobar while any tab is attached; dismissing it detaches that tab until it navigates again.
 - A tab with DevTools open can't be attached (one debugger per tab — the constraint the relay multiplexes around for its own clients).
+- Chrome refuses the debugger in a tab while another extension's frame, such as a password manager's inline menu, is in it. This fork leaves those frames untouched and reports Chrome's refusal. Close the other extension's popup yourself before retrying.
 - Anything that can reach the relay port can drive your logged-in browser. The relay binds loopback only; use `omp browser-relay --token <secret>` (mirrored in the extension options) if untrusted local processes are a concern.
+
+Relay tabs do not support download tracking or download-path lookup in this fork. Explicitly select a non-relay browser to use the existing download helpers; relay calls do not request broader extension permissions.

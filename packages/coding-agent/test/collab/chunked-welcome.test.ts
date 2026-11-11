@@ -10,7 +10,11 @@
  * forwarding contract exactly; only the TUI context and the network transport
  * are stubbed.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as utils from "@oh-my-pi/pi-utils";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -100,6 +104,7 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 			messages: [],
 		},
 		statusContainer: { clear: () => {} },
+		pendingShellContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,
@@ -123,6 +128,9 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		renderInitialMessages: () => {},
 		reloadTodos: () => Promise.resolve(),
 		syncRunningSubagentBadge: () => {},
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		showStatus: () => {},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
@@ -134,7 +142,7 @@ function makeCancelledSwitchGuestContext(
 	switchSession: () => Promise<boolean>,
 	events: string[],
 ): InteractiveModeContext {
-	return {
+	const ctx = {
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionFile: () => null,
@@ -153,6 +161,7 @@ function makeCancelledSwitchGuestContext(
 			},
 		},
 		statusContainer: { clear: () => events.push("clear-transient-ui") },
+		pendingShellContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,
@@ -176,12 +185,16 @@ function makeCancelledSwitchGuestContext(
 		resetObserverRegistry: () => {},
 		renderInitialMessages: () => {},
 		syncRunningSubagentBadge: () => {},
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		reloadTodos: () => Promise.resolve(),
 		showStatus: (status: string) => events.push(`status:${status}`),
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		collabGuest: undefined,
 	} as unknown as InteractiveModeContext;
+	return ctx;
 }
 
 // ── Shared host/relay ───────────────────────────────────────────────────────
@@ -201,8 +214,19 @@ afterAll(async () => {
 });
 
 const guestCleanups: (() => void)[] = [];
-afterEach(() => {
-	for (const cleanup of guestCleanups.splice(0).reverse()) cleanup();
+let replicaRoot: string | undefined;
+beforeEach(async () => {
+	replicaRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-collab-replica-"));
+	vi.spyOn(utils, "getConfigRootDir").mockReturnValue(replicaRoot);
+});
+afterEach(async () => {
+	try {
+		for (const cleanup of guestCleanups.splice(0).reverse()) cleanup();
+	} finally {
+		vi.restoreAllMocks();
+		if (replicaRoot) await utils.removeWithRetries(replicaRoot);
+		replicaRoot = undefined;
+	}
 });
 
 describe("collab chunked welcome (#3144)", () => {

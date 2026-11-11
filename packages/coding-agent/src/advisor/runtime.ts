@@ -3,6 +3,7 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { raceWithSignal } from "@oh-my-pi/pi-ai/utils/abort";
 import { logger } from "@oh-my-pi/pi-utils";
+import { isEvalStateContext } from "../eval/state";
 import {
 	collectNativeReplayRegexSecretValues,
 	obfuscateNativeReplay,
@@ -92,6 +93,13 @@ export interface AdvisorRuntimeHost {
 	 *  hard-stops), so the host can repaint UI that reflects whether the
 	 *  advisor is still going to comment on the current yield. */
 	notifyIdle?(): void;
+	/**
+	 * Whether primary assistant thinking blocks (`_thinking:_`) are included in
+	 * deltas rendered for this advisor. Defaults to `true`. Setting `false`
+	 * runs the advisor in evidence-only mode (actions, tool I/O, and outputs
+	 * without the primary model's chain-of-thought).
+	 */
+	includeReasoning?: boolean;
 }
 
 /**
@@ -254,13 +262,6 @@ interface CatchupWaiter {
 	timer?: NodeJS.Timeout;
 }
 
-/**
- * Synthetic message `AgentSession.#withEvalStateContext` appends at the tail of
- * every display-context rebuild; its slot moves each time, so
- * {@link AdvisorRuntime.rebaseDeliveredPrefix} does not align on it.
- */
-const EVAL_STATE_CONTEXT_TYPE = "eval-state-context";
-
 interface DeliveredMessage {
 	message: AgentMessage;
 	fingerprint: bigint | undefined;
@@ -302,6 +303,10 @@ export class AdvisorRuntime {
 	#busy = false;
 	#sessionTransitionPaused = false;
 	#promptInFlight: Promise<void> | undefined;
+	/** True while the drain awaits batch collection (context maintenance). */
+	#collecting = false;
+	/** Set by {@link supersede} for the batch collecting or in flight: it is held, not reviewed. */
+	#superseded = false;
 	#iterationAbort: AbortController | undefined;
 	#backlog = 0;
 	#consecutiveFailures = 0;
@@ -316,8 +321,9 @@ export class AdvisorRuntime {
 	 * terminal turn ends the cascade, or on reset, so a later refusal starts fresh.
 	 */
 	readonly #refusalModelsTried = new Set<string>();
+	readonly #configuredIncludeThinking: boolean;
 	/** Whether primary reasoning is included in advisor deltas for the current model. */
-	#includeThinking = true;
+	#includeThinking: boolean;
 	#modelIdentity: string | undefined;
 	/** Completed 3-failure backlog-drop cycles since the last success/reset. */
 	#droppedBacklogs = 0;
@@ -348,9 +354,9 @@ export class AdvisorRuntime {
 	 *  being retried/requeued into the post-reset conversation. */
 	#epoch = 0;
 	disposed = false;
-	/** Quota/rate-limit pause state. When `true`, the advisor stops processing
-	 *  turns and drops new deltas until an explicit {@link reset} clears it
-	 *  (triggered by `/new`, config rebuild, or session restart). There is no
+	/** Quota/usage-limit pause state. When `true`, the advisor stops processing
+	 *  turns and drops new deltas until a {@link reset} clears it (compaction,
+	 *  image drop, shake, session switch, rebuild, or restart). There is no
 	 *  timer-based auto-resume: provider quota windows (5h/7d) are far longer
 	 *  than any reasonable timer, and premature retries waste calls and
 	 *  re-trigger the same error. */
@@ -360,7 +366,10 @@ export class AdvisorRuntime {
 		private readonly agent: AdvisorAgent,
 		private readonly host: AdvisorRuntimeHost,
 		private readonly retryDelayMs = 1000,
-	) {}
+	) {
+		this.#configuredIncludeThinking = host.includeReasoning !== false;
+		this.#includeThinking = this.#configuredIncludeThinking;
+	}
 
 	get backlog(): number {
 		return this.#backlog;
@@ -455,6 +464,47 @@ export class AdvisorRuntime {
 	flushHeld(): void {
 		if (this.disposed || this.#quotaExhausted || this.#halted) return;
 		this.#dispatch(undefined);
+	}
+
+	/**
+	 * Cancel every review of the work captured so far that has not judged it:
+	 * queued, collecting, or in flight (its advisor turn is aborted and rolled
+	 * back, so it emits nothing). `keepInFlight` spares the review in flight —
+	 * the one whose verdict is being delivered. Cancelled deltas return to held,
+	 * so the next dispatching boundary reviews them together with newer work.
+	 * Returns whether a review was cancelled.
+	 */
+	supersede(keepInFlight = false): boolean {
+		const inFlight = !keepInFlight && (this.#collecting || this.#promptInFlight !== undefined);
+		if (!inFlight && this.#pending.length === 0) return false;
+		this.#backlog = Math.max(0, this.#backlog - this.#pending.reduce((sum, delta) => sum + delta.turns, 0));
+		this.#held = [
+			...this.#pending.map(delta => ({ ...delta, turns: 1, overflowRecovery: undefined })),
+			...this.#held,
+		];
+		this.#pending = [];
+		if (inFlight) {
+			this.#superseded = true;
+			try {
+				this.agent.abort("advisor review superseded");
+			} catch {}
+		}
+		this.#notifyWaiters();
+		return true;
+	}
+
+	/** Hold a superseded batch ahead of everything captured after it. */
+	#holdSuperseded(text: string, rawMessages: AgentMessage[], turns: number, wip: boolean): void {
+		this.#superseded = false;
+		this.#backlog = Math.max(0, this.#backlog - turns);
+		this.#held.unshift({
+			text,
+			rawMessages: rawMessages.map(message => ({ ...message })),
+			renderRevision: this.#renderRevision,
+			turns: 1,
+			wip,
+		});
+		this.#notifyWaiters();
 	}
 
 	/**
@@ -585,7 +635,6 @@ export class AdvisorRuntime {
 	}
 
 	#clearAdvisorContextAtCurrentCursor(): void {
-		this.#consecutiveFailures = 0;
 		this.#clearSeenContext();
 		try {
 			this.agent.reset();
@@ -608,6 +657,7 @@ export class AdvisorRuntime {
 		this.#deliveredPrefix = [];
 		this.#pending = [];
 		this.#held = [];
+		this.#consecutiveFailures = 0;
 		this.#clearAdvisorContextAtCurrentCursor();
 		if (clearBacklog) {
 			this.#backlog = 0;
@@ -736,7 +786,7 @@ export class AdvisorRuntime {
 		const rebased: DeliveredMessage[] = [];
 		for (const delivered of this.#deliveredPrefix) {
 			const message = delivered.message;
-			if (message.role === "custom" && message.customType === EVAL_STATE_CONTEXT_TYPE) continue;
+			if (isEvalStateContext(message)) continue;
 			const current = all[rebased.length];
 			if (current === undefined) return;
 			const fingerprint = fingerprintMessage(current);
@@ -760,7 +810,7 @@ export class AdvisorRuntime {
 		const identity = this.host.getModelIdentity?.();
 		if (identity === undefined || identity === this.#modelIdentity) return;
 		this.#modelIdentity = identity;
-		this.#includeThinking = true;
+		this.#includeThinking = this.#configuredIncludeThinking;
 	}
 
 	// Candidate 4 (multi-message split): render the Session update as MULTIPLE
@@ -1183,6 +1233,8 @@ export class AdvisorRuntime {
 						pending: this.#pending.length,
 						backlog: this.#backlog,
 					});
+					// A maintenance re-prime is not a recovery: the batch keeps its strikes, or a batch that
+					// keeps failing and keeps triggering maintenance is retried without end instead of dropped.
 					this.#clearAdvisorContextAtCurrentCursor();
 					const preparedMessages = this.#prepareBatch(rawMessages);
 					return {
@@ -1307,12 +1359,15 @@ export class AdvisorRuntime {
 					delta.renderRevision = this.#renderRevision;
 				}
 				const recoveringOverflow = popped.some(delta => delta.overflowRecovery === true);
+				this.#superseded = false;
+				this.#collecting = true;
 				const result = await this.#collectAndMaintainBatch(
 					epoch,
 					popped,
 					recoveringOverflow,
 					iterationAbort.signal,
 				);
+				this.#collecting = false;
 
 				// Epoch was invalidated during batch collection; restart the loop.
 				if (result === null) continue;
@@ -1323,6 +1378,11 @@ export class AdvisorRuntime {
 				}
 
 				const { batchText, rawMessages, preparedMessages, finalTurns, wip, resetContext } = result;
+				if (this.#superseded) {
+					this.#restoreSeenContextInFlight();
+					this.#holdSuperseded(batchText, rawMessages, finalTurns, wip);
+					continue;
+				}
 				// The single-block text is only needed when the multi-message split
 				// cannot be used or a failed turn requeues the batch, so render it on
 				// first use (with the thinking policy this batch was prepared under).
@@ -1375,6 +1435,7 @@ export class AdvisorRuntime {
 					// Agent.#runLoop catches provider/stream failures internally and
 					// resolves prompt() cleanly with stopReason: "error". Treat that
 					// as a failed turn so endpoint rejections trip the retry path.
+					if (this.#superseded) throw new Error("advisor review superseded");
 					const promptError = this.agent.state.error;
 					if (promptError) throw new Error(promptError);
 					// A content-less stop is a deliberate silent review — the documented
@@ -1404,6 +1465,11 @@ export class AdvisorRuntime {
 					if (this.#sessionTransitionPaused) {
 						this.#rollbackFailedTurn(messageSnapshot);
 						this.#pending.unshift(...popped);
+						continue;
+					}
+					if (this.#superseded) {
+						this.#rollbackFailedTurn(messageSnapshot);
+						this.#holdSuperseded(batchText, rawMessages, finalTurns, wip);
 						continue;
 					}
 					// reset()/dispose() aborts the in-flight prompt; treat it as a
@@ -1440,8 +1506,13 @@ export class AdvisorRuntime {
 					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
 					if (classifierRefusal) {
-						if (this.#includeThinking) {
-							this.#includeThinking = false;
+						// Stripping only recovers when it changes what was sent: a batch
+						// without primary reasoning would be resent byte-for-byte and
+						// refused again, so it goes straight to the model fallback.
+						const strippingChangesBatch =
+							this.#includeThinking && this.#renderPreparedDelta(preparedMessages, wip, false) !== renderBatch();
+						this.#includeThinking = false;
+						if (strippingChangesBatch) {
 							// Do NOT advance #seenContext here: the requeued batch is
 							// re-deduped by #prepareBatch on the next drain, so a mutation
 							// now would double-fold first-time primary context into
@@ -1602,6 +1673,7 @@ export class AdvisorRuntime {
 						this.#noteDroppedBacklog(err);
 						success = true;
 					} else if (contextOverflow) {
+						this.#consecutiveFailures = 0;
 						this.#clearAdvisorContextAtCurrentCursor();
 						if (contextWasFresh) {
 							// The bounded update cannot fit even with no advisor history. Drop
@@ -1670,6 +1742,7 @@ export class AdvisorRuntime {
 		} finally {
 			this.#iterationAbort = undefined;
 			this.#busy = false;
+			this.#collecting = false;
 			// Notify on EVERY path that lands the runtime in the yielded state —
 			// not just an empty backlog. The quota branch requeues the failed
 			// batch (backlog/pending stay non-empty) yet `yielded` is true via
@@ -1749,7 +1822,7 @@ function obfuscateAssistantMessage(
 			const args = obfuscateToolArguments(obfuscator, block.arguments, sharedRegexSecretValues);
 			if (args === block.arguments) return block;
 			changed = true;
-			return { ...block, arguments: args };
+			return { ...block, arguments: args, thoughtSignature: undefined };
 		}
 		return block;
 	});

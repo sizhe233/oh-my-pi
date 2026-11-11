@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type WasmGrammarInfo, type WasmGrammarQuery, wasmGrammarFor } from "@oh-my-pi/pi-natives";
+import { __ompSetGrammarDir, type WasmGrammarInfo, type WasmGrammarQuery, wasmGrammarFor } from "@oh-my-pi/pi-natives";
 import { getNativeGrammarsDir, logger, withFileLock } from "@oh-my-pi/pi-utils";
 import { withDownload } from "../downloads/activity";
 import { downloadFile } from "./tools-manager";
@@ -114,6 +114,9 @@ export function installGrammar(info: WasmGrammarInfo, dir: string = getNativeGra
  * `false`; native AST APIs then treat the language as unsupported.
  */
 export async function ensureGrammar(query: WasmGrammarQuery): Promise<boolean> {
+	// The loader cannot import pi-utils and initializes a legacy fallback. Use
+	// the installer's resolver here, including runtime profile/XDG changes.
+	__ompSetGrammarDir(getNativeGrammarsDir());
 	const info = wasmGrammarFor(query);
 	if (!info || info.installed) return true;
 	return installGrammar(info);
@@ -125,6 +128,7 @@ export async function ensureGrammar(query: WasmGrammarQuery): Promise<boolean> {
  * installed, i.e. a caller that saw them missing should re-run.
  */
 export async function ensureGrammars(languages: readonly string[]): Promise<boolean> {
+	__ompSetGrammarDir(getNativeGrammarsDir());
 	const installed = await Promise.all(
 		languages.map(lang => {
 			const info = wasmGrammarFor({ lang });

@@ -72,6 +72,8 @@ export const KNOWN_HOSTS = {
 	/** ZenMux's Anthropic-compatible proxy (`zenmux.ai/api/anthropic`) forwards to signature-enforcing Anthropic. */
 	zenmux: { providers: ["zenmux"], urlMarkers: ["zenmux.ai"] },
 	chutes: { urlMarkers: ["chutes.ai"] },
+	/** Morph (`api.morphllm.com`). Reached only through custom providers, so the URL is its sole identity. */
+	morph: { urlMarkers: ["api.morphllm.com"] },
 } as const satisfies Record<string, HostClassSpec>;
 
 export type KnownHost = keyof typeof KNOWN_HOSTS;
@@ -193,11 +195,13 @@ function hasPathPrefix(pathname: string, prefix: string): boolean {
  * - `anthropic`: the Anthropic Messages API under `/anthropic`.
  * - `openai`: the OpenAI-compatible APIs under `/openai`, plus Mantle's
  *   documented `/v1` base (`https://bedrock-mantle.<region>.api.aws/v1`).
+ * - `runtime`: the bedrock-runtime origin itself, where Converse and
+ *   InvokeModel live under `/model/<id>/…`.
  *
  * Hostnames are parsed strictly so proxies that embed these hosts in a path
  * do not match.
  */
-export function isBedrockRouteUrl(baseUrl: string | undefined, route: "openai" | "anthropic"): boolean {
+export function isBedrockRouteUrl(baseUrl: string | undefined, route: "openai" | "anthropic" | "runtime"): boolean {
 	if (!baseUrl) return false;
 	let url: URL;
 	try {
@@ -208,8 +212,9 @@ export function isBedrockRouteUrl(baseUrl: string | undefined, route: "openai" |
 	if (url.protocol !== "https:") return false;
 	const host = BEDROCK_PUBLIC_HOST.exec(url.hostname) ?? BEDROCK_PRIVATELINK_HOST.exec(url.hostname);
 	if (!host) return false;
-	if (route === "anthropic") return hasPathPrefix(url.pathname, "/anthropic");
 	const isMantle = host.groups?.runtime === undefined;
+	if (route === "runtime") return !isMantle && url.pathname === "/";
+	if (route === "anthropic") return hasPathPrefix(url.pathname, "/anthropic");
 	return hasPathPrefix(url.pathname, "/openai") || (isMantle && hasPathPrefix(url.pathname, "/v1"));
 }
 

@@ -91,20 +91,30 @@ describe.skipIf(isWindows)("search across unrelated filesystem trees", () => {
 	let dirA: string;
 	let dirB: string;
 	let cwd: string;
+	const createdDirectories: string[] = [];
 
 	beforeEach(async () => {
 		// Place fixtures in two unrelated top-level subtrees so their only shared
 		// ancestor is the filesystem root. Without the multi-target fanout, the
 		// search tool would scan from `/` and walk the entire filesystem.
-		dirA = await fs.mkdtemp(path.join("/tmp", "pi-search-multi-A-"));
-		dirB = await fs.mkdtemp(path.join("/var/tmp", "pi-search-multi-B-"));
+		const rootA = await fs.realpath("/tmp");
+		const workspaceRoot = await fs.realpath(process.cwd());
+		const topLevel = (directory: string) => directory.split(path.sep).filter(Boolean)[0];
+		const rootB = topLevel(workspaceRoot) !== topLevel(rootA) ? workspaceRoot : await fs.realpath("/var/tmp");
+		// Resolve symlinks first: on macOS /tmp and /var/tmp can both live under /private.
+		expect(topLevel(rootA)).not.toBe(topLevel(rootB));
+		dirA = await fs.mkdtemp(path.join(rootA, "pi-search-multi-A-"));
+		createdDirectories.push(dirA);
+		dirB = await fs.mkdtemp(path.join(rootB, "pi-search-multi-B-"));
+		createdDirectories.push(dirB);
 		cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pi-search-multi-cwd-"));
+		createdDirectories.push(cwd);
 		await Bun.write(path.join(dirA, "alpha.txt"), "shared-needle alpha\n");
 		await Bun.write(path.join(dirB, "beta.txt"), "shared-needle beta\n");
 	});
 
 	afterEach(async () => {
-		await Promise.all([removeWithRetries(dirA), removeWithRetries(dirB), removeWithRetries(cwd)]);
+		await Promise.all(createdDirectories.splice(0).map(directory => removeWithRetries(directory)));
 	});
 
 	it("returns matches from both trees without rooting the scan at /", async () => {

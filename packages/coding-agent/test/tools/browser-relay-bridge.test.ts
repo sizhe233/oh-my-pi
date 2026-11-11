@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, jest } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -7,9 +7,10 @@ import * as vm from "node:vm";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
 	reapOrphanSharedTargets,
+	closeRelayTarget,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
-import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
+import { RelayBridge, type FrontApp, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
 import { closeRelayOwnedTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
 import type {
 	RelayRpcRequest,
@@ -17,7 +18,7 @@ import type {
 	TabSnapshot,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
-import type { Browser } from "puppeteer-core";
+import type { Browser, CDPSession } from "puppeteer-core";
 
 /** Same derivation as the bridge: target ids embed this per-instance code. */
 function instanceCode(instanceId: string): string {
@@ -193,6 +194,7 @@ function connectInstance(
 	instanceId: string,
 	tabs: TabSnapshot[],
 	attachedTabIds: number[] = [],
+	browserSession?: string,
 ): void {
 	bridge.extConnected(socket);
 	bridge.extMessage(
@@ -200,6 +202,7 @@ function connectInstance(
 		JSON.stringify({
 			t: "hello",
 			instanceId,
+			browserSession,
 			userAgent: "test",
 			browserVersion: instanceId === "edge" ? "Edg/151.0.0.0" : "Chrome/151.0.0.0",
 			discardedTabsProtocol: 1,
@@ -442,6 +445,21 @@ describe("RelayBridge tab grouping", () => {
 		expect(ext.rpcs("group")).toHaveLength(0);
 	});
 
+	it("closes a tab Target.createTarget made for a client that disconnected before it opened", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.createTarget", params: { url: "https://example.com/" } }),
+		);
+		bridge.cdpClosed(connId);
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		expect(ext.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+	});
+
 	it("auto-claims a tab created through Target.createTarget", async () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
@@ -457,6 +475,47 @@ describe("RelayBridge tab grouping", () => {
 		const groups = ext.rpcs("group");
 		expect(groups).toHaveLength(1);
 		expect(groups[0]!.tabIds).toEqual([9]);
+	});
+
+	it("consumes the provisional claim when the creating worker adopts its own tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const worker = new FakeCdpSocket();
+		const workerConn = bridge.cdpConnected(worker);
+		bridge.cdpMessage(workerConn, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		const workerSession = await attachPage(bridge, ext, worker, workerConn, 9);
+		const adopt = ++msgSeq;
+		bridge.cdpMessage(
+			workerConn,
+			JSON.stringify({
+				id: adopt,
+				sessionId: workerSession,
+				method: "OMP.claimTarget",
+				params: { ownsTarget: true },
+			}),
+		);
+		await flush();
+		expect(worker.messages.find(message => message.id === adopt)?.result).toEqual({});
+		const other = new FakeCdpSocket();
+		const otherConn = bridge.cdpConnected(other);
+		const otherSession = await attachPage(bridge, ext, other, otherConn, 9);
+		const steal = ++msgSeq;
+		bridge.cdpMessage(
+			otherConn,
+			JSON.stringify({
+				id: steal,
+				sessionId: otherSession,
+				method: "OMP.claimTarget",
+				params: { ownsTarget: true },
+			}),
+		);
+		await flush();
+		expect(other.messages.find(message => message.id === steal)?.error).toMatchObject({
+			message: expect.stringContaining("already driven by another omp session"),
+		});
 	});
 
 	it("hands a created tab from its supervisor to the owned worker without opening a second claim", async () => {
@@ -501,6 +560,33 @@ describe("RelayBridge tab grouping", () => {
 		const released = claim(otherConn, otherSession);
 		await flush();
 		expect(other.messages.find(message => message.id === released)?.result).toEqual({});
+	});
+
+	it("fails Target.createTarget with Chrome's refusal and closes the tab when the new tab cannot be attached", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.setAutoAttach", params: {} }));
+		await flush();
+		const createId = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: createId, method: "Target.createTarget", params: { url: "about:blank" } }),
+		);
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9, url: "about:blank" }) });
+		await flush();
+		// Chrome 155+ under an ExtensionSettings runtime_blocked_hosts policy refuses every chrome.debugger.attach.
+		nack(bridge, ext, "attach", "Host access is restricted by policy.");
+		await flush();
+		expect(ext.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+		ack(bridge, ext, "removeTab");
+		await flush();
+		const reply = cdp.messages.find(m => m.id === createId);
+		expect(reply).toMatchObject({
+			error: { message: expect.stringContaining("Host access is restricted by policy.") },
+		});
 	});
 
 	it("creates a Target.createTarget background tab without selecting it", () => {
@@ -610,6 +696,21 @@ describe("RelayBridge tab grouping", () => {
 		expect(ungroups[0]!.tabIds).toEqual([1]);
 	});
 
+	it("ungroups a tab when its claimant closes before the group RPC finishes", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const socket = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(socket);
+		await claimTab(bridge, ext, socket, conn, 1);
+		expect(ext.pending("group").map(rpc => rpc.tabIds)).toEqual([[1]]);
+		bridge.cdpClosed(conn);
+		expect(ext.rpcs("ungroup")).toHaveLength(0);
+		ack(bridge, ext, "group", { grouped: { "1": 42 } });
+		await flush();
+		expect(ext.rpcs("ungroup").map(rpc => rpc.tabIds)).toEqual([[1]]);
+	});
+
 	it("never overlaps group RPCs: a tab claimed mid-flight waits for the pending group", async () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
@@ -696,6 +797,88 @@ describe("RelayBridge child targets", () => {
 		["Target.detachedFromTarget", sessionId],
 	];
 
+	it("owns an explicitly attached child without arming auto-attach", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const page = await attachPage(bridge, ext, cdp, conn, 1);
+		const otherCdp = new FakeCdpSocket();
+		const other = bridge.cdpConnected(otherCdp);
+		const otherPage = await attachPage(bridge, ext, otherCdp, other, 1);
+		const attachId = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: attachId,
+				sessionId: page,
+				method: "Target.attachToTarget",
+				params: { targetId: "FRAME1", flatten: true },
+			}),
+		);
+		emit(bridge, ext, ATTACH);
+		ack(bridge, ext, "send", { sessionId: "CHILD1" });
+		await flush();
+		expect(cdp.sessionFor(attachId)).toBe("CHILD1");
+		const evaluateId = ++msgSeq;
+		const evaluate = { id: evaluateId, sessionId: "CHILD1", method: "Runtime.evaluate", params: { expression: "1" } };
+		bridge.cdpMessage(conn, JSON.stringify(evaluate));
+		bridge.cdpMessage(other, JSON.stringify(evaluate));
+		ack(bridge, ext, "send", { result: { type: "number", value: 1 } });
+		await flush();
+		expect(cdp.messages.find(message => message.id === evaluateId)).toMatchObject({
+			result: { result: { type: "number", value: 1 } },
+		});
+		expect(otherCdp.messages.find(message => message.id === evaluateId)).toMatchObject({
+			error: { message: "Unknown session id CHILD1" },
+		});
+		await armAutoAttach(bridge, ext, conn, "CHILD1");
+		emit(bridge, ext, NESTED_ATTACH);
+		await armAutoAttach(bridge, ext, conn, page);
+		await armAutoAttach(bridge, ext, other, otherPage);
+		emit(bridge, ext, {
+			method: "Target.attachedToTarget",
+			params: { sessionId: "AUTOMATIC", targetInfo: { targetId: "FRAME2", type: "iframe" } },
+		});
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId: page,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: false, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		await flush();
+		expect(cdp.messages).toContainEqual({
+			sessionId: page,
+			method: "Target.detachedFromTarget",
+			params: { sessionId: "AUTOMATIC" },
+		});
+		const afterOptOut = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ ...evaluate, id: afterOptOut }));
+		ack(bridge, ext, "send", { result: { type: "number", value: 1 } });
+		await flush();
+		expect(cdp.messages.find(message => message.id === afterOptOut)).toMatchObject({
+			result: { result: { type: "number", value: 1 } },
+		});
+		const descendantId = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ ...evaluate, id: descendantId, sessionId: "CHILD2" }));
+		ack(bridge, ext, "send", { result: { type: "number", value: 1 } });
+		await flush();
+		expect(cdp.messages.find(message => message.id === descendantId)).toMatchObject({
+			result: { result: { type: "number", value: 1 } },
+		});
+		emit(bridge, ext, NAVIGATE, DETACH);
+		expect(childTraffic(cdp).filter(([method]) => method !== undefined)).toEqual([
+			["Target.attachedToTarget", "CHILD1"],
+			["Page.frameNavigated", "CHILD1"],
+			["Target.detachedFromTarget", page],
+		]);
+		expect(childTraffic(otherCdp).filter(([method]) => method !== undefined)).toEqual(lifecycleOn(otherPage));
+	});
+
 	it("announces a real child target only to the page session that armed auto-attach", async () => {
 		const bridge = new RelayBridge({});
 		const ext = new FakeExtSocket();
@@ -734,6 +917,255 @@ describe("RelayBridge child targets", () => {
 		emit(bridge, ext, NAVIGATE, DETACH);
 
 		expect(childTraffic(cdp)).toEqual(lifecycleOn(first));
+	});
+
+	it("revokes automatic children when the last local page is released while another connection remains armed", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const page = await attachPage(bridge, ext, cdp, conn, 1);
+		await armAutoAttach(bridge, ext, conn, page);
+		const otherCdp = new FakeCdpSocket();
+		const other = bridge.cdpConnected(otherCdp);
+		const otherPage = await attachPage(bridge, ext, otherCdp, other, 1);
+		await armAutoAttach(bridge, ext, other, otherPage);
+		emit(bridge, ext, ATTACH);
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId: page } }),
+		);
+		await flush();
+		const commandId = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: commandId,
+				sessionId: "CHILD1",
+				method: "Runtime.evaluate",
+				params: { expression: "1" },
+			}),
+		);
+		await flush();
+		expect(cdp.messages.find(message => message.id === commandId)).toMatchObject({
+			error: { message: "Unknown session id CHILD1" },
+		});
+		expect(ext.pending("send")).toEqual([]);
+		emit(bridge, ext, NAVIGATE);
+		expect(childTraffic(cdp).filter(([method]) => method !== undefined)).toEqual([
+			["Target.attachedToTarget", page],
+			["Target.detachedFromTarget", page],
+		]);
+		expect(childTraffic(otherCdp)).toEqual([
+			["Target.attachedToTarget", otherPage],
+			["Page.frameNavigated", "CHILD1"],
+		]);
+	});
+
+	it.each(["disconnect", "release"])(
+		"isolates opt-out and disarms Chrome when the final armed holder leaves by %s",
+		async leave => {
+			const bridge = new RelayBridge({});
+			const ext = new FakeExtSocket();
+			connect(bridge, ext, [tab({ tabId: 1 })]);
+			const firstCdp = new FakeCdpSocket();
+			const first = bridge.cdpConnected(firstCdp);
+			const firstSession = await attachPage(bridge, ext, firstCdp, first, 1);
+			await armAutoAttach(bridge, ext, first, firstSession);
+			const secondCdp = new FakeCdpSocket();
+			const second = bridge.cdpConnected(secondCdp);
+			const secondSession = await attachPage(bridge, ext, secondCdp, second, 1);
+			await armAutoAttach(bridge, ext, second, secondSession);
+			if (leave === "disconnect") {
+				await armAutoAttach(bridge, ext, second, await attachPage(bridge, ext, secondCdp, second, 1));
+			}
+			emit(bridge, ext, ATTACH);
+			const thirdCdp = new FakeCdpSocket();
+			const third = bridge.cdpConnected(thirdCdp);
+			await armAutoAttach(bridge, ext, third, await attachPage(bridge, ext, thirdCdp, third, 1));
+			bridge.cdpClosed(third);
+			await flush();
+			expect(ext.pending("send")).toEqual([]);
+			emit(bridge, ext, NAVIGATE);
+			expect(childTraffic(secondCdp)).toContainEqual(["Page.frameNavigated", "CHILD1"]);
+
+			bridge.cdpMessage(
+				first,
+				JSON.stringify({
+					id: ++msgSeq,
+					sessionId: firstSession,
+					method: "Target.setAutoAttach",
+					params: { autoAttach: false, waitForDebuggerOnStart: false, flatten: true },
+				}),
+			);
+			await flush();
+			expect(ext.pending("send")).toEqual([]);
+			expect(childTraffic(firstCdp)).toEqual([
+				["Target.attachedToTarget", firstSession],
+				["Page.frameNavigated", "CHILD1"],
+				["Target.detachedFromTarget", firstSession],
+			]);
+			const detachedCommand = ++msgSeq;
+			bridge.cdpMessage(
+				first,
+				JSON.stringify({
+					id: detachedCommand,
+					sessionId: "CHILD1",
+					method: "Runtime.evaluate",
+					params: { expression: "1" },
+				}),
+			);
+			await flush();
+			expect(firstCdp.messages.find(message => message.id === detachedCommand)).toMatchObject({
+				error: { message: "Unknown session id CHILD1" },
+			});
+			expect(ext.pending("send")).toEqual([]);
+			const optedOut = firstCdp.messages.length;
+			emit(bridge, ext, NAVIGATE, NESTED_ATTACH);
+			expect(firstCdp.messages).toHaveLength(optedOut);
+			expect(childTraffic(secondCdp)).toContainEqual(["Page.frameNavigated", "CHILD1"]);
+			emit(bridge, ext, DETACH, ATTACH);
+			expect(firstCdp.messages).toHaveLength(optedOut);
+
+			// The opted-out connection still holds the tab, so releasing the last armed holder must disarm Chrome.
+			if (leave === "disconnect") bridge.cdpClosed(second);
+			else
+				bridge.cdpMessage(
+					second,
+					JSON.stringify({
+						id: ++msgSeq,
+						method: "Target.detachFromTarget",
+						params: { sessionId: secondSession },
+					}),
+				);
+			await flush();
+			expect(ext.pending("send").map(rpc => [rpc.method, rpc.params])).toEqual([
+				["Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }],
+			]);
+			ack(bridge, ext, "send");
+			await flush();
+			expect(ext.pending("send")).toEqual([]);
+		},
+	);
+
+	it("disarms Chrome after another holder's in-flight enable fails", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const firstCdp = new FakeCdpSocket();
+		const first = bridge.cdpConnected(firstCdp);
+		const session = await attachPage(bridge, ext, firstCdp, first, 1);
+		await armAutoAttach(bridge, ext, first, session);
+		const secondCdp = new FakeCdpSocket();
+		const second = bridge.cdpConnected(secondCdp);
+		const other = await attachPage(bridge, ext, secondCdp, second, 1);
+		bridge.cdpMessage(
+			second,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId: other,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		bridge.cdpMessage(
+			first,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId: session,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: false, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		nack(bridge, ext, "send");
+		await flush();
+		expect(ext.pending("send").map(rpc => [rpc.method, rpc.params?.autoAttach])).toEqual([
+			["Target.setAutoAttach", false],
+		]);
+		ack(bridge, ext, "send");
+		await flush();
+	});
+
+	it.each(["disconnect", "release"])("retries a failed disable after its holder leaves by %s", async leave => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const session = await attachPage(bridge, ext, cdp, conn, 1);
+		await armAutoAttach(bridge, ext, conn, session);
+		const registry = new FakeCdpSocket();
+		await attachPage(bridge, ext, registry, bridge.cdpConnected(registry), 1);
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId: session,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: false, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		if (leave === "disconnect") bridge.cdpClosed(conn);
+		else
+			bridge.cdpMessage(
+				conn,
+				JSON.stringify({
+					id: ++msgSeq,
+					method: "Target.detachFromTarget",
+					params: { sessionId: session },
+				}),
+			);
+		nack(bridge, ext, "send");
+		await flush();
+		expect(ext.pending("send").map(rpc => [rpc.method, rpc.params?.autoAttach])).toEqual([
+			["Target.setAutoAttach", false],
+		]);
+		ack(bridge, ext, "send");
+		await flush();
+	});
+
+	it("rejects a queued auto-attach after its page session is released", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp);
+		const first = await attachPage(bridge, ext, cdp, conn, 1);
+		const queued = await attachPage(bridge, ext, cdp, conn, 1);
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: ++msgSeq,
+				sessionId: first,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		const queuedId = ++msgSeq;
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: queuedId,
+				sessionId: queued,
+				method: "Target.setAutoAttach",
+				params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+			}),
+		);
+		bridge.cdpMessage(
+			conn,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.detachFromTarget",
+				params: { sessionId: queued },
+			}),
+		);
+		ack(bridge, ext, "send");
+		await flush();
+		expect(cdp.messages.find(message => message.id === queuedId)).toMatchObject({
+			error: { message: `Unknown session id ${queued}` },
+		});
+		expect(ext.pending("send")).toEqual([]);
 	});
 
 	it("does not report children to a session whose Target.setAutoAttach failed", async () => {
@@ -1129,7 +1561,172 @@ describe("RelayBridge Runtime sessions", () => {
 	});
 });
 
+describe("RelayBridge command deadlines", () => {
+	/** Send one command on a fresh page session and let `ms` pass with Chrome not answering; returns its reply, if any. */
+	async function unansweredFor(method: string, params: Record<string, unknown>, ms: number) {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		jest.useFakeTimers();
+		try {
+			const id = ++msgSeq;
+			bridge.cdpMessage(connId, JSON.stringify({ id, sessionId, method, params }));
+			await flush();
+			jest.advanceTimersByTime(ms);
+			await flush();
+			return cdp.messages.find(m => m.id === id);
+		} finally {
+			jest.useRealTimers();
+		}
+	}
+
+	// omp's clients give up at `BROWSER_PROTOCOL_TIMEOUT_MS` (60 s); the relay waits 5 s past that.
+	const clientGivesUpMs = 60_000;
+	const pageBoundMs = clientGivesUpMs + 5_000;
+
+	it.each([
+		["Runtime.callFunctionOn", { functionDeclaration: "() => new Promise(() => {})", awaitPromise: true }],
+		["Runtime.awaitPromise", { promiseObjectId: "1" }],
+		["Page.navigate", { url: "https://example.com/slow" }],
+	])("keeps waiting on %s, whose answer waits on the page, until omp's own client gave up", async (method, params) => {
+		expect(await unansweredFor(method, params, clientGivesUpMs)).toBeUndefined();
+		expect(JSON.stringify(await unansweredFor(method, params, pageBoundMs))).toContain(
+			`${method} on tab 1: Chrome sent no answer within ${pageBoundMs}ms`,
+		);
+	});
+
+	it("fails a command Chrome answers at once after 20 s, naming the command and the tab", async () => {
+		expect(
+			JSON.stringify(await unansweredFor("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 }, 20_000)),
+		).toContain("Input.dispatchMouseEvent on tab 1: Chrome sent no answer within 20000ms");
+		// An evaluation that does not wait on its promise is answered at once, so it keeps the 20 s deadline.
+		expect(
+			JSON.stringify(await unansweredFor("Runtime.evaluate", { expression: "1", awaitPromise: false }, 20_000)),
+		).toContain("Runtime.evaluate on tab 1: Chrome sent no answer within 20000ms");
+	});
+});
+
 describe("RelayBridge attachment release", () => {
+	it("keeps a tab Chrome detached on its own adoptable, but bans it after the user cancels the debugging bar", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets", params: {} }));
+		await flush();
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const created = () =>
+			cdp.messages.filter(
+				m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"PAGE${ANON}.1"`),
+			).length;
+		expect(created()).toBe(1);
+
+		// Another extension's frame started loading in the tab: Chrome drops the debugger on its own.
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "target_closed" }));
+		await flush();
+		expect(
+			cdp.messages.some(
+				m =>
+					m.method === "Target.detachedFromTarget" &&
+					m.params !== null &&
+					typeof m.params === "object" &&
+					"sessionId" in m.params &&
+					m.params.sessionId === sessionId,
+			),
+		).toBe(true);
+		// Announced again at once and still listed, so an open can adopt the same tab.
+		expect(created()).toBe(2);
+		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE${ANON}.1`]);
+		const readopted = await attachPage(bridge, ext, cdp, connId, 1);
+		expect(readopted).not.toBe(sessionId);
+
+		// The user pressing Cancel on the debugging bar is a refusal: the tab is hidden until it navigates.
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "canceled_by_user" }));
+		await flush();
+		expect(created()).toBe(2);
+		expect(bridge.listTargets()).toEqual([]);
+		const refusedId = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: refusedId, method: "Target.attachToTarget", params: { targetId: `PAGE${ANON}.1` } }),
+		);
+		await flush();
+		expect(ext.pending("attach")).toEqual([]);
+		expect(cdp.messages.some(m => m.id === refusedId && "error" in m)).toBe(true);
+	});
+
+	it("tells the driving session why Chrome detached before failing its command in flight", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const clickId = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: clickId,
+				sessionId,
+				method: "Input.dispatchMouseEvent",
+				params: { type: "mousePressed" },
+			}),
+		);
+		await flush();
+
+		// Chrome answers the command in flight before it reports the detach.
+		nack(bridge, ext, "send", "Detached while handling command.");
+		await flush();
+		expect(cdp.messages.some(m => m.id === clickId)).toBe(false);
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "target_closed" }));
+		await flush();
+		const told = cdp.messages.findIndex(m => m.method === "OMP.debuggerDetached" && m.sessionId === sessionId);
+		expect(told).toBeGreaterThanOrEqual(0);
+		expect(cdp.messages.findIndex(m => m.id === clickId && "error" in m)).toBeGreaterThan(told);
+	});
+
+	it("neither reports nor re-announces the detach of a tab the relay is closing", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets", params: {} }));
+		await flush();
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const created = () =>
+			cdp.messages.filter(
+				m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"PAGE${ANON}.1"`),
+			).length;
+		const closeId = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: closeId,
+				sessionId,
+				method: "Target.closeTarget",
+				params: { targetId: `PAGE${ANON}.1` },
+			}),
+		);
+		await flush();
+		expect(ext.pending("removeTab").map(r => r.tabId)).toEqual([1]);
+
+		// Chrome reports the debugger detach of the closing tab before its removal.
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "target_closed" }));
+		await flush();
+		expect(cdp.messages.some(m => m.method === "OMP.debuggerDetached")).toBe(false);
+		expect(created()).toBe(1);
+		ack(bridge, ext, "removeTab");
+		bridge.extMessage(ext, JSON.stringify({ t: "tabRemoved", tabId: 1 }));
+		await flush();
+		expect(cdp.messages.some(m => m.id === closeId && "result" in m)).toBe(true);
+		expect(bridge.listTargets()).toEqual([]);
+	});
+
 	it("detaches cleanly on explicit last-session release and permits reattachment", async () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
 		const ext = new FakeExtSocket();
@@ -1715,6 +2312,252 @@ describe("RelayBridge multiple extension instances", () => {
 		expect(chromeSends).toEqual([1]);
 		expect(edgeSends).toEqual([1]);
 	});
+
+	it("opens new tabs in the browser showing the first selected tab, not the one that reconnected last", () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1, active: true })]);
+		connectInstance(bridge, new FakeExtSocket(), "edge", [tab({ tabId: 1, active: true })]);
+		// Edge's service worker restarts and says hello again.
+		const edge = new FakeExtSocket();
+		connectInstance(bridge, edge, "edge", [tab({ tabId: 1, active: true })]);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget", params: {} }));
+		expect(chrome.rpcs("createTab")).toHaveLength(1);
+		expect(edge.rpcs("createTab")).toHaveLength(0);
+	});
+
+	it("opens new tabs in the browser of a tab the client already drives", async () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		const edge = new FakeExtSocket();
+		connectInstance(bridge, edge, "edge", [tab({ tabId: 1 })]);
+		// Chrome both shows the selected tab and said hello last.
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1, active: true })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, edge, cdp, connId, 1, "edge");
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget", params: {} }));
+		expect(edge.rpcs("createTab")).toHaveLength(1);
+		expect(chrome.rpcs("createTab")).toHaveLength(0);
+	});
+
+	it("opens a new tab in the browser of nearTargetId after the user closed that tab", () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		const edge = new FakeExtSocket();
+		connectInstance(bridge, edge, "edge", [tab({ tabId: 1 })]);
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1, active: true })]);
+		bridge.extMessage(edge, JSON.stringify({ t: "tabRemoved", tabId: 1 }));
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.createTarget",
+				params: { url: "about:blank", nearTargetId: `PAGE${instanceCode("edge")}.1` },
+			}),
+		);
+		expect(edge.rpcs("createTab")).toHaveLength(1);
+		expect(chrome.rpcs("createTab")).toHaveLength(0);
+	});
+
+	it("waits for the browser of nearTargetId to reconnect instead of opening the tab in another browser", async () => {
+		const bridge = new RelayBridge({});
+		const edge = new FakeExtSocket();
+		const chrome = new FakeExtSocket();
+		connectInstance(bridge, edge, "edge", [tab({ tabId: 1 })]);
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1, active: true })]);
+		bridge.extClosed(edge);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.createTarget",
+				params: { url: "about:blank", nearTargetId: `PAGE${instanceCode("edge")}.1` },
+			}),
+		);
+		await flush();
+		expect(chrome.rpcs("createTab")).toHaveLength(0);
+		const back = new FakeExtSocket();
+		connectInstance(bridge, back, "edge", [tab({ tabId: 1 })]);
+		await flush();
+		expect(back.rpcs("createTab")).toHaveLength(1);
+		expect(chrome.rpcs("createTab")).toHaveLength(0);
+	});
+
+	it("opens the tab in another browser once the browser of nearTargetId stays offline past its reconnect window", async () => {
+		jest.useFakeTimers();
+		try {
+			const bridge = new RelayBridge({});
+			const edge = new FakeExtSocket();
+			const chrome = new FakeExtSocket();
+			connectInstance(bridge, edge, "edge", [tab({ tabId: 1 })]);
+			connectInstance(bridge, chrome, "chrome", [tab({ tabId: 1, active: true })]);
+			bridge.extClosed(edge);
+			const connId = bridge.cdpConnected(new FakeCdpSocket());
+			bridge.cdpMessage(
+				connId,
+				JSON.stringify({
+					id: ++msgSeq,
+					method: "Target.createTarget",
+					params: { url: "about:blank", nearTargetId: `PAGE${instanceCode("edge")}.1` },
+				}),
+			);
+			await flush();
+			jest.advanceTimersByTime(12_000);
+			await flush();
+			expect(chrome.rpcs("createTab")).toHaveLength(1);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	it("retires a browser's targets once it restarted, so an old target id never names a tab that reuses its id", async () => {
+		const bridge = new RelayBridge({});
+		const before = new FakeExtSocket();
+		connectInstance(bridge, before, "chrome", [tab({ tabId: 7 })], [], "run-1");
+		const oldTarget = bridge.listTargets()[0]?.id;
+		// A service-worker restart keeps the browser run, and with it the target id.
+		const reconnected = new FakeExtSocket();
+		connectInstance(bridge, reconnected, "chrome", [tab({ tabId: 7 })], [], "run-1");
+		expect(bridge.listTargets().map(target => target.id)).toEqual([oldTarget]);
+		// Chrome restarted: tab 7 is now a page the user opened.
+		const restarted = new FakeExtSocket();
+		connectInstance(bridge, restarted, "chrome", [tab({ tabId: 7, url: "https://mail.example/" })], [], "run-2");
+		expect(bridge.listTargets().map(target => target.id)).not.toContain(oldTarget);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const closeId = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: closeId, method: "Target.closeTarget", params: { targetId: oldTarget } }),
+		);
+		await flush();
+		expect(cdp.messages.find(message => message.id === closeId)).toHaveProperty("error");
+		expect(restarted.rpcs("removeTab")).toHaveLength(0);
+	});
+
+	it("closes a tab Chrome creates after the createTab RPC timed out", async () => {
+		jest.useFakeTimers();
+		try {
+			const bridge = new RelayBridge({});
+			const ext = new FakeExtSocket();
+			connect(bridge, ext, []);
+			const cdp = new FakeCdpSocket();
+			const connId = bridge.cdpConnected(cdp);
+			const createId = ++msgSeq;
+			bridge.cdpMessage(connId, JSON.stringify({ id: createId, method: "Target.createTarget", params: {} }));
+			await flush();
+			jest.advanceTimersByTime(20_000);
+			await flush();
+			expect(cdp.messages.find(message => message.id === createId)).toHaveProperty("error");
+			// Chrome answers late: nobody learned the tab's id, so the relay closes it.
+			ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+			await flush();
+			expect(ext.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	it("forgets a timed-out createTab once its late window passes, so a wedged extension cannot grow the relay", async () => {
+		jest.useFakeTimers();
+		try {
+			const bridge = new RelayBridge({});
+			const ext = new FakeExtSocket();
+			connect(bridge, ext, []);
+			const connId = bridge.cdpConnected(new FakeCdpSocket());
+			bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget", params: {} }));
+			await flush();
+			jest.advanceTimersByTime(20_000 + 60_000);
+			await flush();
+			// The relay no longer tracks the request, so an answer this late changes nothing.
+			ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+			await flush();
+			expect(ext.rpcs("removeTab")).toHaveLength(0);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+});
+
+describe("closeRelayTarget", () => {
+	/** A browser-level channel onto one bridge connection, as the tab supervisor's root connection is. */
+	function channel(bridge: RelayBridge): Pick<CDPSession, "send"> {
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const send = async (method: string, params: object = {}): Promise<unknown> => {
+			const id = ++msgSeq;
+			bridge.cdpMessage(connId, JSON.stringify({ id, method, params }));
+			await flush();
+			const reply = cdp.messages.find(msg => msg.id === id);
+			if (!reply) throw new Error(`no reply to ${method}`);
+			if ("error" in reply) throw new Error(JSON.stringify(reply.error));
+			return reply.result;
+		};
+		return { send } as unknown as Pick<CDPSession, "send">;
+	}
+
+	it("does not report a tab closed while its browser's extension is offline, and closes it once that browser reconnects", async () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 7 }), tab({ tabId: 8 })]);
+		bridge.extClosed(chrome);
+		expect(await closeRelayTarget(channel(bridge), `PAGE${instanceCode("chrome")}.7`)).toBeFalse();
+		const back = new FakeExtSocket();
+		connectInstance(bridge, back, "chrome", [tab({ tabId: 7 }), tab({ tabId: 8 })]);
+		expect(back.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([7]);
+		// It drops again before closing the tab: the next reconnect closes it.
+		bridge.extClosed(back);
+		await flush();
+		const again = new FakeExtSocket();
+		connectInstance(bridge, again, "chrome", [tab({ tabId: 7 }), tab({ tabId: 8 })]);
+		expect(again.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([7]);
+	});
+
+	it("closes a tab whose close its browser dropped mid-call once that browser reconnects", async () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 7 })]);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({
+				id: ++msgSeq,
+				method: "Target.closeTarget",
+				params: { targetId: `PAGE${instanceCode("chrome")}.7` },
+			}),
+		);
+		await flush();
+		expect(chrome.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([7]);
+		bridge.extClosed(chrome);
+		await flush();
+		const back = new FakeExtSocket();
+		connectInstance(bridge, back, "chrome", [tab({ tabId: 7 })]);
+		expect(back.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([7]);
+	});
+
+	it("does not close a tab whose id now shows another page when its browser reconnects", async () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 7 })]);
+		bridge.extClosed(chrome);
+		expect(await closeRelayTarget(channel(bridge), `PAGE${instanceCode("chrome")}.7`)).toBeFalse();
+		// Chrome restarted meanwhile: tab 7 is a page the user opened.
+		const back = new FakeExtSocket();
+		connectInstance(bridge, back, "chrome", [tab({ tabId: 7, url: "https://mail.example/" })]);
+		expect(back.rpcs("removeTab")).toHaveLength(0);
+	});
+
+	it("reports a tab the relay no longer knows as closed", async () => {
+		const bridge = new RelayBridge({});
+		connectInstance(bridge, new FakeExtSocket(), "chrome", [tab({ tabId: 7 })]);
+		expect(await closeRelayTarget(channel(bridge), `PAGE${instanceCode("chrome")}.8`)).toBeTrue();
+	});
 });
 
 describe("RelayBridge last-hello fallback and offline instance pruning", () => {
@@ -1831,6 +2674,104 @@ describe("RelayBridge orphan reaper close (OMP.closeOwnedTarget)", () => {
 		expect(resultOf(userTab)).toEqual({ closed: false });
 		expect(resultOf(drivenTab)).toEqual({ closed: false });
 		expect(resultOf(orphan)).toEqual({ closed: true });
+	});
+
+	it("rejects adoption while an orphan close is in flight and permits retry after failure", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 2 })], [2]);
+		const driver = new FakeCdpSocket();
+		const driverConn = bridge.cdpConnected(driver);
+		const sessionId = await attachPage(bridge, ext, driver, driverConn, 2);
+		const reaper = new FakeCdpSocket();
+		reap(bridge, reaper, bridge.cdpConnected(reaper), 2);
+		await flush();
+		const claimId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: claimId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === claimId)?.error).toEqual({
+			code: -32000,
+			message: `Tab ${ANON}:2 is closing`,
+		});
+		const remove = ext.pending("removeTab")[0]!;
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: remove.id, error: "close refused" }));
+		await flush();
+		const retryId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: retryId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === retryId)?.result).toEqual({});
+		bridge.extClosed(ext);
+		const back = new FakeExtSocket();
+		helloWithOwned(bridge, back, [tab({ tabId: 2 })], [2]);
+		expect(back.rpcs("removeTab")).toHaveLength(0);
+	});
+
+	it("joins concurrent orphan closes so a failed close cannot leave another removal behind an adopted tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 2 })], [2]);
+		const driver = new FakeCdpSocket();
+		const driverConn = bridge.cdpConnected(driver);
+		const sessionId = await attachPage(bridge, ext, driver, driverConn, 2);
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		const first = reap(bridge, reaper, reaperConn, 2);
+		const second = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+		const claimId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: claimId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === claimId)?.error).toMatchObject({
+			message: expect.stringContaining("is closing"),
+		});
+		const remove = ext.pending("removeTab")[0]!;
+		ext.markAcked(remove.id);
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: remove.id, error: "close refused" }));
+		await flush();
+		for (const id of [first, second]) {
+			expect(reaper.messages.find(message => message.id === id)?.error).toMatchObject({
+				message: expect.stringContaining("close refused"),
+			});
+		}
+		expect(ext.pending("removeTab")).toHaveLength(0);
+		const retryId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: retryId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === retryId)?.result).toEqual({});
+		const stale = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(reaper.messages.find(message => message.id === stale)?.result).toEqual({ closed: false });
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+	});
+
+	it("keeps a replacement connection's close locked when the old connection fails", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		helloWithOwned(bridge, ext, [tab({ tabId: 2 })], [2]);
+		const reaper = new FakeCdpSocket();
+		const reaperConn = bridge.cdpConnected(reaper);
+		const previous = reap(bridge, reaper, reaperConn, 2);
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+		bridge.extClosed(ext);
+		const back = new FakeExtSocket();
+		helloWithOwned(bridge, back, [tab({ tabId: 2 })], [2]);
+		const current = reap(bridge, reaper, reaperConn, 2);
+		await flush();
+		expect(back.rpcs("removeTab")).toHaveLength(1);
+		expect(reaper.messages.find(message => message.id === previous)?.error).toBeDefined();
+		const driver = new FakeCdpSocket();
+		const driverConn = bridge.cdpConnected(driver);
+		const sessionId = await attachPage(bridge, back, driver, driverConn, 2);
+		const claimId = ++msgSeq;
+		bridge.cdpMessage(driverConn, JSON.stringify({ id: claimId, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		expect(driver.messages.find(message => message.id === claimId)?.error).toMatchObject({
+			message: expect.stringContaining("is closing"),
+		});
+		ack(bridge, back, "removeTab");
+		await flush();
+		expect(reaper.messages.find(message => message.id === current)?.result).toEqual({ closed: true });
 	});
 
 	it("errors (record retained) while the target's browser is disconnected", async () => {
@@ -1988,6 +2929,80 @@ describe("RelayBridge orphan reaper close (OMP.closeOwnedTarget)", () => {
 	});
 });
 
+describe("RelayBridge page-session target lifecycle", () => {
+	it("opens, activates and closes targets a page session asks for in that page's browser", async () => {
+		const bridge = new RelayBridge({});
+		const chrome = new FakeExtSocket();
+		const edge = new FakeExtSocket();
+		connectInstance(bridge, chrome, "chrome", [
+			tab({ tabId: 1, title: "Chrome tab", url: "https://chrome.example/" }),
+		]);
+		// Edge helloes last, so browser-wide creates go there.
+		connectInstance(bridge, edge, "edge", [tab({ tabId: 1, title: "Edge tab", url: "https://edge.example/" })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, chrome, cdp, connId, 1, "chrome");
+		const send = async (method: string, params: Record<string, unknown>) => {
+			const id = ++msgSeq;
+			bridge.cdpMessage(connId, JSON.stringify({ id, sessionId, method, params }));
+			await flush();
+			return id;
+		};
+		const reply = (id: number) => cdp.messages.find(message => message.id === id);
+		const created = `PAGE${instanceCode("chrome")}.9`;
+
+		const createId = await send("Target.createTarget", { url: "https://example.com/", newWindow: true });
+		ack(bridge, chrome, "createTab", { tab: tab({ tabId: 9, title: "Created", url: "https://example.com/" }) });
+		await flush();
+		const activateId = await send("Target.activateTarget", { targetId: created });
+		ack(bridge, chrome, "activateTab");
+		await flush();
+		const closeId = await send("Target.closeTarget", { targetId: created });
+		ack(bridge, chrome, "removeTab");
+		await flush();
+
+		// Sent raw, Chrome would open its own window and answer with an id the relay cannot resolve.
+		expect(chrome.rpcs("send").map(rpc => rpc.method)).toEqual([]);
+		expect(edge.rpcs("createTab")).toHaveLength(0);
+		expect(chrome.rpcs("createTab").map(rpc => rpc.url)).toEqual(["https://example.com/"]);
+		expect(reply(createId)).toMatchObject({ sessionId, result: { targetId: created } });
+		expect(chrome.rpcs("activateTab").map(rpc => rpc.tabId)).toEqual([9]);
+		expect(reply(activateId)?.result).toEqual({});
+		expect(chrome.rpcs("removeTab").map(rpc => rpc.tabId)).toEqual([9]);
+		expect(reply(closeId)?.result).toEqual({ success: true });
+	});
+
+	it("fails a page session's activate or close of a target the relay does not know", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const ids: number[] = [];
+		for (const [method, params] of [
+			["Target.activateTarget", { targetId: "2E08A730A7A82AC514A041D202746564" }],
+			["Target.activateTarget", { targetId: `PAGE${ANON}.9` }],
+			["Target.activateTarget", {}],
+			["Target.closeTarget", { targetId: "2E08A730A7A82AC514A041D202746564" }],
+		] as const) {
+			const id = ++msgSeq;
+			ids.push(id);
+			bridge.cdpMessage(connId, JSON.stringify({ id, sessionId, method, params }));
+		}
+		await flush();
+
+		for (const id of ids) {
+			expect(cdp.messages.find(message => message.id === id)).toMatchObject({
+				sessionId,
+				error: { message: expect.stringContaining("No target with id") },
+			});
+		}
+		expect(ext.rpcs("send")).toHaveLength(0);
+		expect(ext.rpcs("activateTab")).toHaveLength(0);
+		expect(ext.rpcs("removeTab")).toHaveLength(0);
+	});
+});
 describe("RelayBridge auto-attach gating", () => {
 	function destroyedIds(cdp: FakeCdpSocket): string[] {
 		const ids: string[] = [];
@@ -2097,6 +3112,46 @@ describe("RelayBridge auto-attach gating", () => {
 		expect(destroyedIds(cdp)).toContain(`PAGE${ANON}.2`);
 		expect(ext.rpcs("detach").map(r => r.tabId)).toContain(2);
 		ack(bridge, ext, "detach");
+	});
+
+	it("announces and attaches a tab again once its URL changes after Chrome refused its reattach", async () => {
+		const bridge = new RelayBridge();
+		const ext = new FakeExtSocket();
+		// Tab 2 is another relay tab in use, so the auto-attaching connection stays open throughout.
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets", params: { discover: true } }),
+		);
+		await flush();
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.setAutoAttach", params: { autoAttach: true } }),
+		);
+		ack(bridge, ext, "attach");
+		await flush();
+		const attachedTab1 = () => attachedIds(cdp).filter(id => id === `TAB${ANON}.1`).length;
+		expect(attachedTab1()).toBe(1);
+
+		// Another extension's frame loads in tab 1: Chrome detaches, and refuses the reattach while the frame is there.
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "target_closed" }));
+		await flush();
+		nack(bridge, ext, "attach", "Cannot access a chrome-extension:// URL of different extension");
+		await flush();
+		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE${ANON}.2`]);
+
+		// The frame is gone and the user navigates: the tab is announced and attached on the open connection again.
+		bridge.extMessage(
+			ext,
+			JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 1, url: "https://example.com/next" }) }),
+		);
+		await flush();
+		expect(ext.pending("attach").map(r => r.tabId)).toEqual([1]);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(attachedTab1()).toBe(2);
 	});
 
 	it("does not reattach an initially discovered tab discarded during attach", async () => {
@@ -2209,6 +3264,28 @@ describe("RelayBridge auto-attach gating", () => {
 		expect(ext.rpcs("attach")).toHaveLength(0);
 	});
 
+	it("announces to discovering clients the tabs a browser brings in its hello", async () => {
+		const bridge = new RelayBridge();
+		connectInstance(bridge, new FakeExtSocket(), "first", [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets", params: { discover: true } }),
+		);
+		await flush();
+		// A second browser connects with a tab the client has never seen, as one does whose extension says
+		// hello after its tabs already exist.
+		connectInstance(bridge, new FakeExtSocket(), "second", [tab({ tabId: 5, title: "First" })]);
+		await flush();
+		const second = `PAGE${instanceCode("second")}.5`;
+		expect(bridge.listTargets().map(target => target.id)).toContain(second);
+		const created = cdp.messages.filter(
+			m => m.method === "Target.targetCreated" && JSON.stringify(m.params).includes(`"${second}"`),
+		);
+		expect(created).toHaveLength(1);
+	});
+
 	it("reannounces a held tab on revival without attaching it while discarded", async () => {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();
@@ -2280,6 +3357,272 @@ describe("RelayBridge auto-attach gating", () => {
 	});
 });
 
+describe("RelayBridge front app on a window omp's input opens", () => {
+	/** A relay reading the front app as `n` (the read count), recording each app it holds in front and for how long. */
+	function frontAppRecorder(): { holds: Array<{ app: number; ms: number }>; frontApp: () => FrontApp } {
+		const holds: Array<{ app: number; ms: number }> = [];
+		let reads = 0;
+		return {
+			holds,
+			frontApp: () => {
+				const app = ++reads;
+				return {
+					keepInFront: async ms => {
+						holds.push({ app, ms });
+						return 1;
+					},
+				};
+			},
+		};
+	}
+
+	async function sendInput(bridge: RelayBridge, ext: FakeExtSocket, connId: number, sessionId: string): Promise<void> {
+		for (const type of ["mousePressed", "mouseReleased"]) {
+			bridge.cdpMessage(
+				connId,
+				JSON.stringify({
+					id: ++msgSeq,
+					sessionId,
+					method: "Input.dispatchMouseEvent",
+					params: { type, x: 5, y: 5 },
+				}),
+			);
+		}
+		ack(bridge, ext, "send");
+		await flush();
+	}
+
+	/** The tab's page (or, with `sessionId`, a frame of it on a child session) opening a window. */
+	function windowOpen(bridge: RelayBridge, ext: FakeExtSocket, tabId: number, sessionId?: string): void {
+		const params = { url: "https://example.com/", windowName: "", windowFeatures: [], userGesture: true };
+		bridge.extMessage(ext, JSON.stringify({ t: "cdpEvent", tabId, sessionId, method: "Page.windowOpen", params }));
+	}
+
+	it("holds the app that was in front at omp's input to a tab in front once that tab's page opens a window", async () => {
+		const { holds, frontApp } = frontAppRecorder();
+		const bridge = new RelayBridge();
+		bridge.keepFrontAppWith(frontApp);
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 }), tab({ tabId: 9, active: true })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const first = await attachPage(bridge, ext, cdp, connId, 1);
+		const second = await attachPage(bridge, ext, cdp, connId, 2);
+		// Reading the page reads no front app; only input can make Chrome open and show a window.
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, sessionId: first, method: "Runtime.evaluate", params: {} }),
+		);
+		ack(bridge, ext, "send");
+		// Reads 1 and 2 for tab 1, then 3 and 4 for omp's other tab.
+		await sendInput(bridge, ext, connId, first);
+		await sendInput(bridge, ext, connId, second);
+
+		// The click opens two windows; the user's own tab opens one of its own.
+		windowOpen(bridge, ext, 1);
+		windowOpen(bridge, ext, 1);
+		windowOpen(bridge, ext, 9);
+		await flush();
+		expect(holds).toEqual([{ app: 2, ms: 500 }]);
+		// A frame of omp's other tab opens one, reported on the frame's own session.
+		windowOpen(bridge, ext, 2, "CHILD1");
+		await flush();
+		expect(holds).toEqual([
+			{ app: 2, ms: 500 },
+			{ app: 4, ms: 500 },
+		]);
+		// Once that hold is over, a later window does not bring back the app read for the same input.
+		windowOpen(bridge, ext, 1);
+		await flush();
+		expect(holds).toHaveLength(2);
+	});
+
+	it.each([
+		{ case: "no input of omp's came before it", inputTab: null, after: 0 },
+		{ case: "omp's last input to its tab was over a second before it", inputTab: 1, after: 1_001 },
+		{ case: "omp's input went to another of its tabs", inputTab: 2, after: 0 },
+	])("holds no app in front for a window when $case", async ({ inputTab, after }) => {
+		jest.useFakeTimers();
+		try {
+			const { holds, frontApp } = frontAppRecorder();
+			const bridge = new RelayBridge();
+			bridge.keepFrontAppWith(frontApp);
+			const ext = new FakeExtSocket();
+			connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })]);
+			const cdp = new FakeCdpSocket();
+			const connId = bridge.cdpConnected(cdp);
+			const opener = await attachPage(bridge, ext, cdp, connId, 1);
+			const other = await attachPage(bridge, ext, cdp, connId, 2);
+			if (inputTab !== null) await sendInput(bridge, ext, connId, inputTab === 1 ? opener : other);
+			jest.advanceTimersByTime(after);
+			windowOpen(bridge, ext, 1);
+			await flush();
+			expect(holds).toEqual([]);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	it("reads the front app only on omp's inputs that can open a window, not on moves, key-ups or inserted text", async () => {
+		const { holds, frontApp } = frontAppRecorder();
+		const bridge = new RelayBridge();
+		bridge.keepFrontAppWith(frontApp);
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const send = async (method: string, params: Record<string, unknown>): Promise<void> => {
+			bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, sessionId, method, params }));
+			ack(bridge, ext, "send");
+			await flush();
+		};
+		await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 5, y: 5 });
+		await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: 5, y: 5, deltaX: 0, deltaY: 10 });
+		await send("Input.dispatchKeyEvent", { type: "keyUp", key: "a" });
+		await send("Input.insertText", { text: "a" });
+		windowOpen(bridge, ext, 1);
+		await flush();
+		expect(holds).toEqual([]);
+		// The first read, at the key going down.
+		await send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter" });
+		windowOpen(bridge, ext, 1);
+		await flush();
+		expect(holds).toEqual([{ app: 1, ms: 500 }]);
+	});
+
+	it("still forwards omp's input when reading the front app throws, and stops reading it", async () => {
+		let reads = 0;
+		const bridge = new RelayBridge();
+		bridge.keepFrontAppWith(() => {
+			reads++;
+			throw new Error("macOSFrontApp is missing from this native addon");
+		});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const sent = ext.rpcs("send").length;
+		await sendInput(bridge, ext, connId, sessionId);
+		const inputs = ext.rpcs("send").slice(sent);
+		expect(inputs.map(rpc => rpc.method)).toEqual(["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]);
+		const replies = cdp.messages.filter(m => typeof m.id === "number" && m.id > msgSeq - 2);
+		expect(replies.every(m => "result" in m && !("error" in m))).toBe(true);
+		expect(reads).toBe(1);
+	});
+
+	it("reads no front app while a hold runs, so a window opened after it never holds the browser in front", async () => {
+		let reads = 0;
+		const holds: number[] = [];
+		const ends: Array<() => void> = [];
+		const bridge = new RelayBridge();
+		bridge.keepFrontAppWith(() => {
+			const app = ++reads;
+			return {
+				keepInFront: () => {
+					holds.push(app);
+					const { promise, resolve } = Promise.withResolvers<number>();
+					ends.push(() => resolve(1));
+					return promise;
+				},
+			};
+		});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		await sendInput(bridge, ext, connId, sessionId);
+		windowOpen(bridge, ext, 1);
+		await flush();
+		expect(holds).toEqual([2]);
+		// The browser is in front while the hold runs; omp clicks again, and that click's window comes during the
+		// hold and once more after it.
+		await sendInput(bridge, ext, connId, sessionId);
+		windowOpen(bridge, ext, 1);
+		for (const end of ends) end();
+		await flush();
+		windowOpen(bridge, ext, 1);
+		await flush();
+		expect(reads).toBe(2);
+		expect(holds).toEqual([2]);
+	});
+
+	it("ends a hold at its deadline even while the native hold has not settled", async () => {
+		jest.useFakeTimers();
+		try {
+			let reads = 0;
+			const holds: number[] = [];
+			const bridge = new RelayBridge();
+			// The native hold is still queued behind other native work: it never settles here.
+			bridge.keepFrontAppWith(() => {
+				const app = ++reads;
+				return {
+					keepInFront: () => {
+						holds.push(app);
+						return Promise.withResolvers<number>().promise;
+					},
+				};
+			});
+			const ext = new FakeExtSocket();
+			connect(bridge, ext, [tab({ tabId: 1 })]);
+			const cdp = new FakeCdpSocket();
+			const connId = bridge.cdpConnected(cdp);
+			const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+			await sendInput(bridge, ext, connId, sessionId);
+			windowOpen(bridge, ext, 1);
+			await flush();
+			jest.advanceTimersByTime(500);
+			// The next click's window, after the first hold's 500 ms.
+			await sendInput(bridge, ext, connId, sessionId);
+			windowOpen(bridge, ext, 1);
+			await flush();
+			expect(holds).toEqual([2, 4]);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	it("keeps a rejected native hold guarded until its original deadline", async () => {
+		jest.useFakeTimers();
+		try {
+			let reads = 0;
+			const holds: number[] = [];
+			const bridge = new RelayBridge();
+			bridge.keepFrontAppWith(() => {
+				const app = ++reads;
+				return {
+					keepInFront: async () => {
+						holds.push(app);
+						throw new Error("desktop control is busy");
+					},
+				};
+			});
+			const ext = new FakeExtSocket();
+			connect(bridge, ext, [tab({ tabId: 1 })]);
+			const cdp = new FakeCdpSocket();
+			const connId = bridge.cdpConnected(cdp);
+			const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+			await sendInput(bridge, ext, connId, sessionId);
+			windowOpen(bridge, ext, 1);
+			await flush();
+			await sendInput(bridge, ext, connId, sessionId);
+			windowOpen(bridge, ext, 1);
+			await flush();
+			expect(reads).toBe(2);
+			expect(holds).toEqual([2]);
+			jest.advanceTimersByTime(500);
+			await sendInput(bridge, ext, connId, sessionId);
+			windowOpen(bridge, ext, 1);
+			await flush();
+			expect(holds).toEqual([2, 4]);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+});
+
 describe("RelayBridge active tab metadata", () => {
 	it("keeps only the newly activated tab active in its window", () => {
 		const bridge = new RelayBridge();
@@ -2298,5 +3641,355 @@ describe("RelayBridge active tab metadata", () => {
 			["Second", "true"],
 			["Other window", "true"],
 		]);
+	});
+});
+
+/** Turn a tab-wide `{ enabled }` switch on or off from one page session, as a client would. */
+async function setSwitch(
+	bridge: RelayBridge,
+	ext: FakeExtSocket,
+	connId: number,
+	sessionId: string,
+	method: string,
+	enabled: boolean,
+): Promise<void> {
+	bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, sessionId, method, params: { enabled } }));
+	await flush();
+	ack(bridge, ext, "send");
+	await flush();
+}
+
+/** `enabled` of every `method` command the bridge sent the extension, in order. */
+function switchSends(ext: FakeExtSocket, method: string): unknown[] {
+	return ext
+		.rpcs("send")
+		.filter(rpc => rpc.method === method)
+		.map(rpc => rpc.params?.enabled);
+}
+
+const CHOOSER = "Page.setInterceptFileChooserDialog";
+const FOCUS = "Emulation.setFocusEmulationEnabled";
+
+describe("RelayBridge file chooser interception", () => {
+	it("keeps interception on while another session on the tab still waits for a chooser", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		// A page's own `waitForFileChooser()` and an upload's chooser session share the tab's one attachment.
+		const waiting = await attachPage(bridge, ext, cdp, connId, 1);
+		const uploading = await attachPage(bridge, ext, cdp, connId, 1);
+		await setSwitch(bridge, ext, connId, waiting, CHOOSER, true);
+		await setSwitch(bridge, ext, connId, uploading, CHOOSER, true);
+		await setSwitch(bridge, ext, connId, uploading, CHOOSER, false);
+		await setSwitch(bridge, ext, connId, waiting, CHOOSER, false);
+		expect(switchSends(ext, CHOOSER)).toEqual([true, true, true, false]);
+	});
+
+	it("switches interception off when its last owner detaches or disconnects without disabling it", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		// The holder keeps the tab's attachment alive, as the registry connection does.
+		const holderCdp = new FakeCdpSocket();
+		const holderId = bridge.cdpConnected(holderCdp);
+		await attachPage(bridge, ext, holderCdp, holderId, 1);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+
+		const detached = await attachPage(bridge, ext, cdp, connId, 1);
+		await setSwitch(bridge, ext, connId, detached, CHOOSER, true);
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId: detached } }),
+		);
+		await flush();
+		ack(bridge, ext, "send");
+		expect(switchSends(ext, CHOOSER)).toEqual([true, false]);
+
+		const killed = await attachPage(bridge, ext, cdp, connId, 1);
+		await setSwitch(bridge, ext, connId, killed, CHOOSER, true);
+		bridge.cdpClosed(connId);
+		await flush();
+		expect(switchSends(ext, CHOOSER)).toEqual([true, false, true, false]);
+	});
+
+	/** Send an interception command without answering it; returns its CDP id. */
+	function request(bridge: RelayBridge, connId: number, sessionId: string, enabled: boolean): number {
+		const id = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id, sessionId, method: "Page.setInterceptFileChooserDialog", params: { enabled } }),
+		);
+		return id;
+	}
+
+	/** Answer the oldest unanswered interception RPC: the extension settles RPCs in any order. */
+	async function settleOldest(bridge: RelayBridge, ext: FakeExtSocket, ok: boolean): Promise<void> {
+		const rpc = ext.pending("send").find(pending => pending.method === "Page.setInterceptFileChooserDialog");
+		if (!rpc) throw new Error("no interception RPC pending");
+		ext.markAcked(rpc.id);
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: rpc.id, ok, error: ok ? undefined : "rpc failed" }));
+		await flush();
+	}
+
+	it("keeps a later enable when an earlier overlapping enable on the session fails", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const holderCdp = new FakeCdpSocket();
+		const holderId = bridge.cdpConnected(holderCdp);
+		await attachPage(bridge, ext, holderCdp, holderId, 1);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+
+		request(bridge, connId, sessionId, true);
+		const later = request(bridge, connId, sessionId, true);
+		await flush();
+		await settleOldest(bridge, ext, false);
+		await settleOldest(bridge, ext, true);
+		expect(cdp.messages.find(message => message.id === later)).toMatchObject({ result: {} });
+		// The later enable succeeded, so the session still owns interception and its detach must switch it off.
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id: ++msgSeq, method: "Target.detachFromTarget", params: { sessionId } }),
+		);
+		await flush();
+		expect(switchSends(ext, CHOOSER).at(-1)).toBe(false);
+	});
+
+	it("keeps interception on for an owner whose disable failed while another owner's disable succeeded", async () => {
+		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const first = await attachPage(bridge, ext, cdp, connId, 1);
+		const second = await attachPage(bridge, ext, cdp, connId, 1);
+		await setSwitch(bridge, ext, connId, first, CHOOSER, true);
+		await setSwitch(bridge, ext, connId, second, CHOOSER, true);
+
+		const failed = request(bridge, connId, first, false);
+		request(bridge, connId, second, false);
+		await flush();
+		await settleOldest(bridge, ext, false);
+		await settleOldest(bridge, ext, true);
+		expect(cdp.messages.find(message => message.id === failed)).toHaveProperty("error");
+		// `first` still asks for interception, so the tab must be left intercepting.
+		expect(switchSends(ext, CHOOSER).at(-1)).toBe(true);
+		await setSwitch(bridge, ext, connId, first, CHOOSER, false);
+		expect(switchSends(ext, CHOOSER).at(-1)).toBe(false);
+	});
+});
+
+describe("RelayBridge focus emulation", () => {
+	it("finishes focus reset before detaching a released tab and re-adopting it", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		await setSwitch(bridge, ext, connId, sessionId, FOCUS, true);
+
+		bridge.cdpClosed(connId);
+		await flush();
+		expect(switchSends(ext, FOCUS)).toEqual([true, false]);
+		expect(ext.rpcs("detach")).toEqual([]);
+
+		const next = new FakeCdpSocket();
+		const nextConn = bridge.cdpConnected(next);
+		const targetsId = ++msgSeq;
+		bridge.cdpMessage(nextConn, JSON.stringify({ id: targetsId, method: "Target.getTargets" }));
+		expect(next.messages.find(message => message.id === targetsId)).toMatchObject({
+			result: { targetInfos: [{ attached: false }] },
+		});
+		const reattachId = ++msgSeq;
+		bridge.cdpMessage(
+			nextConn,
+			JSON.stringify({
+				id: reattachId,
+				method: "Target.attachToTarget",
+				params: { targetId: `PAGE${ANON}.1`, flatten: true },
+			}),
+		);
+		await flush();
+		expect(ext.pending("attach")).toHaveLength(0);
+
+		ack(bridge, ext, "send");
+		await flush();
+		expect(ext.pending("detach")).toHaveLength(1);
+		ack(bridge, ext, "detach");
+		await flush();
+		expect(ext.pending("attach")).toHaveLength(1);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(next.sessionFor(reattachId)).toBeDefined();
+	});
+
+	it("keeps a tab focus-emulated while any session asks, and ends it when the last client goes away", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		// The long-lived registry connection keeps the debugger attached throughout.
+		const registry = new FakeCdpSocket();
+		await attachPage(bridge, ext, registry, bridge.cdpConnected(registry), 1);
+		const first = new FakeCdpSocket();
+		const firstConn = bridge.cdpConnected(first);
+		const firstSession = await attachPage(bridge, ext, first, firstConn, 1);
+		const second = new FakeCdpSocket();
+		const secondConn = bridge.cdpConnected(second);
+		const secondSession = await attachPage(bridge, ext, second, secondConn, 1);
+
+		await setSwitch(bridge, ext, firstConn, firstSession, FOCUS, true);
+		await setSwitch(bridge, ext, secondConn, secondSession, FOCUS, true);
+		bridge.cdpClosed(firstConn);
+		await flush();
+		expect(switchSends(ext, FOCUS)).toEqual([true, true]);
+
+		// A killed worker never turns it off itself.
+		bridge.cdpClosed(secondConn);
+		await flush();
+		expect(switchSends(ext, FOCUS)).toEqual([true, true, false]);
+		expect(ext.rpcs("detach")).toEqual([]);
+	});
+
+	it("restores a tab's switches after a service-worker restart drops the attachment", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		await setSwitch(bridge, ext, connId, sessionId, FOCUS, true);
+
+		const restarted = new FakeExtSocket();
+		connect(bridge, restarted, [tab({ tabId: 1 })]);
+		ack(bridge, restarted, "attach");
+		await flush();
+		expect(switchSends(restarted, FOCUS)).toEqual([true]);
+		expect(switchSends(restarted, CHOOSER)).toEqual([]);
+	});
+
+	it("brings a surviving attachment's switches to the live sessions' wishes when the extension reconnects", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const registry = new FakeCdpSocket();
+		await attachPage(bridge, ext, registry, bridge.cdpConnected(registry), 1);
+		const killed = new FakeCdpSocket();
+		const killedConn = bridge.cdpConnected(killed);
+		const killedSession = await attachPage(bridge, ext, killed, killedConn, 1);
+		const live = new FakeCdpSocket();
+		const liveConn = bridge.cdpConnected(live);
+		const liveSession = await attachPage(bridge, ext, live, liveConn, 1);
+		await setSwitch(bridge, ext, killedConn, killedSession, FOCUS, true);
+		await setSwitch(bridge, ext, killedConn, killedSession, CHOOSER, true);
+		await setSwitch(bridge, ext, liveConn, liveSession, FOCUS, true);
+
+		// The socket drops but chrome.debugger stays attached; the worker dies meanwhile, so nothing reaches the tab.
+		bridge.extClosed(ext);
+		bridge.cdpClosed(killedConn);
+		await flush();
+		const back = new FakeExtSocket();
+		connect(bridge, back, [tab({ tabId: 1 })], [1]);
+		await flush();
+		// Focus emulation is still on and still wanted; only the release that could not be sent is settled.
+		expect(switchSends(back, FOCUS)).toEqual([]);
+		expect(switchSends(back, CHOOSER)).toEqual([false]);
+	});
+
+	it("switches off what a vanished client left on when the relay restarts under a live extension", async () => {
+		// A fresh bridge: the extension kept tab 1's attachment, and whatever switches the old relay's clients set.
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2 })], [1]);
+		await flush();
+		expect(ext.rpcs("send").map(rpc => [rpc.tabId, rpc.method, rpc.params?.enabled])).toEqual([
+			[1, CHOOSER, false],
+			[1, FOCUS, false],
+		]);
+	});
+
+	it("settles a switch whose reply was lost with the extension socket", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		// Chrome may apply the switch, but the socket drops before its reply arrives.
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, sessionId, method: FOCUS, params: { enabled: true } }));
+		await flush();
+		bridge.extClosed(ext);
+		await flush();
+		const back = new FakeExtSocket();
+		connect(bridge, back, [tab({ tabId: 1 })], [1]);
+		await flush();
+		expect(switchSends(back, FOCUS)).toEqual([false]);
+	});
+});
+
+describe("RelayBridge restricted extension capabilities", () => {
+	it("never requests foreign-frame mutation for a claimed tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const socket = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(socket);
+		const sessionId = await attachPage(bridge, ext, socket, conn, 1);
+		bridge.cdpMessage(conn, JSON.stringify({ id: ++msgSeq, sessionId, method: "OMP.claimTarget" }));
+		bridge.cdpMessage(conn, JSON.stringify({ id: ++msgSeq, sessionId, method: "Page.getFrameTree" }));
+		await flush();
+		expect(ext.rpcs("attach").length).toBeGreaterThan(0);
+		expect(ext.rpcs("send").some(rpc => rpc.method === "Page.getFrameTree")).toBe(true);
+		for (const rpc of [...ext.rpcs("attach"), ...ext.rpcs("send")]) {
+			expect(Object.hasOwn(rpc, "clearForeignFrames")).toBe(false);
+		}
+	});
+});
+
+describe("RelayBridge download paths", () => {
+	function hello(bridge: RelayBridge, socket: FakeExtSocket, downloadsProtocol?: number): void {
+		bridge.extConnected(socket);
+		bridge.extMessage(
+			socket,
+			JSON.stringify({
+				t: "hello",
+				userAgent: "test",
+				browserVersion: "Chrome/151.0.0.0",
+				discardedTabsProtocol: 1,
+				downloadsProtocol,
+				tabs: [tab({ tabId: 1 })],
+				attachedTabIds: [],
+			}),
+		);
+	}
+
+	async function askPath(bridge: RelayBridge, ext: FakeExtSocket): Promise<{ cdp: FakeCdpSocket; id: number }> {
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		const id = ++msgSeq;
+		bridge.cdpMessage(
+			connId,
+			JSON.stringify({ id, sessionId, method: "OMP.downloadPath", params: { guid: "guid-1" } }),
+		);
+		await flush();
+		return { cdp, id };
+	}
+
+	it.each([undefined, 1])("rejects download lookup even when the peer advertises protocol %s", async protocol => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		hello(bridge, ext, protocol);
+		const { cdp, id } = await askPath(bridge, ext);
+		expect(ext.messages.some(message => "op" in message && String(message.op) === "findDownload")).toBe(false);
+		expect(ext.rpcs("send").some(rpc => rpc.method === "OMP.downloadPath")).toBe(false);
+		expect(cdp.messages.find(m => m.id === id)).toMatchObject({
+			error: { message: "Relay download tracking is unavailable under this fork's existing extension permissions" },
+		});
 	});
 });

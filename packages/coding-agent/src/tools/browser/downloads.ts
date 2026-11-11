@@ -49,6 +49,7 @@ export class DownloadManager {
 	readonly #page: Page;
 	readonly #defaultDirectory: string;
 	readonly #perTab: boolean;
+	readonly #relay: boolean;
 	#directory?: string;
 	#arming?: Promise<void>;
 	#session?: CDPSession;
@@ -64,11 +65,12 @@ export class DownloadManager {
 	 * for a browser the user drives (connected, relay): there the folder also receives the user's own downloads, which
 	 * would otherwise be saved under bare GUIDs nobody renames.
 	 */
-	constructor(browser: Browser, page: Page, tabId: string, options: { perTab: boolean }) {
+	constructor(browser: Browser, page: Page, tabId: string, options: { perTab: boolean; relay?: boolean }) {
 		this.#browser = browser;
 		this.#page = page;
 		this.#defaultDirectory = path.join(os.tmpdir(), `omp-downloads-${tabId}`);
 		this.#perTab = options.perTab;
+		this.#relay = options.relay === true;
 	}
 
 	/**
@@ -76,6 +78,7 @@ export class DownloadManager {
 	 * so tabs never overwrite each other's, and each tab moves its own into its folder under the suggested name.
 	 */
 	async enable(directory?: string): Promise<void> {
+		this.#requireSupportedDownloads();
 		const resolved = path.resolve(directory ?? this.#defaultDirectory);
 		await fs.mkdir(resolved, { recursive: true });
 		if (!this.#session) await this.#attach();
@@ -89,6 +92,14 @@ export class DownloadManager {
 		this.#directory = resolved;
 	}
 
+	#requireSupportedDownloads(): void {
+		if (this.#relay) {
+			throw new ToolError(
+				"Relay download tracking is unavailable in this fork because the extension keeps its existing permissions. Use an explicitly selected non-relay browser for download tracking.",
+			);
+		}
+	}
+
 	/** Enabling started by a `wait()` that has not yet applied; settles once downloads are tracked. */
 	get arming(): Promise<void> | undefined {
 		return this.#arming;
@@ -96,6 +107,7 @@ export class DownloadManager {
 
 	/** Wait for the next unclaimed completed download. */
 	async wait(signal?: AbortSignal): Promise<BrowserDownload> {
+		this.#requireSupportedDownloads();
 		if (this.#unclaimed.length === 0) {
 			// A rejected `arming` nobody awaits would surface as an unhandled rejection.
 			if (signal?.aborted) throw signal.reason;
@@ -129,6 +141,7 @@ export class DownloadManager {
 
 	/** Return every completed download for this tab. */
 	list(): BrowserDownload[] {
+		this.#requireSupportedDownloads();
 		return this.#completed.map(download => ({ ...download }));
 	}
 

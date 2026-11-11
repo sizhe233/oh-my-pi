@@ -546,7 +546,8 @@ try {
 			{
 				diagnosticEnableNewSurface: process.env.OMP_E2E_ENABLE_NEW_SURFACE === "true",
 				startedAt,
-				sourceSha: process.env.GITHUB_SHA ?? process.env.OMP_E2E_SOURCE_SHA ?? "unknown",
+				sourceSha: process.env.OMP_E2E_SOURCE_SHA ?? process.env.GITHUB_SHA ?? "unknown",
+				workflowSha: process.env.GITHUB_SHA ?? null,
 				finishedAt: new Date().toISOString(),
 				platform: process.platform,
 				headed: true,
