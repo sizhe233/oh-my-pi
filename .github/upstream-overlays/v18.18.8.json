@@ -3,8 +3,8 @@
   "releaseTag": "v18.18.8",
   "upstreamSha": "679691a78141de0dd6ba1b7a5d5c1b1d7d967a63",
   "mergeBaseSha": "81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b",
-  "mergedProductSha256": "3c5802645b5a28eb4da6f76f0f3f44101a92d528e47c7e9ccc1be4bf5aa64f12",
-  "finalProductSha256": "b3ed07ac3799df55004c9f2afd554e9f3e9537808d02e496562ce5ae5eefe39e",
+  "mergedProductSha256": "9a8bd25d53f7247cfe5df20de02955223bcb49b8d39548e7d59adb0c91ef746f",
+  "finalProductSha256": "ed5488326ea0bd662bd2a1ac2d2a6670343c5341e081760072c0ee7dc6e17912",
   "entries": [
     {
       "path": "crates/pi-ast/src/block.rs",
