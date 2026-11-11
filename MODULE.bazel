@@ -245,7 +245,9 @@ llvm_msvc_tools(name = "llvm_msvc_tools")
 
 xwin_sysroot = use_repo_rule("//bazel/toolchains/msvc:sysroot.bzl", "xwin_sysroot_repository")
 
-xwin_sysroot(name = "xwin_sysroot")
+# Match the existing arm64 SDK pin: xwin 0.6.5 cannot parse the newer
+# SDK payload paths. Keep the normal download verification and build checks.
+xwin_sysroot(name = "xwin_sysroot", sdk_version = "10.0.22621")
 
 xwin_sysroot(
     name = "xwin_sysroot_arm64",

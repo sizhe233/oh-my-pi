@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Preserve refused CDP WebSocket endpoint context on Bun 1.4.4 while restricting additional diagnostics to bounded local HTTP probes ([#67](https://github.com/sizhe233/oh-my-pi/pull/67) by [@sizhe233](https://github.com/sizhe233)).
+
 - Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
 
 ## [18.10.3] - 2026-10-12
