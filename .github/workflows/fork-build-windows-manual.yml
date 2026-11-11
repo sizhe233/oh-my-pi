@@ -98,6 +98,13 @@ jobs:
             ../catalog/test/model-thinking.test.ts \
             ../catalog/test/compat-cascade.test.ts \
             ../catalog/test/published-effort-ladders.test.ts
+      - name: Run the complete TypeScript suite for the exact imported source
+        if: ${{ inputs.source_sha != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run gen:export-viewer --check
+          bun run ci:test:ts
       - name: Cross-compile Windows x64 release CLI with baseline addon
         run: bun scripts/ci-release-build-binaries.ts --targets win32-x64
       - name: Record same-commit cross-build checksums
@@ -209,6 +216,15 @@ jobs:
             ../catalog/test/compat-cascade.test.ts `
             ../catalog/test/published-effort-ladders.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'Windows restore, catalog and tokenizer regression tests failed' }
+      - name: Verify imported Windows process and pipe lifecycle contracts
+        if: ${{ inputs.source_sha != '' }}
+        env:
+          PI_TEST_RUNTIME: '1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          bun test --timeout=120000 packages/utils/test/ptree-timeout.test.ts packages/utils/test/ptree-signal.test.ts packages/coding-agent/test/eval/kernel-process-group.test.ts packages/coding-agent/test/eval/probe.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows process lifecycle tests failed' }
       - name: Smoke standalone executable and caller cwd
         shell: pwsh
         run: |
