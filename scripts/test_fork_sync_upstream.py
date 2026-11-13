@@ -1070,6 +1070,27 @@ class ScriptPreservationTests(OverlayTests):
         self.save_review()
         return self.data['entries'][-1]
 
+    def test_v200_release_preserves_existing_script_mode(self):
+        self.fixture()
+        with patch.object(SYNC, 'SCRIPT_PRESERVATION_RELEASE', ('v18.18.8', 'a'*40)), patch.object(SYNC, 'SCRIPT_PRESERVATION_RELEASE_200', ('v1.1.0', self.upstream_sha)):
+            self.apply()
+        self.assertEqual(self.run_git(self.work, 'write-tree').stdout.strip(), self.final)
+        self.assertEqual(SYNC.script_record(self.final, self.path)['mode'], '100755')
+
+    def test_v200_release_wrong_sha_rejected_atomically(self):
+        self.fixture()
+        with patch.object(SYNC, 'SCRIPT_PRESERVATION_RELEASE', ('v18.18.8', 'a'*40)), patch.object(SYNC, 'SCRIPT_PRESERVATION_RELEASE_200', ('v1.1.0', 'b'*40)):
+            self.reject()
+
+    def test_v200_release_wrong_tag_rejected_atomically(self):
+        self.fixture()
+        with patch.object(SYNC, 'SCRIPT_PRESERVATION_RELEASE', ('v18.18.8', 'a'*40)), patch.object(SYNC, 'SCRIPT_PRESERVATION_RELEASE_200', ('v1.2.0', self.upstream_sha)):
+            self.reject()
+
+    def test_v200_exact_binding_without_unpublished_v190(self):
+        self.assertEqual(SYNC.SCRIPT_PRESERVATION_RELEASE_200, ('v18.20.0', 'c308970263ae13744ea15ab67302e3dac840e266'))
+        self.assertFalse(hasattr(SYNC, 'SCRIPT_PRESERVATION_RELEASE_190'))
+
     def test_inner_release_scope_is_required(self):
         self.fixture()
         with patch.object(SYNC,'SCRIPT_PRESERVATION_RELEASE',('v18.18.8','a'*40)):
