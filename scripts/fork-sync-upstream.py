@@ -257,6 +257,7 @@ def check_extension_boundary(base: str, candidate: str) -> None:
 
 
 SCRIPT_PRESERVATION_RELEASE = ("v18.18.8", "679691a78141de0dd6ba1b7a5d5c1b1d7d967a63")
+SCRIPT_PRESERVATION_RELEASE_200 = ("v18.20.0", "c308970263ae13744ea15ab67302e3dac840e266")
 SCRIPT_PRESERVATION_SOURCE = "e325ffc73ab86e03bdd20a91b77d8e2b3964c906"
 
 # Explicit preservation scope; no glob or importer/metadata paths.
@@ -277,7 +278,7 @@ def script_record(revision: str, path: str) -> dict | None:
 
 
 def validate_script_preservation(entry: dict, base: str, upstream: str, merged: str, tag: str) -> str:
-    if (tag, upstream) != SCRIPT_PRESERVATION_RELEASE:
+    if (tag, upstream) not in (SCRIPT_PRESERVATION_RELEASE, SCRIPT_PRESERVATION_RELEASE_200):
         raise ValueError("Script preservation release mismatch")
     if entry["path"] not in SCRIPT_PRESERVATION_PATHS:
         raise ValueError("Script outside explicit preservation scope")
