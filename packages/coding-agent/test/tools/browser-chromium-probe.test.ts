@@ -17,8 +17,10 @@ function harness(overrides: Partial<ChromiumProbeHost> = {}) {
 	const events: string[] = [];
 	const diagnostics: ChromiumProbeDiagnostic[] = [];
 	let exitCode: number | null = null;
-	const child: Pick<ChildProcess, "pid" | "exitCode" | "peekStderr" | "kill" | "wait"> = {
+	const exited = Promise.withResolvers<number>();
+	const child: Pick<ChildProcess, "pid" | "exitCode" | "exited" | "peekStderr" | "kill" | "wait"> = {
 		pid: 123,
+		exited: exited.promise,
 		get exitCode() {
 			return exitCode;
 		},
@@ -26,6 +28,7 @@ function harness(overrides: Partial<ChromiumProbeHost> = {}) {
 		kill: () => {
 			events.push("kill");
 			exitCode = 137;
+			exited.resolve(exitCode);
 		},
 		wait: async () => {
 			events.push("wait");
@@ -68,6 +71,15 @@ function harness(overrides: Partial<ChromiumProbeHost> = {}) {
 }
 
 describe("Chromium test availability diagnostics", () => {
+	it("rejects a browser that exits before a successful CDP response instead of accepting a reused port", async () => {
+		const state = harness({ ci: () => "true" });
+		Object.defineProperty(state.child, "exited", { value: Promise.resolve(127) });
+		await assert.rejects(state.probe.chromiumAvailable(), /Chromium unavailable in CI/);
+		assert.equal(state.diagnostics[0]!.error.stage, "cdp");
+		assert.equal(state.events.includes("kill"), true);
+		assert.equal(state.events.includes("remove"), true);
+	});
+
 	it("fails CI instead of silently skipping every importing suite, with a single cached diagnostic", async () => {
 		const state = harness({
 			ci: () => "true",

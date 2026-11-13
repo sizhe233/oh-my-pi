@@ -88,27 +88,34 @@ describe("ACP stdout hygiene", () => {
 		cleanupRoots.push(root);
 		const xdg = path.join(root, "xdg");
 		const agentDir = path.join(root, "agent");
-		await fs.promises.mkdir(xdg, { recursive: true });
+		await fs.promises.mkdir(path.join(xdg, "omp"), { recursive: true });
 		await fs.promises.mkdir(agentDir, { recursive: true });
 
-		// NOTE: we intentionally do NOT override HOME. Bun keys its transpile
-		// cache at `$HOME/.bun/install/cache`; pointing HOME at a fresh tmp
-		// dir forces a full re-transpile of the CLI's module graph on every
-		// run (~12s cold vs ~0.4s warm). XDG_* and PI_CODING_AGENT_DIR
-		// already isolate PI's on-disk state for this smoke test.
+		// Keep HOME unchanged. On XDG platforms, the default
+		// agent path lets the initialized private app root cover agent and
+		// per-project daemon state; a custom override disables that root/agent selection.
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			XDG_DATA_HOME: xdg,
+			XDG_CONFIG_HOME: xdg,
+			XDG_STATE_HOME: xdg,
+			XDG_CACHE_HOME: xdg,
+			PI_CODING_AGENT_DIR: agentDir,
+			PI_NO_TITLE: "1",
+			NO_COLOR: "1",
+		};
+		if (process.platform === "linux" || process.platform === "darwin") {
+			childEnv.PI_CONFIG_DIR = `.omp-${path.basename(root)}`;
+			childEnv.PI_CODING_AGENT_DIR = undefined;
+			childEnv.OMP_PROFILE = "default";
+			childEnv.PI_PROFILE = undefined;
+		}
 		const proc = Bun.spawn(["bun", cliEntry, "acp"], {
 			cwd: repoRoot,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
-			env: {
-				...process.env,
-				XDG_DATA_HOME: xdg,
-				XDG_CONFIG_HOME: xdg,
-				PI_CODING_AGENT_DIR: agentDir,
-				PI_NO_TITLE: "1",
-				NO_COLOR: "1",
-			},
+			env: childEnv,
 		});
 		activeProc = proc;
 
@@ -145,7 +152,7 @@ describe("ACP stdout hygiene", () => {
 		proc.stdin.flush();
 
 		const firstLine = await readFirstFrame(proc.stdout);
-		expect(firstLine[0]).toBe("{");
+		expect(firstLine[0], `ACP stderr: ${Buffer.concat(stderrChunks).toString("utf8")}`).toBe("{");
 
 		const message = JSON.parse(firstLine) as {
 			jsonrpc?: string;

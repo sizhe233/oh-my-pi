@@ -2,7 +2,7 @@ import { diffWords } from "@oh-my-pi/pi-natives";
 import { DEFAULT_TAB_WIDTH, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { TspDiffHunk, TspProps } from "@oh-my-pi/pi-wire";
 import { theme as activeTheme, getLanguageFromPath, highlightCode, type Theme } from "../theme/index";
-import { type CodeFrameMarker, formatCodeFrameLine, replaceTabs, shortenPath } from "../render/render-utils";
+import { type CodeFrameMarker, formatCodeFrameLine, replaceTabs } from "../render/render-utils";
 import { node } from "../native/describe";
 import type { NativeNode } from "../native/node";
 /** SGR dim on / normal intensity — additive, preserves fg/bg colors. */
@@ -102,26 +102,30 @@ function renderIntraLineDiff(
 
 /**
  * Native `diff` node for omp's compact diff text (`+12|added`, `-12|removed`,
- * ` 12|context`, blank or `…` rows between regions). Each contiguous region
- * becomes one hunk; the terminal draws gutters, word emphasis and highlighting.
- * Removed rows carry old line numbers, added rows new ones and context rows
- * old ones, so the other side is derived from the running line delta.
+ * ` 12|context`, blank or `…` rows between regions). Each run of consecutive
+ * lines becomes one hunk; a blank or `…` row or a jump in line numbers (distant
+ * edits follow each other directly) starts the next. The terminal draws
+ * gutters, word emphasis, highlighting and the unchanged-line count between
+ * hunks. Removed rows carry old line numbers, added rows new ones and context
+ * rows old ones, so the other side follows from the running line offset.
+ * Runs without an added or removed row are dropped: they are the far
+ * enclosing-block lines (a section heading, a function's closing brace) the
+ * model reads as anchors, which as hunks of their own only bury the change.
+ * Tern picks the grammar from `path`.
  */
-export function nativeDiff(diffText: string, options: { filePath?: string } & TspProps<"diff"> = {}): NativeNode {
-	const { filePath, ...props } = options;
+export function nativeDiff(diffText: string, props: TspProps<"diff"> = {}): NativeNode {
 	const hunks: TspDiffHunk[] = [];
 	let lines: string[] = [];
-	let oldStart = 0;
-	let newStart = 0;
-	// New-minus-old line offset accumulated over the regions already closed.
-	let delta = 0;
-	let regionDelta = 0;
+	let changed = false;
+	let oldStart = 1;
+	let newStart = 1;
+	// The old and new lines the open run continues with.
 	let nextOld = 1;
+	let nextNew = 1;
 	const close = (): void => {
-		if (lines.length > 0) hunks.push({ oldStart, newStart, lines });
+		if (changed) hunks.push({ oldStart, newStart, lines });
 		lines = [];
-		delta += regionDelta;
-		regionDelta = 0;
+		changed = false;
 	};
 	for (const raw of sanitizeText(diffText).split("\n")) {
 		const parsed = parseDiffLine(raw);
@@ -131,29 +135,25 @@ export function nativeDiff(diffText: string, options: { filePath?: string } & Ts
 			continue;
 		}
 		const number = Number.parseInt(parsed.lineNum.trim(), 10);
+		const added = parsed.prefix === "+";
+		if (Number.isFinite(number) && number !== (added ? nextNew : nextOld)) {
+			close();
+			// The lines skipped are unchanged: both sides move by as many.
+			const skipped = number - (added ? nextNew : nextOld);
+			nextOld += skipped;
+			nextNew += skipped;
+		}
 		if (lines.length === 0) {
-			if (Number.isFinite(number)) {
-				oldStart = parsed.prefix === "+" ? number - delta : number;
-				newStart = parsed.prefix === "+" ? number : number + delta;
-			} else {
-				oldStart = nextOld;
-				newStart = nextOld + delta;
-			}
+			oldStart = nextOld;
+			newStart = nextNew;
 		}
-		if (parsed.prefix === "+") regionDelta++;
-		else {
-			if (parsed.prefix === "-") regionDelta--;
-			nextOld = (Number.isFinite(number) ? number : nextOld) + 1;
-		}
+		if (parsed.prefix !== "+") nextOld++;
+		if (parsed.prefix !== "-") nextNew++;
+		changed ||= parsed.prefix !== " ";
 		lines.push(`${parsed.prefix}${parsed.content}`);
 	}
 	close();
-	return node("diff", {
-		...props,
-		hunks,
-		path: props.path ?? (filePath ? shortenPath(filePath) : undefined),
-		lang: props.lang ?? (filePath ? getLanguageFromPath(filePath) : undefined),
-	});
+	return node("diff", { ...props, hunks });
 }
 
 export interface RenderDiffOptions {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -52,6 +52,7 @@ describe("read → edit round-trip for out-of-cwd files", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await removeWithRetries(cwdDir);
 		await removeWithRetries(outDir);
 		if (homeDir) await removeWithRetries(homeDir);
@@ -79,7 +80,8 @@ describe("read → edit round-trip for out-of-cwd files", () => {
 	});
 
 	it("round-trips a home-relative path through read and edit", async () => {
-		homeDir = await fs.mkdtemp(path.join(os.homedir(), ".omp-read-edit-"));
+		homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-read-edit-home-"));
+		vi.spyOn(os, "homedir").mockReturnValue(homeDir);
 		const homeFile = path.join(homeDir, "settings.txt");
 		const authoredPath = `~/${path.relative(os.homedir(), homeFile)}`;
 		await Bun.write(homeFile, "alpha\nbeta\n");

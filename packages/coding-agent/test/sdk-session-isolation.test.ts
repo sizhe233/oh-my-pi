@@ -60,12 +60,14 @@ async function withTempConfigRoot<T>(run: () => Promise<T>): Promise<T> {
 	const originalConfigDir = process.env.PI_CONFIG_DIR;
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const configDirName = `.omp-sdk-session-${Snowflake.next()}`;
-	const configRoot = path.join(os.homedir(), configDirName);
+	const tempHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-sdk-home-"));
+	const homeSpy = spyOn(os, "homedir").mockReturnValue(tempHome);
 	try {
 		process.env.PI_CONFIG_DIR = configDirName;
 		setProfile(undefined);
 		return await run();
 	} finally {
+		homeSpy.mockRestore();
 		setProfile(undefined);
 		if (originalConfigDir === undefined) {
 			delete process.env.PI_CONFIG_DIR;
@@ -81,7 +83,7 @@ async function withTempConfigRoot<T>(run: () => Promise<T>): Promise<T> {
 		// The model registry opened the shared `<configRoot>/agent/models.db` cache while the
 		// temp root was active; release it so Windows can delete the root.
 		closeModelCache();
-		removeSyncWithRetries(configRoot);
+		removeSyncWithRetries(tempHome);
 	}
 }
 

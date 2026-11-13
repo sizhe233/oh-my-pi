@@ -1,3 +1,4 @@
+import type { TabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 /**
  * Regression tests for the wedged shared browser (field incident 2026-09-27,
  * omp 18.3.1): under memory pressure the project-shared broker-owned Chromium
@@ -39,10 +40,14 @@ import type { BrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/regi
 import * as relayOwnedTargets from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
 import * as sharedDaemon from "@oh-my-pi/pi-coding-agent/tools/browser/shared-daemon";
 import { stopSharedBrowserIfUnreachable } from "@oh-my-pi/pi-coding-agent/tools/browser/shared-daemon";
+import type { WorkerInbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import { getTabsMapForTest, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
-import type { TabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import type { WorkerTabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { rejectionOf } from "../helpers/rejection";
 
 const DAEMON_NAME = "omp.browser.headless";
 /** The target id the incident log names for the tab whose close never landed. */
@@ -109,6 +114,8 @@ function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): 
 			}
 			return await new Promise<never>(() => {});
 		},
+		on: (): void => undefined,
+		off: (): void => undefined,
 		detach: async (): Promise<void> => undefined,
 	};
 	const handle: Record<string, unknown> = {
@@ -130,7 +137,7 @@ function makeWedgeHandle(scope: SharedTargetScope, options: WedgeOptions = {}): 
 }
 
 /** Tab whose page-close handshake never completes, so cleanup runs the forced path. */
-function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): TabSession {
+function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): WorkerTabSession {
 	return {
 		name: "logos-b2b",
 		browser: makeWedgeHandle(scope, options),
@@ -140,11 +147,13 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 		info: {},
 		pending: new Map(),
 		kindTag: "headless",
+		ownsPage: true,
 		ownerSessionId: "session-wedge",
 		persist: false,
 		lastActivityAt: Date.now(),
 		frozen: false,
 		worker: {
+			mode: "worker",
 			send: () => undefined,
 			onMessage: () => () => undefined,
 			onError: () => () => undefined,
@@ -152,7 +161,7 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 				options.onTerminate?.();
 			},
 		},
-	} as unknown as TabSession;
+	} as unknown as WorkerTabSession;
 }
 
 /** Minimal tool session for the `runInTab` entry point. */
@@ -213,6 +222,7 @@ function makeBroker(
 const READY_MATCH = "DevTools listening on ws://127.0.0.1:63199/devtools/browser/wedged";
 
 afterEach(async () => {
+	vi.useRealTimers();
 	vi.restoreAllMocks();
 	resetOrphanRegistryForTest();
 	// oxlint-disable-next-line unicorn/no-useless-spread -- releasing tabs mutates the map
@@ -285,12 +295,136 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 
 		await expect(
 			runInTab("logos-b2b", { code: "await wait(60_000);", timeoutMs: 20, session: makeSession() }),
-		).rejects.toThrow("hung past grace");
+		).rejects.toThrow('hung past its 20ms budget, so omp released tab "logos-b2b"');
 
 		expect(getTabsMapForTest().has("logos-b2b")).toBe(false);
+		// The next call names the kill once, without the advice the failed call already gave.
+		await expect(runInTab("logos-b2b", { code: "", timeoutMs: 20, session: makeSession() })).rejects.toThrow(
+			/Tab "logos-b2b" was killed:.*Reopen/i,
+		);
 		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 		expect(healthCheck).toHaveBeenCalledTimes(1);
 		expect(healthCheck.mock.calls[0]?.[0]).toEqual(scope);
+	});
+
+	it("terminates an unresponsive cancelled run after the abort grace, not its inherited budget", async () => {
+		const scope = trackedScope();
+		spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
+		const terminated = Promise.withResolvers<void>();
+		const sent = Promise.withResolvers<void>();
+		const tab = makeWedgeTab(scope, { close: "fail", onTerminate: () => terminated.resolve() });
+		tab.worker.send = message => {
+			if (message.type === "run") sent.resolve();
+		};
+		getTabsMapForTest().set(tab.name, tab);
+		vi.useFakeTimers();
+		const controller = new AbortController();
+		const failure = rejectionOf(
+			runInTab(tab.name, {
+				code: "while (true) {}",
+				timeoutMs: 300_000,
+				signal: controller.signal,
+				session: makeSession(),
+			}),
+		);
+		await sent.promise;
+		controller.abort();
+		vi.advanceTimersByTime(749);
+		expect(getTabsMapForTest().has(tab.name)).toBe(true);
+		vi.advanceTimersByTime(1);
+		await terminated.promise;
+		expect(await failure).toBeInstanceOf(ToolAbortError);
+		expect(getTabsMapForTest().has(tab.name)).toBe(false);
+	});
+
+	it.each([
+		{ expired: true, cancel: false, label: "caps startup after an expired run" },
+		{ expired: false, cancel: false, label: "preserves the startup budget of recovery before a run expires" },
+		{ expired: false, cancel: true, label: "cancels a stalled replacement and terminates its worker" },
+	])("$label", async ({ expired, cancel }) => {
+		const scope = trackedScope();
+		spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
+		const tab = makeWedgeTab(scope, { close: "fail" });
+		const runSent = Promise.withResolvers<string>();
+		tab.worker.send = message => {
+			if (message.type === "run") runSent.resolve(message.id);
+		};
+		getTabsMapForTest().set(tab.name, tab);
+		const RealWorker = globalThis.Worker;
+		const readyWait = Promise.withResolvers<void>();
+		const replacementTerminated = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		let replacement: EventTarget | undefined;
+		vi.useFakeTimers();
+		let now = 0;
+		spyOn(performance, "now").mockImplementation(() => now);
+		const setTimer = globalThis.setTimeout;
+		let setupSent = false;
+		spyOn(globalThis, "setTimeout").mockImplementation(
+			Object.assign((...args: Parameters<typeof setTimeout>) => {
+				const timer = setTimer(...args);
+				if (setupSent && args[1] !== 2_000) readyWait.resolve();
+				return timer;
+			}, setTimer),
+		);
+		globalThis.Worker = class extends EventTarget {
+			constructor() {
+				super();
+				replacement = this;
+			}
+			postMessage(message: WorkerInbound): void {
+				if (message.type === "init") {
+					setupSent = true;
+					this.dispatchEvent(new MessageEvent("message", { data: { type: "setup" } }));
+				}
+				if (message.type === "close") {
+					this.dispatchEvent(new MessageEvent("message", { data: { type: "closed" } }));
+				}
+			}
+			terminate(): void {
+				replacementTerminated.resolve();
+			}
+		} as unknown as typeof Worker;
+		try {
+			const run = runInTab(tab.name, {
+				code: "",
+				timeoutMs: cancel ? 300_000 : expired ? 120_000 : 10_000,
+				signal: controller.signal,
+				session: makeSession(),
+			});
+			const result = run.catch(error => error);
+			const id = await runSent.promise;
+			const pending = tab.pending.get(id)!;
+			if (expired) pending.reject(new ToolError("Browser code execution timed out after 120000ms"));
+			else pending.resolve({ displays: [], screenshots: [], returnValue: true, recoverTab: true });
+			await readyWait.promise;
+			if (cancel) {
+				controller.abort();
+				vi.advanceTimersByTime(749);
+				expect(getTabsMapForTest().has(tab.name)).toBe(true);
+				vi.advanceTimersByTime(1);
+			} else {
+				now = 6_000;
+				vi.advanceTimersByTime(6_000);
+			}
+			if (!expired && !cancel) {
+				replacement!.dispatchEvent(new MessageEvent("message", { data: { type: "ready", info: {} } }));
+			}
+			const outcome = await result;
+			if (cancel) {
+				expect(outcome).toBeInstanceOf(ToolAbortError);
+				await replacementTerminated.promise;
+			} else if (expired) {
+				expect(outcome).toBeInstanceOf(ToolError);
+				expect(String(outcome)).toContain("released");
+				expect(String(outcome)).toContain("tools.maxTimeout");
+			} else {
+				expect(outcome).toMatchObject({ returnValue: true });
+			}
+			expect(getTabsMapForTest().has(tab.name)).toBe(!expired && !cancel);
+		} finally {
+			globalThis.Worker = RealWorker;
+		}
 	});
 
 	it("lets a release join an in-flight force-kill instead of tearing the tab down twice", async () => {
@@ -398,7 +532,7 @@ describe("relay cleanup after a failed worker close", () => {
 		const tab = makeWedgeTab(scope, { shared: false });
 		if (tab.backend !== "worker") throw new Error("Expected worker tab fixture");
 		tab.kindTag = "relay";
-		tab.ownsTarget = ownsTarget;
+		tab.ownsPage = ownsTarget;
 		tab.browser.kind = { kind: "relay", cdpUrl: "http://127.0.0.1:9224" };
 		tab.browser.cdpUrl = "http://127.0.0.1:9224";
 		tab.browser.browser.wsEndpoint = () => "ws://127.0.0.1:9224/cdp";
@@ -473,7 +607,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 			await recordSharedTarget(scope, TARGET_ID);
 			const tab = makeWedgeTab(scope);
 			if (tab.backend !== "worker") throw new Error("Expected worker tab fixture");
-			tab.ownsTarget = true;
+			tab.ownsPage = true;
 			tab.reattached = true;
 			acknowledgeClose(tab);
 			getTabsMapForTest().set(tab.name, tab);
@@ -481,7 +615,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 			expect(await releaseTab(tab.name, { timeoutMs: 60 })).toBe(true);
 
 			expect(close).toHaveBeenCalledTimes(1);
-			expect(close).toHaveBeenCalledWith(tab.browser.browser, TARGET_ID);
+			expect(close).toHaveBeenCalledWith(tab.browser.browser, TARGET_ID, 30);
 			expect(await ownedTargets(scope)).toEqual(closed ? [] : [TARGET_ID]);
 			expect(healthCheck).toHaveBeenCalledTimes(closed ? 0 : 1);
 			expect(getTabsMapForTest().has(tab.name)).toBe(false);
@@ -492,7 +626,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 		const tab = makeWedgeTab(scope, { shared: false });
 		if (tab.backend !== "worker") throw new Error("Expected worker tab fixture");
 		tab.kindTag = "relay";
-		tab.ownsTarget = ownsTarget;
+		tab.ownsPage = ownsTarget;
 		tab.reattached = true;
 		tab.browser.kind = { kind: "relay", cdpUrl: "http://127.0.0.1:9224" };
 		tab.browser.cdpUrl = "http://127.0.0.1:9224";
@@ -525,7 +659,7 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 		},
 	);
 
-	it("does not repeat a reattached owned relay worker's acknowledged close", async () => {
+	it("retains ownership when a worker acknowledges close but the supervisor cannot confirm it", async () => {
 		const scope = trackedScope();
 		const close = spyOn(relayOwnedTargets, "closeRelayTarget").mockResolvedValue(false);
 		const healthCheck = spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(true);
@@ -536,8 +670,9 @@ describe("reviewed recovery cleanup preserves target ownership", () => {
 
 		expect(await releaseTab(tab.name, { timeoutMs: 60 })).toBe(true);
 
-		expect(close).not.toHaveBeenCalled();
-		expect(await ownedTargets(scope)).toEqual([]);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(close).toHaveBeenCalledWith("ws://127.0.0.1:9224/cdp", TARGET_ID);
+		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 		expect(healthCheck).not.toHaveBeenCalled();
 		expect(getTabsMapForTest().has(tab.name)).toBe(false);
 	});

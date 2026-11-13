@@ -4,11 +4,12 @@
  * ({@link AgentSession.restoreInterruptedTurn}) and the subagents it was running.
  *
  * Every persisted subagent transcript under the session ({@link collectSubSessions})
- * that its process left mid-turn ({@link hasRestorableTurn}), was not killed (no
+ * that its process left mid-turn (an unfinished turn or pending step dispatch), was not killed (no
  * tombstone) and can be revived (a `session_init` contract, not isolated) runs one
  * more monitored turn as a background job of its parent: the lifecycle reviver
  * rebuilds it from its transcript, {@link runSubagentFollowUpTurn} goes on with the
- * cut-off turn and drives it to `yield`, and the parent receives the result as the
+ * cut-off turn and drives it to `yield` (then through the steps a stepped run had not
+ * sent yet), and the parent receives the result as the
  * ordinary `async-result` of a job with the subagent's id, the id its first run's
  * job had, so a parent waiting on that job finds it again.
  */
@@ -19,14 +20,38 @@ import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
-import { hasRestorableTurn } from "../session/exit-diagnostics";
 import { extractSessionInit, type PersistedSessionInit } from "../session/session-manager";
-import { collectSubSessions } from "../session/sub-sessions";
+import type { SessionEntry } from "../session/session-entries";
+import { collectSubSessions, type SubSession } from "../session/sub-sessions";
 import type { EventBus } from "../utils/event-bus";
-import { runSubagentFollowUpTurn } from "./executor";
-import { persistedAgentDefinition } from "./persisted-revive";
+import { runSubagentFollowUpTurn, softRequestBudgetFor } from "./executor";
+import { persistedAgentDefinition, persistedAgentName } from "./persisted-revive";
+import { readStepProgress } from "./steps";
 import { formatTaskResultSummary } from "./result-summary";
 import { cfgTaskMaxRuntimeMs } from "./settings";
+import { selectRestorableTaskBranches } from "./restore-candidates";
+
+interface RestoreOwnerSession {
+	asyncJobManager: AgentSession["asyncJobManager"];
+	yieldQueue: { holdIdleFlush(): () => void };
+	hasPendingAsyncWork(): boolean;
+	settleAsyncWork(): Promise<void>;
+}
+class UnsupportedRestoreOwnerError extends Error {}
+function hasRestoreOwnerCapabilities(value: object): value is RestoreOwnerSession {
+	return (
+		"asyncJobManager" in value &&
+		"yieldQueue" in value &&
+		typeof value.yieldQueue === "object" &&
+		value.yieldQueue !== null &&
+		"holdIdleFlush" in value.yieldQueue &&
+		typeof value.yieldQueue.holdIdleFlush === "function" &&
+		"hasPendingAsyncWork" in value &&
+		typeof value.hasPendingAsyncWork === "function" &&
+		"settleAsyncWork" in value &&
+		typeof value.settleAsyncWork === "function"
+	);
+}
 
 /** Where restored subagents' lifecycle and progress frames go, as a live run's do. */
 export interface RestoreOptions {
@@ -69,6 +94,23 @@ export async function restoreSession(session: AgentSession, options: RestoreOpti
 	}
 }
 
+/** Inspect only the selected ancestry; abandoned siblings must not decide whether a turn resumes. */
+function selectedBranchEntries(sub: SubSession): SessionEntry[] {
+	const byId = new Map(sub.entries.map(entry => [entry.id, entry]));
+	const branch: SessionEntry[] = [];
+	const seen = new Set<string>();
+	let id = sub.leafId;
+	while (id !== null) {
+		const entry = byId.get(id);
+		// A broken ancestry is not authority to execute a persisted turn.
+		if (!entry || seen.has(id)) return [];
+		seen.add(id);
+		branch.push(entry);
+		id = entry.parentId;
+	}
+	return branch.reverse();
+}
+
 /**
  * Has every subagent of `session` that its last process left mid-turn go on with that
  * turn (see the module docs). Nothing is restored for a session without a file, or
@@ -81,8 +123,8 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 	if (!sessionFile || !manager) return [];
 	const registry = AgentRegistry.global();
 	await ensurePersistedRoster(registry, sessionFile);
-	const subSessions = await collectSubSessions(sessionFile, key => {
-		logger.warn("Subagent transcript unreadable; not restored", { key });
+	const subSessions = await collectSubSessions(sessionFile, {
+		onUnreadable: key => logger.warn("Subagent transcript unreadable; not restored", { key }),
 	});
 	// Parents first: a child's result is delivered to its parent's session.
 	const keys = Object.keys(subSessions).sort((a, b) => a.split("/").length - b.split("/").length);
@@ -108,7 +150,19 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 		if (sub.parent && !candidates.has(sub.parent)) continue;
 		candidates.set(key, { ref, init });
 	}
-	const interrupted = keys.filter(key => candidates.has(key) && hasRestorableTurn(subSessions[key]!.entries));
+	const { interrupted, excluded, failures } = selectRestorableTaskBranches(
+		keys
+			.filter(key => candidates.has(key))
+			.map(key => ({
+				key,
+				parent: subSessions[key]!.parent,
+				entries: selectedBranchEntries(subSessions[key]!),
+			})),
+	);
+	for (const key of excluded) candidates.delete(key);
+	for (const { key, error } of failures) {
+		logger.warn("Subagent step progress unreadable; subtree not restored", { key, error: String(error) });
+	}
 	const ownerKeys = new Set<string>();
 	for (const key of interrupted) {
 		for (let parent = subSessions[key]!.parent; parent; parent = subSessions[parent]!.parent) ownerKeys.add(parent);
@@ -119,7 +173,10 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 	// the descendant results once its queued job is admitted.
 	const scheduled = keys.filter(key => interrupted.includes(key) || ownerKeys.has(key));
 	const lifecycle = AgentLifecycleManager.global();
-	const owners = new Map<string, { session: AgentSession; release: () => void; releaseIdle?: () => void }>();
+	if (!(lifecycle instanceof AgentLifecycleManager)) {
+		throw new Error("Restoring subagents requires the local lifecycle manager");
+	}
+	const owners = new Map<string, { session: RestoreOwnerSession; release: () => void; releaseIdle?: () => void }>();
 	const unavailable = new Set<string>();
 	const restored: string[] = [];
 	const jobs: Promise<void>[] = [];
@@ -135,7 +192,12 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 			let release: (() => void) | undefined;
 			try {
 				release = lifecycle.hold(ref.id, ref);
-				const live = await lifecycle.ensureLive(ref.id);
+				const live = await lifecycle.ensureLiveForRestore(ref.id, ref);
+				if (!hasRestoreOwnerCapabilities(live)) {
+					throw new UnsupportedRestoreOwnerError(
+						"An existing remote owner cannot be restored locally; restart before restoring its subtree",
+					);
+				}
 				if (registry.get(ref.id) !== ref || ref.session !== live || live.asyncJobManager !== manager) {
 					throw new Error("Restored owner changed session generation");
 				}
@@ -143,6 +205,7 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 				owners.set(key, { session: live, release, releaseIdle });
 			} catch (error) {
 				release?.();
+				if (error instanceof UnsupportedRestoreOwnerError) throw error;
 				unavailable.add(key);
 				logger.warn("Subagent owner cannot be revived; subtree not restored", { id: ref.id, error: String(error) });
 			}
@@ -167,28 +230,37 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 							throw new Error(`Subagent "${id}" changed before restore execution`);
 						}
 					}
-					const result = await runSubagentFollowUpTurn({
-						id,
-						agent: persistedAgentDefinition(ref.displayName, init),
-						message: init.task,
-						restore: true,
-						onRestoreSettled: owners.get(key)?.releaseIdle,
-						structured,
-						workPoolYieldItems: init.workPoolYieldItems,
-						outputSchema: init.outputSchema,
-						outputSchemaMode: init.outputSchemaMode,
-						signal,
-						eventBus: options.eventBus,
-						subagentEventBus: options.subagentEventBus,
-						artifactsDir: path.dirname(sessionFileOfRef),
-						maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
-					});
-					const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
-					const structuredOutput = result.structuredOutput;
-					if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
-						throw new AsyncJobError(text, structuredOutput);
+					// Acquire only after admission, for this exact generation. A leaf needs
+					// the same TTL protection as owners while its restored turn is settling.
+					const release = lifecycle.hold(id, ref);
+					try {
+						const result = await runSubagentFollowUpTurn({
+							id,
+							agent: persistedAgentDefinition(ref.displayName, init),
+							message: init.task,
+							restore: true,
+							steps: readStepProgress(selectedBranchEntries(subSessions[key]!)),
+							onRestoreSettled: owners.get(key)?.releaseIdle,
+							structured,
+							workPoolYieldItems: init.workPoolYieldItems,
+							outputSchema: init.outputSchema,
+							outputSchemaMode: init.outputSchemaMode,
+							signal,
+							eventBus: options.eventBus,
+							subagentEventBus: options.subagentEventBus,
+							artifactsDir: path.dirname(sessionFileOfRef),
+							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
+							...softRequestBudgetFor(persistedAgentName(ref.displayName, init), session.settings),
+						});
+						const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
+						const structuredOutput = result.structuredOutput;
+						if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
+							throw new AsyncJobError(text, structuredOutput);
+						}
+						return structuredOutput ? { text, structured: structuredOutput } : text;
+					} finally {
+						release();
 					}
-					return structuredOutput ? { text, structured: structuredOutput } : text;
 				},
 				{
 					id,
