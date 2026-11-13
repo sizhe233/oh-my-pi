@@ -15,16 +15,16 @@ describe("Windows release binary target", () => {
 			.nothrow();
 		expect(result.exitCode).toBe(0);
 		const output = result.text();
+		expect(output).toContain("DRY RUN bun --cwd=packages/collab-web run gen:export-viewer --check");
 
 		expect(output).toContain("Building packages/coding-agent/binaries/omp-windows-x64.exe...");
 		expect(output).toContain(
-			"DRY RUN Bun.build target=bun-windows-x64-baseline outfile=packages/coding-agent/binaries/omp-windows-x64.exe",
+			"DRY RUN Bun.build target=bun-windows-x64-baseline outfile=packages/coding-agent/binaries/omp-windows-x64.exe external=@huggingface/transformers,fastembed,onnxruntime-node",
 		);
 		expect(output).toContain("Building packages/coding-agent/binaries/omp-windows-arm64.exe...");
 		expect(output).toContain(
-			"DRY RUN Bun.build target=bun-windows-arm64 outfile=packages/coding-agent/binaries/omp-windows-arm64.exe",
+			"DRY RUN Bun.build target=bun-windows-arm64 outfile=packages/coding-agent/binaries/omp-windows-arm64.exe external=@huggingface/transformers,fastembed,onnxruntime-node",
 		);
-		expect(output).toContain("external=fastembed,onnxruntime-node");
 		expect(output).not.toContain("bun-windows-x64-modern");
 	});
 
@@ -65,7 +65,6 @@ it("runs compiled bytecode containing dependency import.meta.resolve calls", asy
 		repoRoot: temp.path(),
 		entrypoint,
 		outfile,
-		transformersVersion: "unused",
 		native: null,
 	});
 	const result = await $`${outfile}`.quiet().nothrow();
@@ -85,7 +84,6 @@ it("runs code behind a lazy import() from a split chunk of the compiled binary",
 		repoRoot: temp.path(),
 		entrypoint,
 		outfile,
-		transformersVersion: "unused",
 		native: null,
 	});
 	const result = await $`${outfile}`.quiet().nothrow();

@@ -8,6 +8,7 @@ import type { RenderResultOptions } from "./renderer";
 import type { Theme } from "../theme/theme";
 
 import { renderStatusLine, renderTreeList } from "../render";
+import { wrapTreeLine } from "../render/hanging-wrap";
 import { framedToolCard } from "../render/tool-card";
 
 import { formatErrorDetail, formatMoreItems, PREVIEW_LIMITS, pluralize, replaceTabs } from "../render/render-utils";
@@ -22,17 +23,15 @@ import type { NativeToolView, ToolRenderResult } from "./renderer";
 // =============================================================================
 
 /** Lifecycle state of a todo item. */
-export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 
 /** Operation names accepted by the todo tool and echoed in successful result details. */
-export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "block" | "unblock" | "append" | "view";
+export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "append" | "view";
 
 /** A task displayed within a todo phase. */
 export interface TodoItem {
 	content: string;
 	status: TodoStatus;
-	/** When `status === "blocked"`, an optional note on what the task is waiting for. */
-	blocker?: string;
 	details?: string;
 	notes?: string[];
 }
@@ -103,6 +102,11 @@ function matchesNormalizedCandidates(target: string, candidates: readonly string
  * ("Sonnet #2: bug scan" vs "Sonnet #2") still links up. The substring
  * fallback requires at least {@link TODO_DESCRIPTION_MIN_OVERLAP} chars on
  * the contained side.
+ *
+ * Display-only: the fallback deliberately over-matches (a "Review auth"
+ * subagent also lights "Review auth deployment"), and even an exact match
+ * does not show that a subagent owns a todo, so never change a todo's
+ * status from it.
  */
 export function todoMatchesAnyDescription(content: string, descriptions: readonly string[]): boolean {
 	const target = normalizeForTodoMatch(content);
@@ -382,10 +386,6 @@ function formatTodoLine(
 			return uiTheme.fg("accent", `${prefix}${checkbox.unchecked} ${text}`);
 		case "abandoned":
 			return uiTheme.fg("error", `${prefix}${checkbox.unchecked} ${strikethroughText(text)}`);
-		case "blocked": {
-			const note = item.blocker ? `blocked: ${forDisplay(item.blocker)}` : "blocked";
-			return uiTheme.fg("warning", `${prefix}${checkbox.unchecked} ${text} (${note})`);
-		}
 		default:
 			// A pending todo lit by a live subagent match renders accent, matching
 			// the sticky HUD's convention (#5873).
@@ -469,16 +469,12 @@ const CHECKLIST_STATUS: Record<TodoStatus, TspChecklistItem["status"]> = {
 	in_progress: "active",
 	completed: "done",
 	abandoned: "dropped",
-	blocked: "blocked",
 };
 
 /** Checklist item for one todo; a pending todo an in-flight subagent executes reads as active. */
 function checklistItem(task: TodoItem, id: string, matched = false): TspChecklistItem {
 	const status = task.status === "pending" && matched ? "active" : CHECKLIST_STATUS[task.status];
-	const note = task.status === "blocked" && task.blocker ? forDisplay(task.blocker) : undefined;
-	return note === undefined
-		? { id, text: forDisplay(task.content), status }
-		: { id, text: forDisplay(task.content), status, note };
+	return { id, text: forDisplay(task.content), status };
 }
 
 /**
@@ -644,7 +640,7 @@ export const todoToolRenderer = {
 			matchByContent.clear();
 		};
 
-		return framedToolCard(uiTheme, () => {
+		return framedToolCard(uiTheme, ({ contentWidth }) => {
 			const { expanded, spinnerFrame } = options;
 			const multiPhase = phases.length > 1;
 			const indent = multiPhase ? "  " : "";
@@ -725,7 +721,7 @@ export const todoToolRenderer = {
 							);
 						})();
 				for (const line of treeLines) {
-					bodyLines.push(`${indent}${line}`);
+					bodyLines.push(...(wrapTreeLine(`${indent}${line}`, contentWidth, uiTheme) ?? [`${indent}${line}`]));
 				}
 			}
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();

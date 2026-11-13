@@ -49,12 +49,14 @@ export class DownloadManager {
 	readonly #page: Page;
 	readonly #defaultDirectory: string;
 	readonly #perTab: boolean;
+	readonly #relay: boolean;
 	#directory?: string;
 	#arming?: Promise<void>;
 	#session?: CDPSession;
 	readonly #pending = new Map<string, PendingDownload>();
 	readonly #completed: BrowserDownload[] = [];
-	readonly #unclaimed: BrowserDownload[] = [];
+	/** Completed downloads no wait has taken yet, and downloads whose saved file could not be found. */
+	readonly #unclaimed: Array<BrowserDownload | ToolError> = [];
 	readonly #waiters: DownloadWaiter[] = [];
 	#willBegin?: (event: DownloadStarted & { frameId: string }) => void;
 	#progress?: (event: DownloadProgress) => void;
@@ -64,11 +66,12 @@ export class DownloadManager {
 	 * for a browser the user drives (connected, relay): there the folder also receives the user's own downloads, which
 	 * would otherwise be saved under bare GUIDs nobody renames.
 	 */
-	constructor(browser: Browser, page: Page, tabId: string, options: { perTab: boolean }) {
+	constructor(browser: Browser, page: Page, tabId: string, options: { perTab: boolean; relay?: boolean }) {
 		this.#browser = browser;
 		this.#page = page;
 		this.#defaultDirectory = path.join(os.tmpdir(), `omp-downloads-${tabId}`);
 		this.#perTab = options.perTab;
+		this.#relay = options.relay === true;
 	}
 
 	/**
@@ -76,6 +79,7 @@ export class DownloadManager {
 	 * so tabs never overwrite each other's, and each tab moves its own into its folder under the suggested name.
 	 */
 	async enable(directory?: string): Promise<void> {
+		this.#requireSupportedDownloads();
 		const resolved = path.resolve(directory ?? this.#defaultDirectory);
 		await fs.mkdir(resolved, { recursive: true });
 		if (!this.#session) await this.#attach();
@@ -89,6 +93,14 @@ export class DownloadManager {
 		this.#directory = resolved;
 	}
 
+	#requireSupportedDownloads(): void {
+		if (this.#relay) {
+			throw new ToolError(
+				"Relay download tracking is unavailable in this fork because the extension keeps its existing permissions. Use an explicitly selected non-relay browser for download tracking.",
+			);
+		}
+	}
+
 	/** Enabling started by a `wait()` that has not yet applied; settles once downloads are tracked. */
 	get arming(): Promise<void> | undefined {
 		return this.#arming;
@@ -96,6 +108,7 @@ export class DownloadManager {
 
 	/** Wait for the next unclaimed completed download. */
 	async wait(signal?: AbortSignal): Promise<BrowserDownload> {
+		this.#requireSupportedDownloads();
 		if (this.#unclaimed.length === 0) {
 			// A rejected `arming` nobody awaits would surface as an unhandled rejection.
 			if (signal?.aborted) throw signal.reason;
@@ -112,6 +125,7 @@ export class DownloadManager {
 			}
 		}
 		const ready = this.#unclaimed.shift();
+		if (ready instanceof ToolError) throw ready;
 		if (ready) return { ...ready };
 		if (signal?.aborted) throw signal.reason;
 		return await new Promise<BrowserDownload>((resolve, reject) => {
@@ -129,6 +143,7 @@ export class DownloadManager {
 
 	/** Return every completed download for this tab. */
 	list(): BrowserDownload[] {
+		this.#requireSupportedDownloads();
 		return this.#completed.map(download => ({ ...download }));
 	}
 
@@ -175,13 +190,14 @@ export class DownloadManager {
 	async #complete(pending: PendingDownload, filePath: string | undefined): Promise<void> {
 		const directory = this.#directory ?? this.#defaultDirectory;
 		const source = filePath ?? path.join(directory, this.#perTab ? pending.guid : pending.suggestedFilename);
-		for (let attempt = 0; attempt < 100; attempt++) {
-			try {
-				await fs.stat(source);
-				break;
-			} catch {
-				await Bun.sleep(10);
-			}
+		// Chromium saves on its own machine: a browser reached through an `app` CDP URL may run on another one.
+		if (!(await savedFileAppears(source))) {
+			this.#settleFailure(
+				new ToolError(
+					`Download failed: ${pending.url}: the browser finished it, but no file is at ${source} on this machine`,
+				),
+			);
+			return;
 		}
 		const name = typeof pending.suggestedFilename === "string" ? path.basename(pending.suggestedFilename) : "";
 		const target = path.join(directory, name);
@@ -215,6 +231,17 @@ export class DownloadManager {
 		waiter.resolve({ ...download });
 	}
 
+	/** Fail the next wait with `failure`, or keep it for the next wait when none is waiting yet. */
+	#settleFailure(failure: ToolError): void {
+		const waiter = this.#waiters.shift();
+		if (!waiter) {
+			this.#unclaimed.push(failure);
+			return;
+		}
+		if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+		waiter.reject(failure);
+	}
+
 	#rejectNext(error: ToolError): void {
 		const waiter = this.#waiters.shift();
 		if (!waiter) return;
@@ -226,6 +253,22 @@ export class DownloadManager {
 		const index = this.#waiters.indexOf(waiter);
 		if (index >= 0) this.#waiters.splice(index, 1);
 	}
+}
+
+/**
+ * Whether a regular file shows at `file` within about a second, the time Chromium's rename into place can take.
+ * Anything else already there, such as a directory, is no download.
+ */
+async function savedFileAppears(file: string): Promise<boolean> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		try {
+			return (await fs.stat(file)).isFile();
+		} catch (error) {
+			if (!isEnoent(error)) return false;
+		}
+		await Bun.sleep(10);
+	}
+	return false;
 }
 
 /**

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
-import { closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
+import { closeRelayOwnedTarget, closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
 import type { RelayToExtMessage } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 
 const WS_ENDPOINT = "ws://relay.test/cdp";
@@ -96,7 +96,7 @@ describe("relay owned-target close confirmation", () => {
 		expect(bridge.listTargets()).toEqual([]);
 	});
 
-	it("keeps an offline target unresolved even though discovery hides it, allowing a later retry", async () => {
+	it("keeps an offline target unresolved until reconnect retries it, then resolves its stale ownership record", async () => {
 		const bridge = new RelayBridge({});
 		const { extension, removed, targetId } = connectOwnedTab(bridge);
 		installRelayTransport(bridge);
@@ -107,8 +107,13 @@ describe("relay owned-target close confirmation", () => {
 		expect(removed).toEqual([]);
 
 		const reconnected = connectOwnedTab(bridge);
-		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(true);
+		// Reconnect retries the queued close before this new CDP connection sends
+		// its command. Absence still is not an explicit close acknowledgement.
+		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(false);
 		expect(reconnected.removed).toEqual([9]);
+		expect(bridge.listTargets()).toEqual([]);
+		// The ownership-aware reaper separately resolves a stale, absent record.
+		expect(await closeRelayOwnedTarget(WS_ENDPOINT, targetId)).toBe(true);
 	});
 
 	it.each([{ success: false }, {}])("does not confirm an absent target after a close reply of %j", async result => {

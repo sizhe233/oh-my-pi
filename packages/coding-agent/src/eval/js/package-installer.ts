@@ -137,6 +137,12 @@ export async function installJsPackages(options: InstallJsPackagesOptions): Prom
 
 	const lockPath = mode === "managed" ? `${environment.root}.install` : projectLockPath(environment.root);
 	options.signal?.throwIfAborted();
+	// Reject disabled provisioning before creating even the lock's parent directory.
+	// The locked check below still validates the manifest after concurrent changes.
+	if (mode === "managed" && !options.autoProvision) {
+		await ensureManagedManifest(environment, false, options.signal);
+		options.signal?.throwIfAborted();
+	}
 	await fs.promises.mkdir(path.dirname(lockPath), { recursive: true });
 	return await withFileLock(
 		lockPath,

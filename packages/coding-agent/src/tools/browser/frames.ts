@@ -6,11 +6,19 @@ import { Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import type { ElementHandle, ElementScreenshotOptions, Frame, Page } from "puppeteer-core";
 import { formatScreenshot, resizeImage } from "../../utils/image-resize";
 import { throwIfAborted } from "../tool-errors";
+import { markHandled } from "../run-scope";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { type AriaSnapshotOptions, buildAriaSnapshotScript } from "./aria/aria-snapshot";
-import { clickElement, fillViaHandle, focusTextEntryTarget, pressKey } from "./interactions";
+import {
+	type AriaSnapshotOptions,
+	captureAriaSnapshot,
+	parseAriaRefSelector,
+	resolveAriaRefHandle,
+} from "./aria/aria-snapshot";
+import { clickElement, fillViaHandle, pressKey, typeIntoElement, withLiveElement } from "./interactions";
 import { readPageViewport } from "./launch";
 import { RunOutput } from "./run-output";
+import { whileDrawing } from "./screenshot";
+import { selectorWaitOptions, type SelectorWaitOptions, waitForDetached, waitForSelectorHandle } from "./selector-wait";
 import type { ScreenshotResult, SessionSnapshot } from "./tab-protocol";
 
 /** JSON-safe metadata for one document frame. */
@@ -34,29 +42,25 @@ export interface FramePressOptions {
 }
 
 /** Options accepted by frame-scoped selector waits. */
-export interface FrameWaitOptions {
-	/** Maximum wait in milliseconds. */
-	timeout?: number;
-	/** Require a visible matching element. */
-	visible?: boolean;
-	/** Require the matching element to become hidden. */
-	hidden?: boolean;
-}
+export type FrameWaitOptions = SelectorWaitOptions;
 
 /** A frame-scoped helper object exposed by `tab.frame()`. */
 export interface BrowserFrameApi {
-	/** Click a matching element in this frame. */
-	click(selector: string): Promise<void>;
+	/** Click a matching element in this frame, optionally with another button or click count. */
+	click(
+		selector: string,
+		options?: { button?: "left" | "right" | "middle" | "back" | "forward"; count?: number },
+	): Promise<void>;
 	/** Replace a matching form control's value. */
 	fill(selector: string, value: string): Promise<void>;
 	/** Type text into a matching element. */
 	type(selector: string, text: string): Promise<void>;
 	/** Press a keyboard key, optionally after focusing an element. */
 	press(key: string, options?: FramePressOptions): Promise<void>;
-	/** Return a matching element's text content. */
-	text(selector: string): Promise<string>;
-	/** Return a matching element's inner HTML. */
-	html(selector: string): Promise<string>;
+	/** Return a matching element's text content; without a selector, the frame's `<body>`. */
+	text(selector?: string): Promise<string>;
+	/** Return a matching element's inner HTML; without a selector, the frame's `<body>`. */
+	html(selector?: string): Promise<string>;
 	/** Return a matching form control's value. */
 	value(selector: string): Promise<string>;
 	/** Return a matching element attribute. */
@@ -189,11 +193,27 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 		zeroMatchAfterMs: hooks.zeroMatchAfterMs,
 	});
 	const waitForSelector = (selector: string, options?: FrameWaitOptions): Promise<boolean> => {
+		try {
+			options = selectorWaitOptions(options);
+		} catch (error) {
+			return markHandled(Promise.reject(error));
+		}
 		const deadline = hooks.waitMs(options?.timeout);
 		return hooks.op(
 			`frame.waitForSelector(${JSON.stringify(selector)})`,
 			deadline,
 			async signal => {
+				const ref = parseAriaRefSelector(selector);
+				if (ref !== null) {
+					const handle = await waitForSelectorHandle(() => resolveAriaRefHandle(frame, ref), options, signal);
+					await handle?.dispose().catch(() => undefined);
+					return true;
+				}
+				if (options?.state === "detached") {
+					const normalized = hooks.normalizeSelector(selector);
+					await waitForDetached(() => frame.$(normalized), signal);
+					return true;
+				}
 				const handle = await untilAborted(signal, () =>
 					frame.waitForSelector(hooks.normalizeSelector(selector), {
 						timeout: deadline,
@@ -207,7 +227,10 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 			},
 			{
 				selector,
-				zeroMatchAfterMs: options?.timeout === undefined && !options?.hidden ? hooks.zeroMatchAfterMs : undefined,
+				zeroMatchAfterMs:
+					options?.timeout === undefined && !options?.hidden && options?.state !== "detached"
+						? hooks.zeroMatchAfterMs
+						: undefined,
 			},
 		);
 	};
@@ -228,18 +251,26 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 		return handle;
 	};
 	return {
-		click: selector =>
+		click: (selector, options) =>
 			hooks.op(
 				`frame.click(${JSON.stringify(selector)})`,
 				hooks.actionOpMs,
 				async signal => {
 					const label = `frame.click(${JSON.stringify(selector)})`;
-					const handle = await actionHandle(label, selector, signal);
-					try {
-						await clickElement(handle, label, signal);
-					} finally {
-						await handle.dispose().catch(() => undefined);
-					}
+					await withLiveElement(
+						() => actionHandle(label, selector, signal),
+						async handle => {
+							try {
+								await clickElement(handle, label, signal, {
+									button: options?.button,
+									clickCount: options?.count,
+								});
+							} finally {
+								await handle.dispose().catch(() => undefined);
+							}
+						},
+						signal,
+					);
 				},
 				selectorOptions(selector),
 			),
@@ -265,8 +296,7 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 					const handle = await untilAborted(signal, () => frame.$(hooks.normalizeSelector(selector)));
 					if (!handle) throw new ToolError(`frame.type(${JSON.stringify(selector)}) matched no element`);
 					try {
-						await focusTextEntryTarget(handle, "type into", signal);
-						await untilAborted(signal, () => handle.type(text, { delay: 0 }));
+						await typeIntoElement(handle, text, signal);
 					} finally {
 						await handle.dispose().catch(() => undefined);
 					}
@@ -277,19 +307,23 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 			hooks.op(`frame.press(${JSON.stringify(key)})`, hooks.actionOpMs, async signal => {
 				if (options?.selector)
 					await untilAborted(signal, () => frame.focus(hooks.normalizeSelector(options.selector!)));
-				await untilAborted(signal, () => pressKey(frame.page(), key));
+				await pressKey(frame.page(), key, undefined, signal);
 			}),
-		text: selector =>
+		// Without a selector, the frame's `<body>`; any value passed, `null` included, is still checked as a selector.
+		text: (selector = "body") =>
 			hooks.op(
 				`frame.text(${JSON.stringify(selector)})`,
 				hooks.quickOpMs,
 				signal =>
 					untilAborted(signal, () =>
-						frame.$eval(hooks.normalizeSelector(selector), element => element.textContent ?? ""),
+						frame.$eval(hooks.normalizeSelector(selector), element => {
+							const rendered = "innerText" in element ? element.innerText : undefined;
+							return (typeof rendered === "string" ? rendered : (element.textContent ?? "")).trim();
+						}),
 					),
 				selectorOptions(selector),
 			),
-		html: selector =>
+		html: (selector = "body") =>
 			hooks.op(
 				`frame.html(${JSON.stringify(selector)})`,
 				hooks.quickOpMs,
@@ -340,9 +374,14 @@ export function createFrameApi(frame: Frame, hooks: FrameApiHooks): BrowserFrame
 			}),
 		ariaSnapshot: (selector, options) =>
 			hooks.op("frame.ariaSnapshot()", hooks.quickOpMs, async signal => {
-				return (await untilAborted(signal, () =>
-					frame.evaluate(buildAriaSnapshotScript(selector, options)),
-				)) as string;
+				const root = selector ? await untilAborted(signal, () => frame.$(hooks.normalizeSelector(selector))) : null;
+				try {
+					if (selector && !root)
+						throw new ToolError(`frame.ariaSnapshot: selector ${selector} matched no element`);
+					return await untilAborted(signal, () => captureAriaSnapshot(frame, root, options));
+				} finally {
+					await root?.dispose().catch(() => undefined);
+				}
 			}),
 		evaluate: ((fn: string | ((...args: unknown[]) => unknown), ...args: unknown[]) =>
 			hooks.op("frame.evaluate()", Number.POSITIVE_INFINITY, signal =>
@@ -385,7 +424,9 @@ export async function captureFrameScreenshot(
 		).catch(() => undefined);
 		captureScale = (await readPageViewport(frame.page(), signal)).deviceScaleFactor ?? 1;
 		const screenshotOptions: ElementScreenshotOptions = { type: "png", scrollIntoView: false };
-		buffer = (await untilAborted(signal, () => handle.screenshot(screenshotOptions))) as Buffer;
+		buffer = (await whileDrawing(frame.page(), signal, () =>
+			untilAborted(signal, () => handle.screenshot(screenshotOptions)),
+		)) as Buffer;
 	} finally {
 		await handle.dispose().catch(() => undefined);
 	}
@@ -416,8 +457,6 @@ export async function captureFrameScreenshot(
 		type: "text",
 		text: formatScreenshot({
 			saveFullRes,
-			savedMimeType,
-			savedByteLength: savedBuffer.length,
 			dest,
 			resized,
 			capture: { area: "element", scale: captureScale },

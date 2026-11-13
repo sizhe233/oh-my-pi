@@ -6,17 +6,22 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
-import type { AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	isPerCallContextMessage,
+	kCursorExecResolved,
+	kStreamingBlockIndex,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
+	emitSessionShutdownEvent,
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
 	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
@@ -31,6 +36,7 @@ import type {
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -126,7 +132,7 @@ describe("ExtensionRunner", () => {
 		);
 		const actions = {
 			sendMessage: () => {},
-			sendUserMessage: () => {},
+			sendUserMessage: async () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
 			getActiveTools: () => [],
@@ -177,7 +183,7 @@ describe("ExtensionRunner", () => {
 		runner.initialize(
 			{
 				sendMessage: () => {},
-				sendUserMessage: () => {},
+				sendUserMessage: async () => {},
 				appendEntry: () => {},
 				setLabel: () => {},
 				getActiveTools: () => [],
@@ -534,6 +540,155 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.getAssistantThinkingRenderers().length).toBe(1);
 		});
+
+		it("hands out assistant text renderers only while extensionRenderers.assistantText is on", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "text-renderer.ts"),
+				`export default function(pi) { pi.registerAssistantTextRenderer(context => context.text.toUpperCase()); }`,
+			);
+			const result = await loadTestExtensions();
+			const runnerWith = (settings: Settings | undefined) =>
+				new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					settings,
+				);
+
+			// Off (the default, or no session settings at all): nothing reaches the transcript.
+			expect(runnerWith(Settings.isolated({})).getAssistantTextRenderers()).toEqual([]);
+			expect(runnerWith(undefined).getAssistantTextRenderers()).toEqual([]);
+			const [renderer] = runnerWith(
+				Settings.isolated({ "extensionRenderers.assistantText": true }),
+			).getAssistantTextRenderers();
+			expect(
+				renderer?.({ message: createAssistantMessage("hi"), contentIndex: 0, text: "hi", streaming: false }),
+			).toBe("HI");
+		});
+
+		it("fails an extension's load when it registers an assistant text renderer that is not a function", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "bad-text-renderer.ts"),
+				`export default function(pi) { pi.registerAssistantTextRenderer("upper"); }`,
+			);
+			const result = await loadTestExtensions();
+
+			expect(result.extensions).toEqual([]);
+			expect(result.errors).toHaveLength(1);
+			expect(result.errors[0]?.error).toContain("registerAssistantTextRenderer expects a function, got string");
+			expect(result.errors[0]?.error).toContain("bad-text-renderer.ts");
+		});
+
+		it("routes a claimed link's click to its claimant only, while extensionRenderers.assistantText is on", async () => {
+			const clicks: string[] = [];
+			// The extension files below run in this process and record into this global.
+			Reflect.set(globalThis, "__linkClicks", clicks);
+			await Bun.write(
+				path.join(extensionsDir, "link-owner.ts"),
+				`export default function(pi) {
+					pi.registerLinkScheme("Demo");
+					pi.on("link_activate", event => { globalThis.__linkClicks.push("owner " + event.scheme + " " + event.url); });
+				}`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-bystander.ts"),
+				`export default function(pi) { pi.on("link_activate", event => { globalThis.__linkClicks.push("bystander " + event.url); }); }`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-hijack.ts"),
+				`export default function(pi) { pi.registerLinkScheme("https"); }`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-internal-hijack.ts"),
+				`export default function(pi) { pi.registerLinkScheme("Security"); }`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-drive-letter.ts"),
+				`export default function(pi) { pi.registerLinkScheme("C"); }`,
+			);
+			try {
+				const result = await loadTestExtensions();
+				// Claiming a web scheme or one of omp's internal URL schemes fails that extension's load
+				// instead of capturing every such link.
+				expect(result.errors.find(error => error.path.endsWith("link-hijack.ts"))?.error).toContain("reserved");
+				expect(result.errors.find(error => error.path.endsWith("link-internal-hijack.ts"))?.error).toContain(
+					"reserved",
+				);
+				// A one-letter scheme would claim Windows paths such as `C:/notes.md`.
+				expect(result.errors.find(error => error.path.endsWith("link-drive-letter.ts"))?.error).toContain(
+					"two or more characters",
+				);
+				const runnerWith = (settings: Settings) =>
+					new ExtensionRunner(
+						result.extensions,
+						result.runtime,
+						tempDir.path(),
+						sessionManager,
+						modelRegistry,
+						undefined,
+						settings,
+					);
+
+				const off = runnerWith(Settings.isolated({}));
+				expect(off.getLinkSchemes()).toEqual([]);
+				expect(await off.emitLinkActivate("demo:open/1")).toBe(false);
+
+				const on = runnerWith(Settings.isolated({ "extensionRenderers.assistantText": true }));
+				expect(on.getLinkSchemes()).toEqual(["demo"]);
+				expect(await on.emitLinkActivate("DEMO:open/2")).toBe(true);
+				expect(await on.emitLinkActivate("https://example.com")).toBe(false);
+				expect(clicks).toEqual(["owner demo DEMO:open/2"]);
+			} finally {
+				Reflect.deleteProperty(globalThis, "__linkClicks");
+			}
+		});
+
+		it("lets a link_activate handler run past the event-handler timeout, as a command would", async () => {
+			const release = Promise.withResolvers<void>();
+			const done: string[] = [];
+			Reflect.set(globalThis, "__linkRelease", release.promise);
+			Reflect.set(globalThis, "__linkDone", done);
+			await Bun.write(
+				path.join(extensionsDir, "link-dialog.ts"),
+				`export default function(pi) {
+					pi.registerLinkScheme("demo");
+					pi.on("link_activate", async event => {
+						await globalThis.__linkRelease;
+						globalThis.__linkDone.push(event.url);
+					});
+				}`,
+			);
+			vi.useFakeTimers();
+			try {
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					Settings.isolated({ "extensionRenderers.assistantText": true }),
+				);
+				const errors: string[] = [];
+				runner.onError(error => errors.push(error.error));
+				testSetExtensionHandlerTimeoutMs(10);
+				// The handler waits on the user (a dialog) far longer than the handler timeout.
+				const emission = runner.emitLinkActivate("demo:open/1");
+				vi.advanceTimersByTime(1_000);
+				release.resolve();
+				expect(await emission).toBe(true);
+				expect(done).toEqual(["demo:open/1"]);
+				expect(errors).toEqual([]);
+			} finally {
+				vi.useRealTimers();
+				Reflect.deleteProperty(globalThis, "__linkRelease");
+				Reflect.deleteProperty(globalThis, "__linkDone");
+			}
+		});
 	});
 
 	describe("flags", () => {
@@ -869,7 +1024,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -1084,7 +1239,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -1204,6 +1359,40 @@ describe("ExtensionRunner", () => {
 			expect(stopResult).toEqual({ continue: true, additionalContext: "Run one more pass." });
 		});
 
+		it("keeps both cleanup and unfinished-work feedback from separate stop handlers", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "session-stop-merge.ts"),
+				`
+				export default function(pi) {
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "", reason: "Clean abandoned process." }));
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "Continue unfinished work." }));
+				}
+			`,
+			);
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const message = createAssistantMessage("Next is another unfinished change.");
+			const result = await runner.emitSessionStop({
+				messages: [message],
+				turn_id: 1,
+				last_assistant_message: message,
+				session_id: "session-123",
+				session_file: "/tmp/session.jsonl",
+				stop_hook_active: false,
+				signal: new AbortController().signal,
+			});
+			expect(result).toEqual({
+				continue: true,
+				additionalContext: "Clean abandoned process.\n\nContinue unfinished work.",
+			});
+		});
+
 		it("skips cancelled handlers, releases in-flight handlers, and preserves timeout errors", async () => {
 			const extensionPath = path.join(tempDir.path(), "cancel-session-stop.ts");
 			const startedPath = path.join(tempDir.path(), "session-stop-started.txt");
@@ -1305,7 +1494,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -1635,7 +1824,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2206,6 +2395,107 @@ describe("ExtensionRunner", () => {
 			}
 		});
 
+		it("keeps a session_before_* handler's dialog answerable past the handler budget, unlike a non-gate event", async () => {
+			const extensionPath = path.join(tempDir.path(), "gate-dialog.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_before_switch", async (_event, ctx) => ({ cancel: await ctx.ui.confirm("Leave?", "") }));
+						pi.on("agent_end", async (_event, ctx) => {
+							await ctx.ui.confirm("Still there?", "");
+						});
+					}
+				`,
+			);
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: string[] = [];
+			runner.onError(error => errors.push(error.error));
+			let presented = Promise.withResolvers<AbortSignal | undefined>();
+			let answer = Promise.withResolvers<boolean>();
+			const confirm: ExtensionUIContext["confirm"] = async (_title, _message, dialogOptions) => {
+				presented.resolve(dialogOptions?.signal);
+				return answer.promise;
+			};
+			// The runner proxies the UI context, so the overrides sit on its prototype.
+			initializeRunner(runner, Object.create(Object.create(runner.getUIContext(), { confirm: { value: confirm } })));
+			vi.useFakeTimers();
+			let now = 0;
+			const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => now);
+			try {
+				testSetExtensionHandlerTimeoutMs(15);
+				// The operator answers well after the handler budget.
+				const gate = runner.emit({ type: "session_before_switch", reason: "new" });
+				await presented.promise;
+				now = 100;
+				vi.advanceTimersByTime(100);
+				answer.resolve(true);
+				expect(await gate).toEqual({ cancel: true });
+				expect(errors).toEqual([]);
+
+				// Real timers from here: the handler's own 15ms budget is what ends the wait.
+				performanceNow.mockRestore();
+				vi.useRealTimers();
+				presented = Promise.withResolvers();
+				answer = Promise.withResolvers();
+				const notification = runner.emit({ type: "agent_end", messages: [] });
+				const dialogSignal = await presented.promise;
+				await notification;
+				expect(errors).toHaveLength(1);
+				expect(errors[0]).toContain("timed out after 15ms");
+				expect(dialogSignal?.aborted).toBe(true);
+			} finally {
+				performanceNow.mockRestore();
+				vi.useRealTimers();
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+			}
+		});
+
+		it("closes a gate handler's pending dialog and drops its late result when the event's signal aborts", async () => {
+			const extensionPath = path.join(tempDir.path(), "gate-abort.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_before_shutdown", async (_event, ctx) => {
+							await ctx.ui.select("Outcome", ["done"]);
+							return { cancel: true };
+						});
+					}
+				`,
+			);
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const presented = Promise.withResolvers<AbortSignal | undefined>();
+			const answer = Promise.withResolvers<string | undefined>();
+			// Ignores its signal, like a handler that never checks it.
+			const select: ExtensionUIContext["select"] = async (_title, _options, dialogOptions) => {
+				presented.resolve(dialogOptions?.signal);
+				return answer.promise;
+			};
+			initializeRunner(runner, Object.create(Object.create(runner.getUIContext(), { select: { value: select } })));
+			const controller = new AbortController();
+			const emission = runner.emit({ type: "session_before_shutdown", signal: controller.signal });
+			const dialogSignal = await presented.promise;
+			controller.abort();
+			expect(await emission).toBeUndefined();
+			expect(dialogSignal?.aborted).toBe(true);
+			answer.resolve("done");
+		});
+
 		it("cancels a pending confirmation and blocks tool execution when the outer dispatch aborts (#4223)", async () => {
 			const extensionPath = path.join(tempDir.path(), "confirm-abort-tool-call.ts");
 			fs.writeFileSync(
@@ -2307,7 +2597,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2382,7 +2672,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: (_customType, data) => {
 						snapshots.push(data);
 					},
@@ -2453,7 +2743,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2511,7 +2801,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2541,6 +2831,9 @@ describe("ExtensionRunner", () => {
 					input: async () => undefined,
 					notify: () => {},
 					onTerminalInput: () => () => {},
+					rerenderMessage: () => {},
+					refreshTranscript: () => {},
+					getLinkClicksAvailable: () => false,
 					setStatus: () => {},
 					setWorkingMessage: () => {},
 					setWidget: () => {},
@@ -2554,6 +2847,7 @@ describe("ExtensionRunner", () => {
 					editor: async () => undefined,
 					addAutocompleteProvider: () => {},
 					setEditorComponent: () => {},
+					getEditorComponent: () => undefined,
 					get theme() {
 						return {} as never;
 					},
@@ -2623,9 +2917,421 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
+				"Approve dangerous_tool for this session",
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
+		});
+
+		it("approving for this session skips later mode prompts of that tool and tier, until the session changes", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const select = vi.fn(async (_title: string, options: string[]) => options[1]);
+			initializeRunner(runner, select);
+			const context = () => ({
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			});
+			const run = (tool: typeof approvalTool | AgentTool, id: string) =>
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					id,
+					{},
+					undefined,
+					undefined,
+					context(),
+				);
+			await run(approvalTool, "call-grant");
+			await run(approvalTool, "call-granted");
+			expect(select).toHaveBeenCalledTimes(1);
+			// The grant covers that tool at that tier only: its write-tier calls and other tools still ask.
+			await run({ ...approvalTool, approval: "write" as const }, "call-write-tier");
+			await run({ ...approvalTool, name: "other_tool" }, "call-other");
+			expect(select).toHaveBeenCalledTimes(3);
+			// A critical override asks every time and never offers the session choice.
+			const critical = { ...approvalTool, approval: () => ({ tier: "exec" as const, override: true }) };
+			select.mockImplementationOnce(async () => "Approve");
+			await run(critical, "call-critical");
+			expect(select).toHaveBeenLastCalledWith(expect.any(String), ["Approve", "Deny"]);
+			// A new session starts without the grant.
+			await sessionManager.newSession();
+			await run(approvalTool, "call-new-session");
+			expect(select).toHaveBeenCalledTimes(5);
+		});
+
+		const approvalFixture = () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const settings = Settings.isolated({
+				"tools.approvalMode": "always-ask",
+				"compaction.enabled": false,
+				"advisor.enabled": false,
+			});
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }] }));
+			const context = {
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings,
+			};
+			const run = (name = "dangerous_tool") =>
+				new ExtensionToolWrapper(
+					{
+						...approvalTool,
+						name,
+						parameters: Type.Object({}),
+						execute,
+					},
+					runner,
+				).execute(`call-${name}`, {}, undefined, undefined, context);
+			const session = new AgentSession({
+				agent: new Agent({
+					initialState: {
+						model: getBundledModel("anthropic", "claude-sonnet-4-5")!,
+						systemPrompt: ["Test"],
+						tools: [],
+					},
+				}),
+				sessionManager,
+				modelRegistry,
+				settings,
+				extensionRunner: runner,
+			});
+			return { runner, run, execute, session };
+		};
+
+		it.each(["Approve", "Approve other_tool for this session"])(
+			"beginDispose revokes grants and rejects pending %s before asynchronous teardown",
+			async answer => {
+				const { runner, run, execute, session } = approvalFixture();
+				const response = Promise.withResolvers<string>();
+				const prompted = Promise.withResolvers<void>();
+				initializeRunner(runner, async (_title, choices) => choices[1]);
+				try {
+					await run();
+					await run();
+					initializeRunner(runner, async () => {
+						prompted.resolve();
+						return response.promise;
+					});
+					const pending = run("other_tool");
+					const rejected = pending.then(
+						() => undefined,
+						(error: unknown) => {
+							if (!(error instanceof Error)) throw error;
+							return error;
+						},
+					);
+					await prompted.promise;
+					session.beginDispose();
+					response.resolve(answer);
+					expect((await rejected)?.message).toContain("session changed");
+					expect(execute).toHaveBeenCalledTimes(2);
+					const deny = vi.fn(async () => "Deny");
+					initializeRunner(runner, deny);
+					await expect(run()).rejects.toThrow("denied by user");
+					await expect(run("other_tool")).rejects.toThrow("denied by user");
+					expect(deny).toHaveBeenCalledTimes(2);
+				} finally {
+					response.resolve("Deny");
+					await session.dispose();
+				}
+			},
+		);
+
+		it("exports only current approval grants to session mirrors", async () => {
+			const { runner, session } = approvalFixture();
+			try {
+				runner.grantSessionApproval("scope-a");
+				runner.grantSessionApproval("scope-b");
+				expect(runner.sessionApprovalKeys()).toEqual(["scope-a", "scope-b"]);
+				runner.invalidatePendingApprovals();
+				expect(runner.sessionApprovalKeys()).toEqual(["scope-a", "scope-b"]);
+				expect(await session.newSession()).toBe(true);
+				expect(runner.sessionApprovalKeys()).toEqual([]);
+				expect(runner.hasSessionApproval("scope-a")).toBe(false);
+				runner.grantSessionApproval("direct-identity");
+				await sessionManager.newSession();
+				expect(runner.sessionApprovalKeys()).toEqual([]);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["new", "reset", "shutdown"] as const)("accepted %s revokes prior session approvals", async operation => {
+			const { runner, run, session } = approvalFixture();
+			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+			initializeRunner(runner, select);
+			try {
+				await run();
+				await run();
+				expect(select).toHaveBeenCalledTimes(1);
+				if (operation === "new") expect(await session.newSession()).toBe(true);
+				else if (operation === "reset") expect(await session.resetSessionContext()).toBeDefined();
+				else expect(await emitSessionShutdownEvent(runner)).toBe(false);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(2);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["new", "switch", "branch", "fork-no-file", "reset-busy"] as const)(
+			"refused %s preserves the current approval lifetime",
+			async operation => {
+				const { runner, run, session } = approvalFixture();
+				const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+				initializeRunner(runner, select);
+				const abort = new AbortController();
+				let tracked: Promise<unknown> | undefined;
+				const evaluation = Promise.withResolvers<void>();
+				try {
+					await run();
+					if (operation === "fork-no-file") expect(await session.fork()).toBe(false);
+					else if (operation === "reset-busy") {
+						tracked = session.trackEvalExecution(evaluation.promise, abort).catch(() => {});
+						expect(await session.resetSessionContext()).toBeUndefined();
+					} else {
+						vi.spyOn(runner, "hasHandlers").mockImplementation(
+							name => name === "session_before_switch" || name === "session_before_branch",
+						);
+						vi.spyOn(runner, "emit").mockResolvedValue({ cancel: true });
+						if (operation === "new") expect(await session.newSession()).toBe(false);
+						else if (operation === "switch") expect(await session.switchSession("unused.jsonl")).toBe(false);
+						else {
+							const id = sessionManager.appendMessage({ role: "user", content: "branch here", timestamp: 1 });
+							expect((await session.branch(id)).cancelled).toBe(true);
+						}
+					}
+					await run();
+					expect(select).toHaveBeenCalledTimes(1);
+				} finally {
+					abort.abort();
+					evaluation.resolve();
+					await tracked;
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it.each(["tool_approval_requested", "tool_approval_resolved"] as const)(
+			"a session change during %s cannot execute or grant a stale response",
+			async eventType => {
+				const { runner, run, execute, session } = approvalFixture();
+				const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+				initializeRunner(runner, select);
+				vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === eventType);
+				const emit: typeof runner.emit = runner.emit.bind(runner);
+				vi.spyOn(runner, "emit").mockImplementation(event => {
+					if (event.type === eventType) {
+						runner.clearSessionApprovals();
+						runner.grantSessionApproval("new-session-grant");
+					}
+					return emit(event);
+				});
+				try {
+					await expect(run()).rejects.toThrow("session changed");
+					expect(execute).not.toHaveBeenCalled();
+					expect(select).toHaveBeenCalledTimes(eventType === "tool_approval_requested" ? 0 : 1);
+					expect(runner.hasSessionApproval("new-session-grant")).toBe(true);
+				} finally {
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it.each(["new", "switch"] as const)(
+			"accepted %s rejects late approval before abort teardown settles",
+			async operation => {
+				const { runner, run, execute, session } = approvalFixture();
+				const response = Promise.withResolvers<string>();
+				const prompted = Promise.withResolvers<void>();
+				const teardown = Promise.withResolvers<void>();
+				const enteredTeardown = Promise.withResolvers<void>();
+				initializeRunner(runner, async () => {
+					prompted.resolve();
+					return response.promise;
+				});
+				const pending = run().then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await prompted.promise;
+				vi.spyOn(session, "abort").mockImplementation(async () => {
+					enteredTeardown.resolve();
+					await teardown.promise;
+					throw new Error("test teardown stopped before disk access");
+				});
+				const transition = (
+					operation === "new" ? session.newSession() : session.switchSession("unused.jsonl")
+				).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				try {
+					await enteredTeardown.promise;
+					response.resolve("Approve");
+					expect(await pending).toMatchObject({ message: expect.stringContaining("session changed") });
+					expect(execute).not.toHaveBeenCalled();
+				} finally {
+					response.resolve("Deny");
+					teardown.resolve();
+					await transition;
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it("same-session tree navigation rejects a late approval without clearing existing grants", async () => {
+			const { runner, run, execute, session } = approvalFixture();
+			const response = Promise.withResolvers<string>();
+			const prompted = Promise.withResolvers<void>();
+			let allowSession = "";
+			const select = vi.fn(async (_title: string, choices: string[]) => {
+				allowSession = choices[1]!;
+				prompted.resolve();
+				return response.promise;
+			});
+			initializeRunner(runner, select);
+			const user = sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+			sessionManager.appendMessage(createAssistantMessage("answer"));
+			runner.grantSessionApproval("existing-grant");
+			const pending = run().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await prompted.promise;
+				expect((await session.navigateTree(user, { summarize: false })).cancelled).toBe(false);
+				response.resolve(allowSession);
+				expect(await pending).toMatchObject({ message: expect.stringContaining("session changed") });
+				expect(execute).not.toHaveBeenCalled();
+				expect(runner.hasSessionApproval("existing-grant")).toBe(true);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(2);
+			} finally {
+				response.resolve("Deny");
+				await pending;
+				await session.dispose();
+			}
+		});
+
+		it.each(["no-op", "cancelled"] as const)("%s tree navigation preserves the approval lifetime", async outcome => {
+			const { runner, session } = approvalFixture();
+			try {
+				const user = sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+				const leaf = sessionManager.appendMessage(createAssistantMessage("answer"));
+				runner.grantSessionApproval("existing-grant");
+				const epoch = runner.getSessionApprovalEpoch();
+				if (outcome === "cancelled") {
+					vi.spyOn(runner, "hasHandlers").mockImplementation(name => name === "session_before_tree");
+					vi.spyOn(runner, "emit").mockResolvedValue({ cancel: true });
+				}
+				const result = await session.navigateTree(outcome === "no-op" ? leaf : user, { summarize: false });
+				expect(result.cancelled).toBe(outcome === "cancelled");
+				expect(runner.getSessionApprovalEpoch()).toBe(epoch);
+				expect(runner.hasSessionApproval("existing-grant")).toBe(true);
+			} finally {
+				vi.restoreAllMocks();
+				await session.dispose();
+			}
+		});
+
+		it("an accepted branch revokes grants while same-session tree navigation preserves them", async () => {
+			const { runner, run, session } = approvalFixture();
+			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+			initializeRunner(runner, select);
+			try {
+				const user = sessionManager.appendMessage({ role: "user", content: "branch", timestamp: 1 });
+				const leaf = sessionManager.appendMessage(createAssistantMessage("answer"));
+				await run();
+				expect((await session.navigateTree(user, { summarize: false })).cancelled).toBe(false);
+				await run();
+				expect(select).toHaveBeenCalledTimes(1);
+				await session.navigateTree(leaf, { summarize: false });
+				expect((await session.branch(user)).cancelled).toBe(false);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(2);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it.each(["whole-fork", "entry-fork", "btw"] as const)(
+			"accepted %s invalidates a late response before transcript identity mutation",
+			async operation => {
+				const { runner, run, execute, session } = approvalFixture();
+				const user = sessionManager.appendMessage({ role: "user", content: "task", timestamp: 1 });
+				const assistant = createAssistantMessage("answer");
+				const leaf = sessionManager.appendMessage(assistant);
+				const id = sessionManager.getSessionId();
+				const response = Promise.withResolvers<string>();
+				const prompted = Promise.withResolvers<void>();
+				initializeRunner(runner, async () => {
+					prompted.resolve();
+					return response.promise;
+				});
+				const pending = run().then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await prompted.promise;
+				// An in-memory identity seam: stop exactly at mutation, without pretending to exercise disk I/O.
+				vi.spyOn(sessionManager, "getSessionFile").mockReturnValue(tempDir.join("virtual.jsonl"));
+				const stop = () => {
+					throw new Error("test stopped at transcript mutation");
+				};
+				vi.spyOn(sessionManager, "fork").mockImplementation(async () => stop());
+				vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(stop);
+				try {
+					const transition =
+						operation === "whole-fork"
+							? session.fork()
+							: operation === "entry-fork"
+								? session.fork(leaf)
+								: session.branchFromBtw("question", assistant, leaf, id);
+					await expect(transition).rejects.toThrow("test stopped at transcript mutation");
+					expect(sessionManager.getSessionId()).toBe(id);
+					expect(sessionManager.getEntry(user)?.type).toBe("message");
+					response.resolve("Approve dangerous_tool for this session");
+					expect(await pending).toMatchObject({ message: expect.stringContaining("session changed") });
+					expect(execute).not.toHaveBeenCalled();
+				} finally {
+					response.resolve("Deny");
+					await pending;
+					vi.restoreAllMocks();
+					await session.dispose();
+				}
+			},
+		);
+
+		it("switching A to B to A cannot revive A's old approval", async () => {
+			const { runner, run, session } = approvalFixture();
+			const select = vi.fn(async (_title: string, choices: string[]) => choices[1]);
+			initializeRunner(runner, select);
+			try {
+				await run();
+				const original = sessionManager.captureState();
+				await sessionManager.newSession();
+				await run();
+				sessionManager.restoreState(original);
+				select.mockImplementation(async () => "Deny");
+				await expect(run()).rejects.toThrow("denied by user");
+				expect(select).toHaveBeenCalledTimes(3);
+			} finally {
+				await session.dispose();
+			}
 		});
 		it("runs bridged preflight before approval and cancels denied state", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
@@ -3752,8 +4458,8 @@ describe("ExtensionRunner", () => {
 			expect(executed).toEqual([{ command: "echo original" }, { command: "echo revised" }]);
 		});
 
-		it("forfeits the xdevApproved prompt bypass when a handler revises the input", async () => {
-			// write.ts dispatches xd:// devices with xdevApproved: true because its
+		it("forfeits the xd:// prompt bypass when a handler revises the input", async () => {
+			// write.ts dispatches xd:// devices with xdevPolicyKey because its
 			// outer gate already approved the ORIGINAL device input. A tool_call
 			// revision may raise the tier, so revised input must face the full gate
 			// (here: no interactive UI => reject) instead of riding the outer approval.
@@ -3779,7 +4485,7 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 			const xdevContext = {
 				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
-				xdevApproved: true,
+				xdevPolicyKey: "bash",
 			} as never;
 
 			await expect(
@@ -3857,7 +4563,7 @@ describe("ExtensionRunner", () => {
 			let effectiveTier: string | undefined;
 			const xdevContext = {
 				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
-				xdevApproved: true,
+				xdevPolicyKey: "bash",
 				xdevTierResolved: (tier: string) => {
 					effectiveTier = tier;
 				},
@@ -3994,6 +4700,196 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("event delivery order", () => {
+		type Handler = (event: { type: string; toolCallId?: string }) => unknown;
+		const inlineExtension = (name: string, handlers: Record<string, Handler>): Extension => {
+			const extensionPath = path.join(extensionsDir, `${name}.ts`);
+			return {
+				path: extensionPath,
+				resolvedPath: extensionPath,
+				handlers: new Map(
+					Object.entries(handlers).map(([type, handler]) => [
+						type,
+						[async (...args: unknown[]) => handler(args[0] as { type: string; toolCallId?: string })],
+					]),
+				),
+				tools: new Map(),
+				assistantThinkingRenderers: [],
+				assistantTextRenderers: [],
+				transcriptPresenters: [],
+				linkSchemes: [],
+				fileWriteFallbackHandlers: [],
+				fileDeleteFallbackHandlers: [],
+				messageRenderers: new Map(),
+				composerShapes: new Map(),
+				commands: new Map(),
+				flags: new Map(),
+				shortcuts: new Map(),
+			};
+		};
+
+		it("delivers a call's end after its start even while an earlier extension is still handling the start", async () => {
+			const releaseSlowStart = Promise.withResolvers<void>();
+			const seen: string[] = [];
+			const slow = inlineExtension("slow-start", {
+				tool_execution_start: async () => {
+					seen.push("slow:start");
+					await releaseSlowStart.promise;
+				},
+			});
+			const observer = inlineExtension("observer", {
+				tool_execution_start: () => seen.push("observer:start"),
+				tool_execution_end: () => seen.push("observer:end"),
+			});
+			const runner = new ExtensionRunner(
+				[slow, observer],
+				new ExtensionRuntime(),
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			const start = runner.emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
+			const end = runner.emit({
+				type: "tool_execution_end",
+				toolCallId: "call-1",
+				toolName: "read",
+				result: {},
+				isError: false,
+			});
+			// One loop turn drains every microtask, so an end that was not queued
+			// behind the start has reached the observer by now.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(seen).toEqual(["slow:start"]);
+
+			releaseSlowStart.resolve();
+			await Promise.all([start, end]);
+			expect(seen).toEqual(["slow:start", "observer:start", "observer:end"]);
+		});
+
+		it("delivers an event emitted inside a handler at once instead of queueing it behind that handler", async () => {
+			// Queued behind its own emitter the inner emit would wait out this budget.
+			testSetExtensionHandlerTimeoutMs(1_000);
+			try {
+				const errors: ExtensionError[] = [];
+				const seen: string[] = [];
+				// Stands in for `ctx.newSession()` from `agent_end`: the handler awaits a
+				// session event that both it and a later extension still queued on
+				// `agent_end` handle.
+				const switcher = inlineExtension("switcher", {
+					agent_end: async () => {
+						await runner.emit({ type: "session_switch", reason: "new", previousSessionFile: undefined });
+						seen.push("switcher:agent_end");
+					},
+					session_switch: () => seen.push("switcher:session_switch"),
+				});
+				const observer = inlineExtension("observer", {
+					agent_end: () => seen.push("observer:agent_end"),
+					session_switch: () => seen.push("observer:session_switch"),
+				});
+				const runner = new ExtensionRunner(
+					[switcher, observer],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				runner.onError(error => errors.push(error));
+
+				await runner.emit({ type: "agent_end", messages: [] });
+				expect(errors).toEqual([]);
+				expect(seen).toEqual([
+					"switcher:session_switch",
+					"observer:session_switch",
+					"switcher:agent_end",
+					"observer:agent_end",
+				]);
+			} finally {
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+			}
+		});
+
+		it("stops queueing a stalled extension's events behind each other after one handler budget", async () => {
+			// Real timers: the bound under test is the handler timeout itself, which
+			// runs on setTimeout/performance.now.
+			const budgetMs = 100;
+			testSetExtensionHandlerTimeoutMs(budgetMs);
+			const stall = Promise.withResolvers<void>();
+			try {
+				const entered: number[] = [];
+				const stalled = inlineExtension("stalled-updates", {
+					tool_execution_update: async () => {
+						entered.push(performance.now());
+						await stall.promise;
+					},
+				});
+				const runner = new ExtensionRunner(
+					[stalled],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const timeouts: string[] = [];
+				runner.onError(error => timeouts.push(error.error));
+
+				const emittedAt = performance.now();
+				const updates = Array.from({ length: 4 }, (_, i) =>
+					runner.emit({
+						type: "tool_execution_update",
+						toolCallId: "call-1",
+						toolName: "bash",
+						args: {},
+						partialResult: i,
+					}),
+				);
+				await Promise.all(updates);
+
+				expect(timeouts).toHaveLength(4);
+				// Served one after another the fourth update would start after three
+				// full budgets; capped, every update starts within about one.
+				expect(entered).toHaveLength(4);
+				expect(Math.max(...entered) - emittedAt).toBeLessThan(2 * budgetMs);
+			} finally {
+				stall.resolve();
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+			}
+		});
+
+		it("stops waiting behind an extension's earlier event when the queued event's signal aborts", async () => {
+			const stall = Promise.withResolvers<void>();
+			try {
+				let asked = 0;
+				const busy = inlineExtension("busy", {
+					agent_end: () => stall.promise,
+					session_before_shutdown: () => {
+						asked++;
+					},
+				});
+				const runner = new ExtensionRunner(
+					[busy],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				void runner.emit({ type: "agent_end", messages: [] });
+				const controller = new AbortController();
+				const startedAt = performance.now();
+				const emission = runner.emit({ type: "session_before_shutdown", signal: controller.signal });
+				controller.abort();
+				expect(await emission).toBeUndefined();
+				// The default budget would hold the event for 30 seconds behind agent_end.
+				expect(performance.now() - startedAt).toBeLessThan(1_000);
+				expect(asked).toBe(0);
+			} finally {
+				stall.resolve();
+			}
+		});
+	});
+
 	describe("credential_disabled", () => {
 		it("delivers credential_disabled events to subscribed extensions with the typed payload", async () => {
 			const eventsPath = path.join(tempDir.path(), "credential-disabled-events.jsonl");
@@ -4119,7 +5015,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -4144,8 +5040,11 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			// Drain microtasks so the fire-and-forget emit() calls inside initialize() complete.
-			for (let i = 0; i < 5; i++) await Promise.resolve();
+			// The drained emits inside initialize() are fire-and-forget and run one at a time per
+			// extension; one loop turn lets their microtask chain finish.
+			const drained = Promise.withResolvers<void>();
+			setImmediate(drained.resolve);
+			await drained.promise;
 
 			const events = fs
 				.readFileSync(eventsPath, "utf8")
@@ -4191,7 +5090,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -4281,7 +5180,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -4306,8 +5205,11 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			// Drain microtasks so the fire-and-forget emit() calls inside initialize() complete.
-			for (let i = 0; i < 5; i++) await Promise.resolve();
+			// The drained emits inside initialize() are fire-and-forget and run one at a time per
+			// extension; one loop turn lets their microtask chain finish.
+			const drained = Promise.withResolvers<void>();
+			setImmediate(drained.resolve);
+			await drained.promise;
 
 			const events = fs
 				.readFileSync(eventsPath, "utf8")
@@ -4533,6 +5435,9 @@ describe("ExtensionRunner", () => {
 				handlers: new Map([["input", [async (...args: unknown[]) => handler(args[0] as InputEvent)]]]),
 				tools: new Map(),
 				assistantThinkingRenderers: [],
+				assistantTextRenderers: [],
+				transcriptPresenters: [],
+				linkSchemes: [],
 				fileWriteFallbackHandlers: [],
 				fileDeleteFallbackHandlers: [],
 				messageRenderers: new Map(),
@@ -4644,6 +5549,141 @@ describe("ExtensionRunner", () => {
 				);
 			});
 			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
+		});
+
+		const createRewritingRunner = async (prefix: string) => {
+			const extensionCode = `
+				export default function(pi) {
+					let calls = 0;
+					pi.on("context", async event => {
+						calls++;
+						const tag = ${prefix};
+						return {
+							messages: event.messages.map(message => {
+								if (typeof message.content === "string") return { ...message, content: tag + message.content };
+								if (!Array.isArray(message.content)) return message;
+								return {
+									...message,
+									content: message.content.map(block => (block.type === "text" ? { ...block, text: tag + block.text } : block)),
+								};
+							}),
+						};
+					});
+				}
+			`;
+			await Bun.write(path.join(extensionsDir, "rewrite.ts"), extensionCode);
+			const result = await loadTestExtensions();
+			return new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+		};
+
+		const toolLoopStep = (id: string, timestamp: number): AgentMessage[] => [
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id, name: "lookup", arguments: {} }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp,
+			},
+			{
+				role: "toolResult",
+				toolCallId: id,
+				toolName: "lookup",
+				content: [{ type: "text", text: `result ${id}` }],
+				isError: false,
+				timestamp: timestamp + 1,
+			},
+		];
+
+		const captureAnthropicBody = async (transformed: AgentMessage[]): Promise<MessageCreateParams> => {
+			const model = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model to exist");
+			let body: MessageCreateParams | undefined;
+			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+				body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+				return new Response(
+					JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch;
+			await streamAnthropic(
+				model,
+				{
+					systemPrompt: ["system"],
+					messages: convertToLlm(wrapSteeringForModel(transformed)),
+					tools: [
+						{
+							name: "lookup",
+							description: "Lookup a value",
+							parameters: { type: "object", properties: {}, additionalProperties: false },
+						},
+					],
+				},
+				{ apiKey: "sk-ant-api-test", fetch: fetchMock },
+			)
+				.result()
+				.catch(() => undefined);
+			if (!body) throw new Error("Expected Anthropic wire body");
+			return body;
+		};
+
+		it("advances the tail breakpoint through a tool loop when a hook rewrites history the same way every call", async () => {
+			const runner = await createRewritingRunner(`"[tag] "`);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "task", timestamp: 1 },
+				...toolLoopStep("toolu_1", 2),
+			];
+			await runner.emitContext(messages);
+			messages.push(...toolLoopStep("toolu_2", 4));
+
+			const transformed = await runner.emitContext(messages);
+			expect(transformed.some(message => isPerCallContextMessage(message))).toBe(false);
+			const body = await captureAnthropicBody(transformed);
+			const tail = body.messages.at(-1)?.content;
+			if (!Array.isArray(tail)) throw new Error("Expected a structured tail message");
+			const last = tail.at(-1);
+			expect(last).toMatchObject({ type: "tool_result", tool_use_id: "toolu_2" });
+			expect(last !== undefined && "cache_control" in last && last.cache_control != null).toBe(true);
+		});
+
+		it("still marks a hook rewrite per-call once it differs from the previous call", async () => {
+			const runner = await createRewritingRunner(`"[" + calls + "] "`);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "task", timestamp: 1 },
+				...toolLoopStep("toolu_1", 2),
+			];
+
+			const first = await runner.emitContext(messages);
+			expect(first.some(message => isPerCallContextMessage(message))).toBe(false);
+			const second = await runner.emitContext(messages);
+			expect(second.map(message => isPerCallContextMessage(message))).toEqual([true, false, true]);
+		});
+
+		it("does not mark a streamed assistant per-call when a hook leaves its content as is", async () => {
+			// streamAnthropic leaves `kStreamingBlockIndex` on every block it streams; structuredClone
+			// drops it, so the clone a hook hands back never deep-equals the in-memory history message.
+			const runner = await createRewritingRunner(`""`);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "task", timestamp: 1 },
+				...toolLoopStep("toolu_1", 2),
+			];
+			const assistant = messages[1];
+			if (assistant?.role !== "assistant") throw new Error("Expected the streamed assistant");
+			assistant.content.forEach((block, index) => Object.assign(block, { [kStreamingBlockIndex]: index }));
+
+			for (let pass = 0; pass < 2; pass++) {
+				const transformed = await runner.emitContext(messages);
+				expect(transformed.some(message => isPerCallContextMessage(message))).toBe(false);
+			}
 		});
 	});
 });

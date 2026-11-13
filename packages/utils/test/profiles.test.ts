@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,7 +8,6 @@ import {
 	getActiveProfile,
 	getAgentDbPath,
 	getAgentDir,
-	getConfigAgentDirName,
 	getConfigRootDir,
 	getPythonGatewayDir,
 	getSessionsDir,
@@ -61,6 +60,9 @@ describe("profile directories", () => {
 		originalXdgCacheHome = process.env.XDG_CACHE_HOME;
 		tempRoot = path.join(os.tmpdir(), "pi-utils-profiles", Snowflake.next());
 		configDir = `.omp-profile-test-${Snowflake.next()}`;
+		const tempHome = path.join(tempRoot, "home");
+		await fs.mkdir(tempHome, { recursive: true });
+		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 		await fs.mkdir(tempRoot, { recursive: true });
 		process.env.PI_CONFIG_DIR = configDir;
 		// Other suites that run before this one (e.g. dirs-python-gateway) may have
@@ -75,6 +77,7 @@ describe("profile directories", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		setProfile(undefined);
 		if (originalConfigDir === undefined) {
 			delete process.env.PI_CONFIG_DIR;
@@ -114,7 +117,6 @@ describe("profile directories", () => {
 			process.env.PI_PROFILE = originalPiProfileEnv;
 		}
 		await fs.rm(tempRoot, { recursive: true, force: true });
-		await fs.rm(path.join(os.homedir(), configDir), { recursive: true, force: true });
 	});
 
 	it("moves agent and root data under the named profile root", () => {
@@ -124,7 +126,6 @@ describe("profile directories", () => {
 		const agent = path.join(root, "agent");
 		expect(getActiveProfile()).toBe("work");
 		expect(getConfigRootDir()).toBe(root);
-		expect(getConfigAgentDirName()).toBe(path.join(configDir, "profiles", "work", "agent"));
 		expect(getAgentDir()).toBe(agent);
 		expect(getAgentDbPath()).toBe(path.join(agent, "agent.db"));
 		expect(getSessionsDir()).toBe(path.join(agent, "sessions"));
@@ -411,7 +412,7 @@ describe("dirs module import behavior", () => {
 			}
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
-			await fs.rm(path.join(os.homedir(), probeConfigDir), { recursive: true, force: true });
+			// The probe only resolves home paths; it never creates a directory there.
 		}
 	});
 

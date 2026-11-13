@@ -39,6 +39,7 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 
 describe("global --profile flag", () => {
 	let configDir = "";
+	let tempHome = "";
 	let originalProfile: string | undefined;
 	let originalAgentDir = "";
 	let originalAgentDirEnv: string | undefined;
@@ -46,7 +47,7 @@ describe("global --profile flag", () => {
 	let originalPiProfileEnv: string | undefined;
 	let originalConfigDir: string | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		originalProfile = getActiveProfile();
 		originalAgentDir = getAgentDir();
 		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
@@ -54,6 +55,8 @@ describe("global --profile flag", () => {
 		originalPiProfileEnv = process.env.PI_PROFILE;
 		originalConfigDir = process.env.PI_CONFIG_DIR;
 		configDir = `.omp-profile-cli-test-${Snowflake.next()}`;
+		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profile-home-"));
+		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 		process.env.PI_CONFIG_DIR = configDir;
 		process.exitCode = 0;
 	});
@@ -90,7 +93,7 @@ describe("global --profile flag", () => {
 		}
 		__resetProfileSnapshotForTests();
 		process.exitCode = 0;
-		await removeWithRetries(path.join(os.homedir(), configDir));
+		await removeWithRetries(tempHome);
 	});
 
 	it("activates a profile before dispatching root flags", async () => {

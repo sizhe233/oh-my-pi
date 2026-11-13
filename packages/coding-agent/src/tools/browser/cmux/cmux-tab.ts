@@ -49,6 +49,7 @@ import type {
 } from "../network";
 import { extractReadableFromHtml, type ReadableExtractOptions, type ReadableFormat } from "../readable";
 import { assertTabPressArgs } from "../tab-arguments";
+import { readFilePayloads } from "../upload-files";
 import type { VitalsOptions, VitalsResult } from "../react/vitals";
 import type { RecordingOptions, RecordingStartResult, RecordingStatus, RecordingStopResult } from "../recording";
 import type {
@@ -140,12 +141,6 @@ interface BoundingBox {
 	y: number;
 	width: number;
 	height: number;
-}
-
-interface FilePayload {
-	name: string;
-	type: string;
-	data: string;
 }
 
 type CmuxCaptureEntry = BrowserConsoleEntry | BrowserErrorEntry;
@@ -870,7 +865,9 @@ export class CmuxTab implements InProcessRunTab {
 		return new CmuxElementHandle(this, selector);
 	}
 
-	async click(selector: string): Promise<void> {
+	async click(selector: string, options?: { button?: string; count?: number }): Promise<void> {
+		const quoted = JSON.stringify(selector);
+		refuseUnpressableClick(`tab.click(${quoted}, `, `tab.dblclick(${quoted})`, options);
 		await this.#selectorAction(selector, "click");
 	}
 
@@ -1136,8 +1133,6 @@ export class CmuxTab implements InProcessRunTab {
 		if (!opts.silent) {
 			const lines = formatScreenshot({
 				saveFullRes,
-				savedMimeType,
-				savedByteLength: savedBuffer.length,
 				dest,
 				resized,
 				capture: { area: "viewport", scale: cssWidth && resized.originalWidth / cssWidth },
@@ -1458,14 +1453,16 @@ export class CmuxTab implements InProcessRunTab {
 		throw new ToolError("tab.recording() is not supported on the cmux backend");
 	}
 
-	async text(selector: string): Promise<string | null> {
+	/** Without a selector, reads the page `<body>`. */
+	async text(selector = "body"): Promise<string | null> {
 		return await this.queryElement<string>(
 			selector,
-			`element => (element.innerText || element.textContent || "").trim()`,
+			`element => (typeof element.innerText === "string" ? element.innerText : element.textContent || "").trim()`,
 		);
 	}
 
-	async html(selector: string): Promise<string | null> {
+	/** Without a selector, reads the page `<body>`. */
+	async html(selector = "body"): Promise<string | null> {
 		return await this.queryElement<string>(selector, "element => element.innerHTML");
 	}
 
@@ -1612,13 +1609,8 @@ export class CmuxTab implements InProcessRunTab {
 
 	async uploadFile(selector: string, ...filePaths: string[]): Promise<void> {
 		if (!filePaths.length) throw new ToolError("tab.uploadFile() requires at least one file path");
-		const files: FilePayload[] = [];
-		for (const filePath of filePaths) {
-			const absolute = resolveToCwd(filePath, this.#requireRunContext("tab.uploadFile()").session.cwd);
-			const file = Bun.file(absolute);
-			const data = Buffer.from(await file.arrayBuffer()).toString("base64");
-			files.push({ name: path.basename(absolute), type: file.type || "application/octet-stream", data });
-		}
+		const cwd = this.#requireRunContext("tab.uploadFile()").session.cwd;
+		const files = await readFilePayloads(filePaths.map(filePath => resolveToCwd(filePath, cwd)));
 		await this.#selectorAction(selector, "uploadFile", { files });
 	}
 
@@ -1700,8 +1692,14 @@ export class CmuxTab implements InProcessRunTab {
 		signal: AbortSignal | undefined = this.#runContext?.signal,
 	): Promise<Record<string, unknown>> {
 		throwIfAborted(signal);
-		const result = await untilAborted(signal, () =>
-			this.#client.request(method, { surface_id: this.#surfaceId, ...params }, { timeoutMs }),
+		if (this.#runContext) {
+			const remainingMs = Math.max(1, this.#runContext.deadline - Date.now());
+			timeoutMs = Math.min(timeoutMs ?? remainingMs, remainingMs);
+		}
+		const result = await this.#client.request(
+			method,
+			{ surface_id: this.#surfaceId, ...params },
+			{ timeoutMs, signal },
 		);
 		throwIfAborted(signal);
 		return result;
@@ -1969,7 +1967,8 @@ export class CmuxTab implements InProcessRunTab {
 					else if (element.multiple) for (const option of options) option.selected = wanted.includes(option);
 					else element.selectedIndex = wanted[0].index;
 					inputEvent(element);
-					return options.filter(option => option.selected).map(option => option.value);
+					// The handlers may have reset the choice or replaced the options.
+					return Array.from(element.options).filter(option => option.selected).map(option => option.value);
 				}
 				case "uploadFile": {
 					const transfer = new DataTransfer();
@@ -2213,6 +2212,28 @@ class CmuxResponse {
 	}
 }
 
+/**
+ * Every cmux element-click path presses the left button once; refuse another button or count rather than
+ * mis-deliver it. `call` is the call as written up to its options (`tab.click("#x", `), `dblclick` the call
+ * that double-clicks the same target.
+ */
+function refuseUnpressableClick(
+	call: string,
+	dblclick: string,
+	options: { button?: string; count?: number } | undefined,
+): void {
+	if (options?.button !== undefined && options.button !== "left") {
+		throw new ToolError(
+			`${call}{ button: ${JSON.stringify(options.button)} }) is not supported in a cmux browser, which only left-clicks elements`,
+		);
+	}
+	if (options?.count !== undefined && options.count !== 1) {
+		throw new ToolError(
+			`${call}{ count: ${options.count} }) is not supported in a cmux browser; use ${dblclick} for a double click`,
+		);
+	}
+}
+
 class CmuxElementHandle {
 	readonly #tab: CmuxTab;
 	readonly #selector: string;
@@ -2223,17 +2244,7 @@ class CmuxElementHandle {
 	}
 
 	async click(options?: { button?: string; count?: number }): Promise<void> {
-		// Every cmux element-click path presses the left button once; refuse rather than mis-deliver.
-		if (options?.button !== undefined && options.button !== "left") {
-			throw new ToolError(
-				`handle.click({ button: ${JSON.stringify(options.button)} }) is not supported in a cmux browser, which only left-clicks elements`,
-			);
-		}
-		if (options?.count !== undefined && options.count !== 1) {
-			throw new ToolError(
-				`handle.click({ count: ${options.count} }) is not supported in a cmux browser; use handle.dblclick() for a double click`,
-			);
-		}
+		refuseUnpressableClick("handle.click(", "handle.dblclick()", options);
 		await this.#tab.click(this.#selector);
 	}
 
