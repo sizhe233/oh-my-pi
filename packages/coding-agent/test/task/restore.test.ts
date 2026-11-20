@@ -4,9 +4,11 @@ import * as path from "node:path";
 import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { getAgentTombstonePath } from "@oh-my-pi/pi-coding-agent/registry/agent-tombstone";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
@@ -51,14 +53,20 @@ const finished: Message[] = [
 ];
 
 /** Writes subagent `id`'s transcript under the main session `mainFile`, with its spawn contract. */
-async function writeSubagent(mainFile: string, cwd: string, id: string, messages: Message[]): Promise<string> {
+async function writeSubagent(
+	mainFile: string,
+	cwd: string,
+	id: string,
+	messages: Message[],
+	agent?: string,
+): Promise<string> {
 	const file = path.join(mainFile.slice(0, -6), `${id}.jsonl`);
 	const manager = await SessionManager.open(file, undefined, undefined, {
 		initialCwd: cwd,
 		parentSession: mainFile,
 		suppressBreadcrumb: true,
 	});
-	manager.appendSessionInit({ systemPrompt: ["sub prompt"], task: `${id} task`, tools: ["read", "yield"] });
+	manager.appendSessionInit({ systemPrompt: ["sub prompt"], task: `${id} task`, tools: ["read", "yield"], agent });
 	for (const message of messages) manager.appendMessage(message);
 	await manager.close();
 	return file;
@@ -86,14 +94,20 @@ describe("restoreSession (omp --restore)", () => {
 		const mainFile = main.getSessionFile();
 		if (!mainFile) throw new Error("Expected a persisted session file");
 		await main.close();
-		await writeSubagent(mainFile, cwd, "Cut", cutOff);
+		const cutFile = await writeSubagent(mainFile, cwd, "Cut", cutOff, "scout");
 		await writeSubagent(mainFile, cwd, "Done", finished);
 		const killed = await writeSubagent(mainFile, cwd, "Killed", cutOff);
 		await fs.writeFile(getAgentTombstonePath(killed), "");
 
 		manager = new AsyncJobManager({});
 		const delivered: string[] = [];
-		manager.registerDeliverySink(MAIN_AGENT_ID, jobId => {
+		const idleReleaseRequested = Promise.withResolvers<void>();
+		const allowIdleRelease = Promise.withResolvers<void>();
+		const idleReleased = Promise.withResolvers<void>();
+		const allowDelivery = Promise.withResolvers<void>();
+		manager.registerDeliverySink(MAIN_AGENT_ID, async jobId => {
+			await idleReleased.promise;
+			await allowDelivery.promise;
 			delivered.push(jobId);
 		});
 		const result: SingleResult = {
@@ -111,13 +125,82 @@ describe("restoreSession (omp --restore)", () => {
 			requests: 1,
 		};
 		const followUp = vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockResolvedValue(result);
-		const restoreTurn = vi.fn(async () => true);
+		const registry = AgentRegistry.global();
+		const home = { instanceKey: "main:restore-unit-child", sessionFile: cutFile } as AgentSession;
+		const ensureLive = vi
+			.spyOn(AgentLifecycleManager.global(), "ensureLive")
+			.mockImplementation(async (id, expected) => {
+				const ref = registry.get(id);
+				expect(id).toBe("Cut");
+				expect(expected).toBe(ref);
+				if (!ref || !registry.attachSession(id, home, cutFile, ref)) throw new Error("Cut home attach rejected");
+				return home;
+			});
+		let listener: AgentSessionEventListener | undefined;
+		const receiptId = "main:restore-unit:receipt";
+		const drainStarted = Promise.withResolvers<void>();
+		const drainDeliveries = manager.drainDeliveries.bind(manager);
+		const drainReceipt = vi.spyOn(manager, "drainDeliveries").mockImplementation(options => {
+			drainStarted.resolve();
+			return drainDeliveries(options);
+		});
+		const releaseReceipt = vi
+			.fn(async (token: string) => token === receiptId)
+			.mockImplementationOnce(async token => {
+				if (token !== receiptId) return false;
+				idleReleaseRequested.resolve();
+				await allowIdleRelease.promise;
+				idleReleased.resolve();
+				return true;
+			});
+		const receiptFinished = Promise.withResolvers<void>();
+		const initialRunEnded = Promise.withResolvers<void>();
+		const wakeRunEnded = Promise.withResolvers<void>();
+		const wakeWaitStarted = Promise.withResolvers<{ delivered: string[]; pending: boolean }>();
+		const runEnded = vi
+			.fn(() => {
+				wakeWaitStarted.resolve({
+					delivered: [...delivered],
+					pending: manager!.hasPendingDeliveries({ ownerId: MAIN_AGENT_ID, restoreReceiptId: receiptId }),
+				});
+				return wakeRunEnded.promise;
+			})
+			.mockImplementationOnce(() => initialRunEnded.promise);
+		const finishReceipt = vi.fn(async (token: string, discard: boolean) => {
+			expect(token).toBe(receiptId);
+			expect(discard).toBe(false);
+			receiptFinished.resolve();
+			return true;
+		});
+		const restoreTurn = vi.fn(async () => {
+			// The final boundary can arrive before scheduling is acknowledged.
+			listener?.({ type: "agent_end", messages: [] });
+			expect(releaseReceipt).not.toHaveBeenCalled();
+			return true;
+		});
 		const session = {
+			instanceKey: "main:restore-unit",
+			sessionFile: mainFile,
+			getAgentId: () => MAIN_AGENT_ID,
+			addDisposer: () => {},
+			subscribe: (callback: AgentSessionEventListener) => {
+				listener = callback;
+				return () => {
+					listener = undefined;
+				};
+			},
 			sessionManager: { getSessionFile: () => mainFile },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
-			yieldQueue: { holdIdleFlush: () => () => {} },
-			waitForIdle: async () => {},
+			acquireRestoreIdleHold: async (file: string, jobs: AsyncJobManager, signal: AbortSignal) => {
+				expect(file).toBe(mainFile);
+				expect(jobs === manager).toBe(true);
+				signal.throwIfAborted();
+				return receiptId;
+			},
+			releaseRestoreIdleHold: releaseReceipt,
+			finishRestoreIdleHold: finishReceipt,
+			waitForRunEnd: runEnded,
 			restoreInterruptedTurn: restoreTurn,
 		} as unknown as AgentSession;
 
@@ -127,8 +210,45 @@ describe("restoreSession (omp --restore)", () => {
 		// Restore publishes queued jobs before their runners necessarily start.
 		await manager.getJob("Cut")!.promise;
 		expect(followUp).toHaveBeenCalledTimes(1);
-		expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Cut", restore: true, message: "Cut task" });
-		await manager.drainDeliveries({ filter: { ownerId: MAIN_AGENT_ID } });
+		expect(ensureLive).toHaveBeenCalledTimes(1);
+		expect(followUp.mock.calls[0]![0]).toMatchObject({
+			id: "Cut",
+			agent: { name: "Cut" },
+			restore: true,
+			message: "Cut task",
+			softRequestBudget: 100,
+		});
+		// The pre-ack event must release the idle hold even though the
+		// abandonment check's run-end promise has not resolved yet.
+		await idleReleaseRequested.promise;
+		expect(releaseReceipt).toHaveBeenCalledTimes(1);
+		expect(releaseReceipt).toHaveBeenCalledWith(receiptId);
+		expect(runEnded).toHaveBeenCalledTimes(1);
+		expect(finishReceipt).not.toHaveBeenCalled();
+		expect(delivered).toEqual([]);
+		allowIdleRelease.resolve();
+		initialRunEnded.resolve();
+
+		// Deliver only after the real, receipt-scoped drain starts. The
+		// subsequent wait must observe a drained queue and block finalization.
+		const firstAfterRelease = await Promise.race([
+			drainStarted.promise.then(() => "drain"),
+			wakeWaitStarted.promise.then(() => "wake"),
+		]);
+		expect(firstAfterRelease).toBe("drain");
+		expect(drainReceipt).toHaveBeenCalledWith({ filter: { ownerId: MAIN_AGENT_ID, restoreReceiptId: receiptId } });
+		expect(runEnded).toHaveBeenCalledTimes(1);
+		expect(delivered).toEqual([]);
+		allowDelivery.resolve();
+		expect(await wakeWaitStarted.promise).toEqual({ delivered: ["Cut"], pending: false });
+		expect(runEnded).toHaveBeenCalledTimes(2);
+		expect(finishReceipt).not.toHaveBeenCalled();
+		wakeRunEnded.resolve();
+		await receiptFinished.promise;
+
 		expect(delivered).toEqual(["Cut"]);
+		expect(restoreTurn).toHaveBeenCalledTimes(1);
+		expect(finishReceipt).toHaveBeenCalledTimes(1);
+		expect(listener).toBeUndefined();
 	});
 });

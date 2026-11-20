@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import type { TabSnapshot } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { relayCdpClientsOf } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import {
 	type RelayServer,
@@ -72,18 +73,20 @@ function parseVersion(response: string): Record<string, string> {
 	>;
 }
 
-async function connectExtension(port: number): Promise<WebSocket> {
+async function connectExtension(port: number, tabs: TabSnapshot[] = []): Promise<WebSocket> {
 	const { promise, resolve, reject } = Promise.withResolvers<WebSocket>();
 	const ws = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 	ws.addEventListener(
 		"open",
 		() => {
-			ws.send(JSON.stringify(EXTENSION_HELLO));
+			ws.send(JSON.stringify({ ...EXTENSION_HELLO, tabs }));
 			resolve(ws);
 		},
 		{ once: true },
 	);
-	ws.addEventListener("error", () => reject(new Error("Extension socket failed to connect")), { once: true });
+	ws.addEventListener("error", () => reject(new Error("Extension socket failed to connect")), {
+		once: true,
+	});
 	return promise;
 }
 
@@ -114,6 +117,48 @@ describe("browser relay discovery endpoint", () => {
 		await waitForDiscovery(port);
 		return port;
 	}
+
+	it("closes repeated competing websocket claims without losing the original live claim", async () => {
+		const port = await findFreeCdpPort();
+		relay = startRelayServer({ port, group: false });
+		extension = await connectExtension(port, [
+			{
+				tabId: 1,
+				url: "about:blank",
+				title: "Inert test tab",
+				active: true,
+				windowId: 1,
+				pinned: false,
+				groupId: -1,
+				discarded: false,
+			},
+		]);
+		await waitForDiscovery(port);
+		const targetId = relay.bridge.listTargets()[0]?.id;
+		expect(targetId).toBeDefined();
+		const endpoint = `ws://127.0.0.1:${port}/cdp?claim=${targetId}`;
+		const owner = new WebSocket(endpoint);
+		try {
+			const ownerOpen = Promise.withResolvers<void>();
+			owner.addEventListener("open", () => ownerOpen.resolve(), { once: true });
+			owner.addEventListener("error", () => ownerOpen.reject(new Error("Owner connection failed")), { once: true });
+			await ownerOpen.promise;
+			for (let i = 0; i < 2; i++) {
+				const competitor = new WebSocket(endpoint);
+				try {
+					const closed = Promise.withResolvers<void>();
+					competitor.addEventListener("close", () => closed.resolve(), { once: true });
+					await closed.promise;
+					expect(owner.readyState).toBe(WebSocket.OPEN);
+					expect(relay.bridge.cdpClientCount).toBe(1);
+				} finally {
+					competitor.close();
+				}
+			}
+		} finally {
+			owner.close();
+		}
+	});
 
 	it("advertises the requested Host authority so a remote Puppeteer client dials the relay", async () => {
 		const port = await startReadyRelay();

@@ -3,7 +3,7 @@ import { Shell } from "@oh-my-pi/pi-natives";
 /** Exercise the bundled native comparator, including its repeated-call and explicit-key contracts. */
 export async function smokeTestNativeSort(): Promise<{ localeCollation: boolean }> {
 	// Session-scoped values leave the caller's process and selected locale alone.
-	const shell = new Shell({ sessionEnv: { LANG: "en_US.UTF-8", LC_ALL: "", LC_COLLATE: "" } });
+	const shell = new Shell({ sessionEnv: { PATH: "", LANG: "en_US.UTF-8", LC_ALL: "", LC_COLLATE: "" } });
 	const run = async (command: string): Promise<string> => {
 		let output = "";
 		let streamError: Error | undefined;
