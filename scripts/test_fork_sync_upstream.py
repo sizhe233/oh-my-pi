@@ -163,6 +163,109 @@ class SyncFixture(unittest.TestCase):
         self.run_git(self.work, "push", "origin", "main")
         os.environ["GITHUB_SHA"] = self.base
 
+    def v19_conflict_fixture(self):
+        """Construct real three-stage preserved-mode and two-stage deletion conflicts."""
+        exe = SYNC.V19_EXECUTABLE
+        removed = sorted(SYNC.V19_DELETIONS)
+        for path in (exe, *removed):
+            self.write(self.work, path, "ancestor\n")
+        (self.work / exe).chmod(0o755)
+        ancestor = self.commit(self.work, "v19 fixture ancestor")
+        for path in (exe, *removed):
+            self.write(self.work, path, "fork\n")
+        fork = self.commit(self.work, "v19 fixture fork")
+        self.run_git(self.work, "switch", "--detach", ancestor)
+        self.write(self.work, exe, "upstream\n")
+        for path in removed:
+            (self.work / path).unlink()
+        upstream = self.commit(self.work, "v19 fixture upstream")
+        self.run_git(self.work, "switch", "--detach", fork)
+        binding = patch.object(SYNC, "V19_RESOLUTION_RELEASE", ("v19.0.1", upstream))
+        binding.start()
+        self.addCleanup(binding.stop)
+        content = "reviewed executable\n"
+        manifest = {
+            "schemaVersion": 1, "releaseTag": "v19.0.1",
+            "upstreamSha": upstream, "mergeBaseSha": ancestor, "resolutions": [],
+        }
+        for path in (exe, *removed):
+            is_exe = path == exe
+            manifest["resolutions"].append({
+                "path": path,
+                "mergeBaseBlob": self.run_git(self.work, "rev-parse", f"{ancestor}:{path}").stdout.strip(),
+                "forkBlob": self.run_git(self.work, "rev-parse", f"{fork}:{path}").stdout.strip(),
+                "upstreamBlob": self.run_git(self.work, "rev-parse", f"{upstream}:{path}").stdout.strip() if is_exe else None,
+                "content": content if is_exe else None,
+                "resolvedSha256": hashlib.sha256(content.encode()).hexdigest() if is_exe else None,
+            })
+        return exe, removed, ancestor, upstream, manifest
+
+    def test_v19_only_accepts_sort_rename_from_literal_old_parent_paths(self):
+        old, new = SYNC.V19_SORT_RENAME
+        context = "".join(f"unique preserved sort fixture line {i}\n" for i in range(20))
+        self.write(self.work, old, context + "ancestor\n")
+        ancestor = self.commit(self.work, "sort fixture ancestor")
+        self.write(self.work, old, context + "fork\n")
+        fork = self.commit(self.work, "sort fixture fork")
+        self.run_git(self.work, "switch", "--detach", ancestor)
+        (self.work / old).unlink()
+        self.write(self.work, new, context + "upstream\n")
+        upstream = self.commit(self.work, "sort fixture upstream rename")
+        self.run_git(self.work, "switch", "--detach", fork)
+        content = context + "reviewed resolution\n"
+        entry = {
+            "path": new,
+            "mergeBaseBlob": self.run_git(self.work, "rev-parse", f"{ancestor}:{old}").stdout.strip(),
+            "forkBlob": self.run_git(self.work, "rev-parse", f"{fork}:{old}").stdout.strip(),
+            "upstreamBlob": self.run_git(self.work, "rev-parse", f"{upstream}:{new}").stdout.strip(),
+            "content": content, "resolvedSha256": hashlib.sha256(content.encode()).hexdigest(),
+        }
+        data = {"schemaVersion": 1, "releaseTag": "v19.0.1", "upstreamSha": upstream,
+                "mergeBaseSha": ancestor, "resolutions": [entry]}
+        self.write(self.work, f"{SYNC.RESOLUTIONS}/v19.0.1.json", json.dumps(data))
+        base = self.commit(self.work, "review exact renamed conflict")
+        with self.assertRaisesRegex(ValueError, "input pin mismatch"):
+            SYNC.load_resolutions(base, upstream, ancestor, "v19.0.1")
+        with patch.object(SYNC, "V19_RESOLUTION_RELEASE", ("v19.0.1", upstream)):
+            self.assertIsNotNone(SYNC.load_resolutions(base, upstream, ancestor, "v19.0.1"))
+            self.write(self.work, new, context + "fork\n")
+            ambiguous = self.commit(self.work, "incorrectly retain both literal names on fork")
+            with self.assertRaisesRegex(ValueError, "input pin mismatch"):
+                SYNC.load_resolutions(ambiguous, upstream, ancestor, "v19.0.1")
+            candidate = SYNC.prepare_merge(base, upstream, {**self.release, "tag_name": "v19.0.1"},
+                                           f"sync/upstream-v19.0.1-{base}")
+            self.assertEqual(self.run_git(self.work, "show", f"{candidate}:{new}").stdout, content)
+            self.assertFalse((self.work / old).exists())
+            self.assert_no_push()
+
+    def test_v19_resolves_exact_executable_and_deleted_paths(self):
+        exe, removed, _, upstream, manifest = self.v19_conflict_fixture()
+        self.write(self.work, f"{SYNC.RESOLUTIONS}/v19.0.1.json", json.dumps(manifest))
+        base = self.commit(self.work, "review pinned unusual conflict shapes")
+        release = {**self.release, "tag_name": "v19.0.1"}
+        branch = f"sync/upstream-v19.0.1-{base}"
+        first = SYNC.prepare_merge(base, upstream, release, branch)
+        self.assertEqual(self.run_git(self.work, "show", f"{first}:{exe}").stdout, manifest["resolutions"][0]["content"])
+        self.assertTrue(self.run_git(self.work, "ls-tree", first, "--", exe).stdout.startswith("100755 blob "))
+        self.assertEqual(self.run_git(self.work, "ls-tree", first, "--", *removed).stdout, "")
+        self.assertEqual(self.run_git(self.work, "rev-list", "--parents", "-n", "1", first).stdout.split()[1:], [base, upstream])
+        self.run_git(self.work, "switch", "--detach", base)
+        self.run_git(self.work, "branch", "-D", branch)
+        second = SYNC.prepare_merge(base, upstream, release, branch)
+        self.assertEqual(self.run_git(self.work, "diff", "--name-only", first, second).stdout, "")
+        self.assertEqual(self.run_git(self.work, "diff", "--name-only", base, first, "--", SYNC.WORKFLOWS).stdout, "")
+
+    def test_v19_deletion_rejects_nonnull_output_and_wrong_binding(self):
+        _, _, ancestor, upstream, manifest = self.v19_conflict_fixture()
+        manifest["resolutions"][-1]["content"] = "not a deletion"
+        self.write(self.work, f"{SYNC.RESOLUTIONS}/v19.0.1.json", json.dumps(manifest))
+        base = self.commit(self.work, "fixture unauthorized replacement")
+        with self.assertRaisesRegex(ValueError, "cannot write replacement bytes"):
+            SYNC.load_resolutions(base, upstream, ancestor, "v19.0.1")
+        with patch.object(SYNC, "V19_RESOLUTION_RELEASE", ("v19.0.1", "a" * 40)):
+            with self.assertRaisesRegex(ValueError, "100644"):
+                SYNC.load_resolutions(base, upstream, ancestor, "v19.0.1")
+
     def test_reviewed_conflict_preserves_exact_bytes_history_and_replays_deterministically(self):
         """Reviewed combined bytes are published with audit provenance and reproduce on retries."""
         self.reviewed_conflict()
