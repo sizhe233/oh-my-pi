@@ -30,6 +30,7 @@ import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 import { cfgCompactionExperimentalContextManagement } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { resourceText } from "../helpers/resource-text";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-protocol-"));
@@ -55,9 +56,9 @@ function makeToolSession(
 		getSessionFile: () => sessionFile,
 		getSessionSpawns: () => "*",
 		getArtifactsDir: () => path.join(cwd, "artifacts"),
-		allocateOutputArtifact: async toolType => ({
+		allocateOutputArtifact: async () => ({
 			id: "history-read",
-			path: path.join(cwd, "artifacts", `history-read.${toolType}.log`),
+			path: path.join(cwd, "artifacts", `history-read.log`),
 		}),
 		settings: Settings.isolated(),
 		...overrides,
@@ -65,12 +66,12 @@ function makeToolSession(
 }
 
 /** Minimal current-version session JSONL: header + a linear user/assistant chain. */
-function sessionFixtureJsonl(): string {
+function sessionFixtureJsonl(userText = "parked hello", headerId = "fixture-session"): string {
 	const timestamp = new Date().toISOString();
 	const header = {
 		type: "session",
 		version: CURRENT_SESSION_VERSION,
-		id: "fixture-session",
+		id: headerId,
 		timestamp,
 		cwd: "/tmp",
 	};
@@ -79,7 +80,7 @@ function sessionFixtureJsonl(): string {
 		id: "m1",
 		parentId: null,
 		timestamp,
-		message: { role: "user", content: "parked hello", timestamp: 1 },
+		message: { role: "user", content: userText, timestamp: 1 },
 	};
 	const assistantEntry = {
 		type: "message",
@@ -339,6 +340,17 @@ describe("history:// protocol", () => {
 		expect(resource.sourcePath).toBeUndefined();
 	});
 
+	it("reads bare history://current as the caller's own branch when no agent is named current", async () => {
+		const resource = await InternalUrlRouter.instance().resolve("history://current", {
+			experimentalContextManagement: true,
+			getSessionBranch: currentBranchFixture,
+		});
+		expect(resource.content).toContain("latest raw request survives");
+		await expect(InternalUrlRouter.instance().resolve("history://current")).rejects.toThrow(
+			"experimentalContextManagement",
+		);
+	});
+
 	it("rejects current/full when disabled or without a caller-bound branch", async () => {
 		await expect(
 			InternalUrlRouter.instance().resolve("history://current/full", {
@@ -410,6 +422,26 @@ describe("history:// protocol", () => {
 		if (output?.type !== "text") throw new Error("Expected text output");
 		expect(output.text).toContain("# HubAgent (idle)");
 		expect(output.text).not.toContain("hello from live");
+	});
+
+	it("reads a closed raw history range without appending paging text", async () => {
+		AgentRegistry.global().register({
+			id: "HubAgent",
+			displayName: "task",
+			kind: "sub",
+			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
+			status: "idle",
+		});
+		const resource = await InternalUrlRouter.instance().resolve("history://HubAgent");
+		const result = await new ReadTool(makeToolSession(os.tmpdir())).execute("history-raw-range", {
+			path: "history://HubAgent:raw:1-2",
+		});
+		const output = result.content.find(content => content.type === "text");
+
+		expect(output?.type).toBe("text");
+		if (output?.type !== "text") throw new Error("Expected text output");
+		// A raw range keeps each line's terminator, so consecutive ranges concatenate to the source.
+		expect(output.text).toBe(`${resourceText(resource).split("\n").slice(0, 2).join("\n")}\n`);
 	});
 
 	it("resolves agent ids case-insensitively", async () => {
@@ -487,6 +519,26 @@ describe("history:// protocol", () => {
 			);
 
 		expect(error?.message).toContain("no transcript");
+	});
+
+	it("history://<id> reports a just-registered running worker instead of erroring", async () => {
+		AgentRegistry.global().register({
+			id: "FreshWorker",
+			displayName: "task",
+			kind: "sub",
+			session: null,
+			sessionFile: null,
+			status: "running",
+			createdAt: Date.now() - 5_000,
+		});
+
+		const resource = await InternalUrlRouter.instance().resolve("history://FreshWorker");
+
+		expect(resource.contentType).toBe("text/markdown");
+		expect(resource.content).toContain("# FreshWorker (running)");
+		expect(resource.content).toContain("No transcript has been written yet.");
+		expect(resource.content).toMatch(/Started \d+s ago\./);
+		expect(resource.notes).toContain("Source: agent registry (no transcript yet)");
 	});
 
 	it("hides advisor transcripts from the index and direct lookup", async () => {

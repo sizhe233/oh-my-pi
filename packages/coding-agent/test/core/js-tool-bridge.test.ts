@@ -1,11 +1,19 @@
 import { describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	EVAL_TIMEOUT_PAUSE_OP,
+	EVAL_TIMEOUT_RESUME_OP,
+	isEvalTimeoutControlEvent,
+} from "@oh-my-pi/pi-coding-agent/eval/bridge-timeout";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import type { EvalShadowCellSession } from "@oh-my-pi/pi-coding-agent/eval/speculation/cell-session";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
+import { resolveXdevTool, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 
 function createTool(name: string, execute: AgentTool["execute"]): AgentTool {
@@ -49,6 +57,20 @@ function createSession(tools: AgentTool[]): ToolSession {
 	};
 }
 
+function createXdevSession(tools: AgentTool[]): { session: ToolSession; write: WriteTool } {
+	const xdev: XdevState = {
+		tools: new Map(tools.map(tool => [tool.name, tool])),
+		mountedNames: new Set(tools.map(tool => tool.name)),
+		builtInNames: new Set(tools.map(tool => tool.name)),
+		isActive: () => false,
+		resolve: name => resolveXdevTool(xdev, name),
+	};
+	const session = { ...createSession(tools), xdev };
+	const write = new WriteTool(session);
+	session.getToolByName = name => (name === "write" ? (write as unknown as AgentTool) : xdev.tools.get(name));
+	return { session, write };
+}
+
 describe("callSessionTool", () => {
 	it("summarizes text results into the bridge value and status event", async () => {
 		const execute = vi.fn().mockResolvedValue({
@@ -63,13 +85,40 @@ describe("callSessionTool", () => {
 			{
 				session,
 				emitStatus: event => {
-					statuses.push(event);
+					if (!isEvalTimeoutControlEvent(event)) statuses.push(event);
 				},
 			},
 		);
 
 		expect(result).toBe("hello");
 		expect(statuses).toEqual([expect.objectContaining({ op: "read", path: "/tmp/demo.txt", chars: 5 })]);
+	});
+
+	it("returns a large result whole, without the model's artifact spill or notices", async () => {
+		const payload = JSON.stringify({
+			items: Array.from({ length: 4000 }, (_, i) => ({ id: i, title: `item ${i}` })),
+		});
+		const tool = wrapToolWithMetaNotice(
+			createTool("mcp_list", async () => ({ content: [{ type: "text", text: payload }] })),
+		);
+		const saved: string[] = [];
+		const session: ToolSession = {
+			...createSession([tool]),
+			getToolContext: () =>
+				({
+					sessionManager: {
+						saveArtifact: async (text: string) => {
+							saved.push(text);
+							return "1";
+						},
+					},
+				}) as unknown as AgentToolContext,
+		};
+
+		const result = await callSessionTool("mcp_list", {}, { session });
+
+		expect(result).toBe(payload);
+		expect(saved).toEqual([]);
 	});
 
 	it("settles an interrupted speculative wait without starting ordinary tool execution", async () => {
@@ -711,7 +760,7 @@ describe("callSessionTool", () => {
 			setTodoPhases: next => {
 				phases = next;
 			},
-			persistTodoPhases: next => persisted.push(next),
+			commitTodoPhases: next => persisted.push(next),
 			getToolByName: name => (name === "todo" ? (todoTool as unknown as AgentTool) : undefined),
 		};
 		const todoTool = new TodoTool(session);
@@ -723,6 +772,72 @@ describe("callSessionTool", () => {
 		await callSessionTool("todo", { op: "view" }, { session });
 		await callSessionTool("todo", { op: "done", task: "No such task" }, { session });
 		expect(persisted).toHaveLength(1);
+	});
+
+	it("persists and summarizes a todo wire alias using the resolved canonical identity", async () => {
+		let phases: TodoPhase[] = [{ name: "Ship", tasks: [{ content: "Persist alias", status: "in_progress" }] }];
+		const persisted: TodoPhase[][] = [];
+		const statuses: Array<Record<string, unknown>> = [];
+		const lookup = vi.fn((name: string) => (name === "checklist" ? (todoTool as unknown as AgentTool) : undefined));
+		const session: ToolSession = {
+			...createSession([]),
+			getTodoPhases: () => phases,
+			setTodoPhases: next => {
+				phases = next;
+			},
+			commitTodoPhases: next => persisted.push(next),
+			getToolForEvalBridge: lookup,
+		};
+		const todoTool = Object.assign(new TodoTool(session), { customWireName: "checklist" });
+
+		await callSessionTool(
+			"checklist",
+			{ op: "done", task: "Persist alias" },
+			{ session, emitStatus: event => !isEvalTimeoutControlEvent(event) && statuses.push(event) },
+		);
+
+		expect(lookup).toHaveBeenCalledTimes(1);
+		expect(persisted).toEqual([[{ name: "Ship", tasks: [{ content: "Persist alias", status: "completed" }] }]]);
+		expect(statuses).toEqual([expect.objectContaining({ op: "todo", committed: true })]);
+		await callSessionTool("checklist", { op: "view" }, { session });
+		await callSessionTool("checklist", { op: "done", task: "No such task" }, { session });
+		expect(persisted).toHaveLength(1);
+	});
+
+	it("passes a FREEFORM tool's raw string as its input field", async () => {
+		const tool = {
+			...createTool("edit", async (_id: string, args: unknown) => ({
+				content: [{ type: "text" as const, text: (args as { input: string }).input }],
+			})),
+			parameters: type({ input: "string" }),
+			customFormat: { syntax: "lark" as const, definition: "start: /.+/" },
+		};
+		expect(await callSessionTool("edit", "*** patch", { session: createSession([tool]) })).toBe("*** patch");
+	});
+
+	it("pauses the watchdog for session tools reached through wire aliases", async () => {
+		for (const [name, alias] of [
+			["wait", "join_jobs"],
+			["task", "delegate"],
+		]) {
+			const statuses: string[] = [];
+			const tool = {
+				...createTool(name, async () => {
+					expect(statuses).toEqual([EVAL_TIMEOUT_PAUSE_OP]);
+					return { content: [{ type: "text" as const, text: "done" }] };
+				}),
+				customWireName: alias,
+			};
+			const session = {
+				...createSession([tool]),
+				getToolForEvalBridge: (requested: string) => (requested === alias ? tool : undefined),
+			};
+
+			expect(await callSessionTool(alias, {}, { session, emitStatus: event => statuses.push(event.op) })).toBe(
+				"done",
+			);
+			expect(statuses).toEqual([EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, name]);
+		}
 	});
 
 	it("keeps persisted nested Todo status bounded for large checklists", async () => {
@@ -749,9 +864,13 @@ describe("callSessionTool", () => {
 		await callSessionTool(
 			"todo",
 			{ op: "done", task: "Task 0" },
-			{ session, emitStatus: event => statuses.push(event) },
+			{ session, emitStatus: event => !isEvalTimeoutControlEvent(event) && statuses.push(event) },
 		);
-		await callSessionTool("todo", { op: "view" }, { session, emitStatus: event => statuses.push(event) });
+		await callSessionTool(
+			"todo",
+			{ op: "view" },
+			{ session, emitStatus: event => !isEvalTimeoutControlEvent(event) && statuses.push(event) },
+		);
 
 		expect(phases[0]?.tasks[0]?.status).toBe("completed");
 		expect(statuses.map(event => event.committed)).toEqual([true, false]);
@@ -790,7 +909,7 @@ describe("callSessionTool", () => {
 		const result = await callSessionTool(
 			"mcp__demo_fail",
 			{},
-			{ session, emitStatus: event => statuses.push(event) },
+			{ session, emitStatus: event => !isEvalTimeoutControlEvent(event) && statuses.push(event) },
 		);
 
 		expect(result).toEqual({
@@ -821,7 +940,11 @@ describe("callSessionTool", () => {
 		]);
 		const statuses: Array<Record<string, unknown>> = [];
 
-		const result = await callSessionTool("custom", {}, { session, emitStatus: event => statuses.push(event) });
+		const result = await callSessionTool(
+			"custom",
+			{},
+			{ session, emitStatus: event => !isEvalTimeoutControlEvent(event) && statuses.push(event) },
+		);
 
 		expect(result).toEqual({
 			text: "preview mismatch",
@@ -861,7 +984,11 @@ describe("callSessionTool", () => {
 
 	it("rejects checkpoint and rewind before reaching the registry", async () => {
 		const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
-		const session = createSession([createTool("checkpoint", execute), createTool("rewind", execute)]);
+		const session = createSession([
+			createTool("checkpoint", execute),
+			createTool("rewind", execute),
+			createTool("yield", execute),
+		]);
 
 		await expect(callSessionTool("checkpoint", { goal: "g" }, { session })).rejects.toThrow(
 			"cannot run through the eval bridge",
@@ -869,7 +996,96 @@ describe("callSessionTool", () => {
 		await expect(callSessionTool("rewind", { report: "r" }, { session })).rejects.toThrow(
 			"cannot run through the eval bridge",
 		);
+		await expect(callSessionTool("yield", { data: { result: "done" } }, { session })).rejects.toThrow(
+			"call the direct `yield` tool",
+		);
 		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("rejects wire aliases of tools that require direct tool results", async () => {
+		for (const [name, alias] of [
+			["checkpoint", "savepoint"],
+			["rewind", "restorepoint"],
+			["yield", "submit"],
+		]) {
+			const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "not committed" }] });
+			const tool = { ...createTool(name, execute), customWireName: alias };
+			const session = {
+				...createSession([tool]),
+				getToolForEvalBridge: (requested: string) => (requested === alias ? tool : undefined),
+			};
+
+			await expect(callSessionTool(alias, {}, { session })).rejects.toThrow(
+				`\`${name}\` cannot run through the eval bridge`,
+			);
+			expect(execute).not.toHaveBeenCalled();
+		}
+	});
+
+	it("rejects direct-event-only xd devices from eval without blocking direct writes", async () => {
+		for (const [name, deviceName] of [
+			["checkpoint", "checkpoint"],
+			["rewind", "rewind"],
+			["yield", "yield"],
+			["yield", "submit"],
+		]) {
+			const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "Result submitted." }] });
+			const tool = { ...createTool(name, execute), customWireName: deviceName };
+			const { session, write } = createXdevSession([tool]);
+			const args = { path: `xd://${deviceName}`, content: JSON.stringify({ data: { result: "done" } }) };
+
+			expect(await callSessionTool("write", args, { session })).toMatchObject({
+				hasError: true,
+				text: expect.stringContaining(`call the direct \`${name}\` tool`),
+			});
+			expect(execute).not.toHaveBeenCalled();
+
+			const direct = await write.execute("direct-device-write", args);
+			expect(direct.isError).not.toBe(true);
+			expect(execute).toHaveBeenCalledTimes(1);
+		}
+	});
+
+	it("keeps concurrent direct device calls outside an asynchronous eval dispatch", async () => {
+		const started = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "Result submitted." }] });
+		const { session, write } = createXdevSession([createTool("yield", execute)]);
+		const args = { path: "xd://yield", content: JSON.stringify({ data: { result: "done" } }) };
+		const nested = createTool("nested", async () => {
+			started.resolve();
+			await resume.promise;
+			return await write.execute("nested-device-write", args);
+		});
+		const getToolByName = session.getToolByName;
+		session.getToolByName = name => (name === "nested" ? nested : getToolByName?.(name));
+
+		const bridged = callSessionTool("nested", {}, { session });
+		await started.promise;
+		try {
+			const direct = await write.execute("concurrent-direct-device-write", args);
+			expect(direct.isError).not.toBe(true);
+			expect(execute).toHaveBeenCalledTimes(1);
+		} finally {
+			resume.resolve();
+		}
+		expect(await bridged).toMatchObject({
+			hasError: true,
+			text: expect.stringContaining("call the direct `yield` tool"),
+		});
+		expect(execute).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets a session started inside an eval dispatch run its own direct-event devices", async () => {
+		const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "Result submitted." }] });
+		const child = createXdevSession([createTool("yield", execute)]);
+		const args = { path: "xd://yield", content: JSON.stringify({ data: { result: "done" } }) };
+		// Stands in for `tool.task`: an in-process subagent whose model writes its own device.
+		const task = createTool("task", async () => await child.write.execute("subagent-device-write", args));
+		const { session } = createXdevSession([task]);
+
+		expect(await callSessionTool("task", {}, { session })).toMatchObject({ text: "Result submitted." });
+		expect(execute).toHaveBeenCalledTimes(1);
 	});
 
 	it("rejects a registry tool excluded from the eval bridge", async () => {
@@ -880,7 +1096,7 @@ describe("callSessionTool", () => {
 		};
 
 		await expect(callSessionTool("write", { path: "out.txt", content: "data" }, { session })).rejects.toThrow(
-			"Unknown tool from js runtime",
+			"registered but not available in this session",
 		);
 		expect(rawExecute).not.toHaveBeenCalled();
 	});

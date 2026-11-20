@@ -1,7 +1,7 @@
 import { type } from "@oh-my-pi/omptype";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type { EvalPreludeDefinition } from "../eval/preludes";
+import type { HostEvalPreludeDefinition } from "../eval/preludes";
 import archiveDocumentation from "../prompts/tools/archive.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
@@ -14,8 +14,6 @@ import {
 	archiveSession,
 	archiveSessions,
 } from "./archive";
-// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
-import archiveDeclarations from "./declarations.d.ts" with { type: "text" };
 // @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
 import archiveJavascript from "./prelude.js" with { type: "text" };
 import archivePython from "./prelude.py" with { type: "text" };
@@ -78,14 +76,13 @@ function describeArchiveCall(parameters: unknown): string | undefined {
 }
 
 /** Create the read-only archive prelude: prompt history, recent projects, past sessions, and recaps. */
-export function createArchivePrelude(session: ToolSession): EvalPreludeDefinition {
+export function createArchivePrelude(session: ToolSession): HostEvalPreludeDefinition {
 	return {
 		name: "archive",
 		documentation: archiveDocumentation,
 		javascript: archiveJavascript,
 		python: archivePython,
 		exports: ["archive"],
-		codeModeDeclarations: archiveDeclarations,
 		approval: "read",
 		enabled: () => cfgArchiveEnabled.get(session.settings) === true,
 		invoke: async parameters => {

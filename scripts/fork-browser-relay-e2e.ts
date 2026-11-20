@@ -283,21 +283,47 @@ try {
 
 	currentCase = 9;
 	const reaper = await CdpClient.connect(port);
-	assert.deepEqual(await reaper.send("OMP.closeOwnedTarget", { targetId: userTarget.targetId }), { closed: false });
-	assert.deepEqual(await reaper.send("OMP.closeOwnedTarget", { targetId: owned.targetId }), { closed: false });
+	const liveOwnerError = "Target is still claimed by a live owner";
+	assert.deepEqual(await reaper.send("OMP.closeOwnedTarget", { targetId: userTarget.targetId }), {
+		closed: false,
+		resolved: true,
+	});
+	await assert.rejects(reaper.send("OMP.closeOwnedTarget", { targetId: owned.targetId }), {
+		message: liveOwnerError,
+	});
+	const secondOwnedTabId = Number(secondOwned.targetId.split(".").at(-1));
+	assert(
+		(await tabs(first.worker)).some(t => t.id === secondOwnedTabId),
+		"Reap fixture must exist in Chrome",
+	);
 	await creator.send("Target.detachFromTarget", { sessionId: secondSession });
 	creator.close();
-	await until(
-		"unclaimed owned tab reaped",
-		async () =>
-			(await reaper.send<{ closed: boolean }>("OMP.closeOwnedTarget", { targetId: secondOwned.targetId })).closed,
+	// The claim lasts until the relay observes the creator's socket close.
+	const reaped = await until("unclaimed owned tab close confirmed", async () => {
+		try {
+			return await reaper.send("OMP.closeOwnedTarget", { targetId: secondOwned.targetId });
+		} catch (error) {
+			if (error instanceof Error && error.message === liveOwnerError) return false;
+			throw error;
+		}
+	});
+	assert.deepEqual(reaped, { closed: true, resolved: true });
+	const remaining = await until("reaped tab gone in Chrome", async () => {
+		const observed = await tabs(first.worker);
+		return observed.some(t => t.id === secondOwnedTabId) ? false : observed;
+	});
+	assert(
+		remaining.some(t => t.id === userTab.id),
+		"The user's tab must survive reaping",
 	);
-	assert((await tabs(first.worker)).some(t => t.id === userTab.id));
-	assert((await tabs(first.worker)).some(t => t.id === ownedTabId));
+	assert(
+		remaining.some(t => t.id === ownedTabId),
+		"The live-claimed tab must survive reaping",
+	);
 	result(
 		9,
 		"partial",
-		"Real ownership-close command rejected a user tab and a live-owned tab, and removed an unclaimed extension-created tab. PID registry, SIGKILL recovery, restart ID reuse, and native runtime chain are not exercised.",
+		"The real relay resolved a non-owned receipt without closing the user tab, refused the live-owner close, and confirmed removal of an unclaimed extension-created tab. Chrome tab queries verified all three outcomes. PID registry, SIGKILL recovery, restart ID reuse, and native runtime chain are not exercised.",
 	);
 
 	currentCase = 5;
@@ -376,11 +402,14 @@ try {
 		)) as string;
 		return logs.some(entry => entry.message === "extension connected" && entry.data?.instanceId === instance);
 	});
-	await until("second browser discovery", async () =>
-		(await targets(recovered)).some(t => t.url.includes("second-instance")),
+	const secondTarget = await until("second browser discovery", async () =>
+		(await targets(recovered)).find(
+			t => t.url.includes("second-instance") && t.targetId.endsWith(`.${secondUser.id}`),
+		),
 	);
 	const routed = await recovered.send<{ targetId: string }>("Target.createTarget", {
 		url: "data:text/html,<title>routed-to-second</title>",
+		nearTargetId: secondTarget.targetId,
 	});
 	// createTab resolves before navigation commits; observe the actual tab's
 	// committed URL rather than treating pending navigation as wrong routing.
@@ -399,18 +428,28 @@ try {
 		return logs.some(entry => entry.message === "extension connected" && entry.data?.instanceId === instance);
 	});
 	assert.equal((await tabs(empty.worker)).length, 0, "Windowless profile must really have no tabs");
-	const fallback = await recovered.send<{ targetId: string }>("Target.createTarget", {
+	// No caller claim or hint: the first eligible selected tab should still win, not the latest hello.
+	const unhinted = await CdpClient.connect(port);
+	assert((await tabs(first.worker)).some(t => t.id === userTab.id && t.active));
+	assert((await tabs(second.worker)).some(t => t.id === secondUser.id && t.active));
+	const discovered = await targets(unhinted);
+	const firstSelectedIndex = discovered.findIndex(t => t.targetId === userTarget.targetId);
+	const secondSelectedIndex = discovered.findIndex(t => t.targetId === secondTarget.targetId);
+	assert(firstSelectedIndex >= 0 && firstSelectedIndex < secondSelectedIndex, "Expected first profile before second");
+	const fallback = await unhinted.send<{ targetId: string }>("Target.createTarget", {
 		url: "data:text/html,<title>windowless-fallback</title>",
 	});
 	assert.equal((await tabs(empty.worker)).length, 0);
-	await until("fallback tab committed in a populated browser", async () =>
-		[...(await tabs(first.worker)), ...(await tabs(second.worker))].some(t => t.url.includes("windowless-fallback")),
+	await until("fallback tab committed in the first selected profile", async () =>
+		(await tabs(first.worker)).some(t => t.url.includes("windowless-fallback")),
 	);
-	await recovered.send("Target.closeTarget", { targetId: fallback.targetId });
+	assert(!(await tabs(second.worker)).some(t => t.url.includes("windowless-fallback")));
+	assert.equal((await tabs(empty.worker)).length, 0);
+	await unhinted.send("Target.closeTarget", { targetId: fallback.targetId });
 	result(
 		11,
 		"pass",
-		"Real multi-profile browsers routed creation to the last connected populated instance; a subsequently connected windowless extension did not receive new tabs.",
+		"Explicit near-target creation used the second real profile and preserved its active tab. Unhinted creation still used the first selected profile after a windowless extension connected.",
 	);
 } catch (error) {
 	failure = error instanceof Error ? (error.stack ?? error.message) : String(error);
