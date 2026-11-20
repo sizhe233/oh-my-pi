@@ -72,11 +72,41 @@ jobs:
           set -euo pipefail
           bun --cwd=packages/coding-agent run check:types
           bun --cwd=packages/browser-relay run check:types
+      - name: Install Puppeteer's pinned Chrome for Testing for Linux tests
+        id: linux-chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun --eval '
+            import { Browser, install } from "@puppeteer/browsers";
+            import { PUPPETEER_REVISIONS } from "puppeteer-core";
+            import { appendFile } from "node:fs/promises";
+            import { isAbsolute, join } from "node:path";
+            const revision = PUPPETEER_REVISIONS.chrome;
+            if (revision !== "150.0.7871.24") throw new Error("Unexpected locked Puppeteer Chrome version: " + revision);
+            const { RUNNER_TEMP, GITHUB_OUTPUT } = process.env;
+            if (!RUNNER_TEMP || !GITHUB_OUTPUT) throw new Error("Missing GitHub runner paths");
+            const result = await install({
+              browser: Browser.CHROME,
+              buildId: revision,
+              cacheDir: join(RUNNER_TEMP, "omp-linux-test-browser"),
+              baseUrl: "https://storage.googleapis.com/chrome-for-testing-public",
+            });
+            if (!isAbsolute(result.executablePath) || /[\r\n]/.test(result.executablePath)) {
+              throw new Error("Invalid installed Chrome executable path");
+            }
+            console.log(JSON.stringify({ revision, executablePath: result.executablePath }));
+            await appendFile(GITHUB_OUTPUT, "executable=" + result.executablePath + "\nrevision=" + revision + "\n");
+          '
       - name: Run complete browser regression suite and image/clipboard contracts on Linux
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
         working-directory: packages/coding-agent
         shell: bash
         run: |
           set -euo pipefail
+          test -f "${PUPPETEER_EXECUTABLE_PATH:?Missing pinned Chrome executable}"
+          test -x "$PUPPETEER_EXECUTABLE_PATH"
           bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
             test/tools/browser-*.test.ts \
             test/utils/image-resize.test.ts \
@@ -99,12 +129,33 @@ jobs:
             ../catalog/test/compat-cascade.test.ts \
             ../catalog/test/published-effort-ladders.test.ts
       - name: Run the complete TypeScript suite for the exact imported source
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
         if: ${{ inputs.source_sha != '' }}
         shell: bash
         run: |
           set -euo pipefail
+          test -f "${PUPPETEER_EXECUTABLE_PATH:?Missing pinned Chrome executable}"
+          test -x "$PUPPETEER_EXECUTABLE_PATH"
           bun run gen:export-viewer --check
           bun run ci:test:ts
+      - name: Record pinned Linux browser version after both test suites
+        if: ${{ always() && steps.linux-chrome.outcome == 'success' }}
+        shell: bash
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
+          PINNED_CHROME_REVISION: ${{ steps.linux-chrome.outputs.revision }}
+        run: |
+          set -euo pipefail
+          bun --eval '
+            import { execFileSync } from "node:child_process";
+            const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+            const revision = process.env.PINNED_CHROME_REVISION;
+            if (!executablePath || !revision) throw new Error("Missing pinned Chrome installation outputs");
+            const version = execFileSync(executablePath, ["--version"], { encoding: "utf8" }).trim();
+            console.log(JSON.stringify({ revision, executablePath, version }));
+            if (version.split(/\s+/).at(-1) !== revision) throw new Error("Chrome revision mismatch");
+          '
       - name: Cross-compile Windows x64 release CLI with baseline addon
         run: bun scripts/ci-release-build-binaries.ts --targets win32-x64
       - name: Record same-commit cross-build checksums
