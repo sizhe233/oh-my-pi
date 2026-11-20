@@ -325,11 +325,18 @@ async function writeStandInVault(contentScript: string): Promise<string> {
 	await fs.writeFile(
 		path.join(vaultDir, "menu.js"),
 		`const documentId = crypto.randomUUID();
+const root = document.documentElement;
+root.setAttribute("data-omp-fixture-menu-probe-state", "initialized");
 window.addEventListener("message", event => {
-	if (event.source !== window.parent || !event.origin.startsWith("http://127.0.0.1:")) return;
 	const request = event.data;
-	if (request?.type !== "omp-fixture-menu-probe" || typeof request.challenge !== "string") return;
-	if (document.querySelector("button")?.textContent !== "Fill") return;
+	if (request?.type !== "omp-fixture-menu-probe") return;
+	let state = "reply-sent";
+	if (event.source !== window.parent) state = "parent-source-rejected";
+	else if (!event.origin.startsWith("http://127.0.0.1:")) state = "parent-origin-rejected";
+	else if (typeof request.challenge !== "string") state = "challenge-rejected";
+	else if (document.querySelector("button")?.textContent !== "Fill") state = "menu-ui-missing";
+	root.setAttribute("data-omp-fixture-menu-probe-state", state);
+	if (state !== "reply-sent") return;
 	window.parent.postMessage({
 		type: "omp-fixture-menu-reply",
 		challenge: request.challenge,
@@ -396,6 +403,8 @@ interface FixtureMenuProgress {
 	ready: boolean;
 	mount: string | null;
 	loads: string | null;
+	probes: string | null;
+	rejected: string | null;
 	reply: string | null;
 	visibility: string;
 }
@@ -416,6 +425,78 @@ async function withFixtureObserver<T>(cdp: CDPSession, read: (cdp: CDPSession) =
 	}
 }
 
+/** Sample only the exact disposable menu target on a slow reply. This is never a pass condition. */
+async function sampleFixtureMenuFrame(page: Page, local: CDPSession, url: string, deadline: number): Promise<string> {
+	const options = () => ({ timeout: Math.max(1, Math.ceil(deadline - performance.now())) });
+	const describeFrame = (frame: Protocol.Page.Frame) =>
+		frame.unreachableUrl
+			? "error-document"
+			: frame.url === url
+				? "expected-menu"
+				: frame.url === "about:blank"
+					? "about:blank"
+					: "other-document";
+	const marker = "data-omp-fixture-menu-probe-state";
+	const knownState = (state: unknown): string =>
+		typeof state === "string" &&
+		/^(initialized|reply-sent|parent-source-rejected|parent-origin-rejected|challenge-rejected|menu-ui-missing)$/.test(
+			state,
+		)
+			? state
+			: "script-unobserved";
+	const sample = async () => {
+		const { root } = await local.send("DOM.getDocument", { depth: -1, pierce: true }, options());
+		const owner = fixtureFrameNode(root, url, "VAULT-MENU");
+		if (!owner?.frameId) return "no-owner";
+		const { frameTree } = await local.send("Page.getFrameTree", undefined, options());
+		const queue = [...(frameTree.childFrames ?? [])];
+		for (const tree of queue) {
+			if (tree.frame.id === owner.frameId) {
+				const state = describeFrame(tree.frame);
+				const attributes =
+					owner.contentDocument?.children?.find(node => node.nodeName === "HTML")?.attributes ?? [];
+				const index = attributes.findIndex((attr, i) => i % 2 === 0 && attr === marker);
+				return state === "expected-menu"
+					? state + "/" + knownState(index < 0 ? undefined : attributes[index + 1])
+					: state;
+			}
+			queue.push(...(tree.childFrames ?? []));
+		}
+		if (performance.now() >= deadline) return "sample-timeout";
+		return await withFixtureObserver(await page.browser().target().createCDPSession(), async browser => {
+			if (performance.now() >= deadline) return "sample-timeout";
+			const { targetInfos } = await browser.send("Target.getTargets", { filter: [{ type: "iframe" }] }, options());
+			const target = targetInfos.find(info => info.type === "iframe" && info.targetId === owner.frameId);
+			if (!target) return "owner-not-listed";
+			if (target.url !== url) return target.url === "about:blank" ? "target-about:blank" : "target-url-not-menu";
+			const connection = browser.connection();
+			if (!connection || performance.now() >= deadline) return "sample-timeout";
+			return await withFixtureObserver(await connection.createSession(target), async child => {
+				if (performance.now() >= deadline) return "sample-timeout";
+				const { frameTree: childTree } = await child.send("Page.getFrameTree", undefined, options());
+				if (childTree.frame.id !== owner.frameId) return "target-frame-id-mismatch";
+				const state = describeFrame(childTree.frame);
+				if (state !== "expected-menu") return state;
+				const { result } = await child.send(
+					"Runtime.evaluate",
+					{
+						expression: `location.href === ${JSON.stringify(url)} && document.documentElement.getAttribute(${JSON.stringify(marker)})`,
+						returnByValue: true,
+					},
+					options(),
+				);
+				return state + "/" + knownState(result.value);
+			});
+		});
+	};
+	// Session attachment has no per-call timeout. Timely reporting does not wait for it;
+	// withFixtureObserver will still detach that exact session if it resolves late.
+	return await Promise.race([
+		sample().catch(() => "sample-unavailable"),
+		Bun.sleep(options().timeout).then(() => "sample-timeout"),
+	]);
+}
+
 /** Challenge the exact live fixture document, then snapshot its closed-shadow iframe through native CDP. */
 async function observeFixtureMenu(page: Page, url: string, phase: string): Promise<FixtureMenuObservation> {
 	return await withFixtureObserver(await page.createCDPSession(), async cdp => {
@@ -429,16 +510,21 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 		ready: document.documentElement.hasAttribute("data-omp-fixture-menu-ready"),
 		mount: host?.getAttribute("data-omp-fixture-menu-mount") ?? null,
 		loads: host?.getAttribute("data-omp-fixture-menu-loads") ?? null,
+		probes: host?.getAttribute("data-omp-fixture-menu-probes") ?? null,
+		rejected: host?.getAttribute("data-omp-fixture-menu-rejected") ?? null,
 		reply: host?.getAttribute("data-omp-fixture-menu-reply") ?? null,
 		visibility: document.visibilityState,
 	};
 })()`;
 		let progress: FixtureMenuProgress | undefined;
+		let frameDiagnostic: string | undefined;
 		const diagnostics = () =>
 			`ready=${progress?.ready ?? false}; mount=${progress?.mount ?? "absent"}; ` +
-			`loads=${progress?.loads ?? "0"}; replied=${Boolean(progress?.reply)}; visibility=${progress?.visibility ?? "unknown"}`;
+			`loads=${progress?.loads ?? "0"}; probes=${progress?.probes ?? "0"}; ` +
+			`rejected=${progress?.rejected ?? "none"}; replied=${Boolean(progress?.reply)}; ` +
+			`visibility=${progress?.visibility ?? "unknown"}; child=${frameDiagnostic ?? "not sampled"}`;
 		try {
-			let probe = `document.dispatchEvent(new CustomEvent("omp-fixture-probe-menu", { detail: ${JSON.stringify(challenge)} }));`;
+			const probe = `document.dispatchEvent(new CustomEvent("omp-fixture-probe-menu", { detail: ${JSON.stringify(challenge)} }));`;
 			while (performance.now() < deadline) {
 				const { result, exceptionDetails } = await cdp.send(
 					"Runtime.evaluate",
@@ -446,7 +532,6 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 					options(),
 				);
 				if (exceptionDetails) throw new Error(exceptionDetails.text);
-				probe = "";
 				progress = result.value as FixtureMenuProgress | undefined;
 				const documentId = progress?.reply?.startsWith(prefix) && progress.reply.slice(prefix.length);
 				if (documentId) {
@@ -461,6 +546,17 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 						frameId: node.frameId,
 						documentId,
 					};
+				}
+				// A send to the initial about:blank is intentionally discarded by targetOrigin;
+				// iframe load can be for that initial document and isn't a script-ready signal.
+				// Probe the same challenge until the committed fixture script can answer.
+				if (options().timeout <= 1_000 && !frameDiagnostic) {
+					frameDiagnostic = await sampleFixtureMenuFrame(
+						page,
+						cdp,
+						url,
+						Math.min(deadline, performance.now() + 400),
+					);
 				}
 				await Bun.sleep(Math.min(25, options().timeout));
 			}
@@ -768,21 +864,34 @@ const menuOrigin = "chrome-extension://" + chrome.runtime.id;
 let menu;
 let host;
 let challenge;
+let probes = 0;
 function probeMenu() {
-	if (!challenge || !menu?.isConnected) return;
-	menu.contentWindow?.postMessage({ type: "omp-fixture-menu-probe", challenge }, menuOrigin);
+	if (!challenge || !menu?.isConnected || !menu.contentWindow) return;
+	host.setAttribute("data-omp-fixture-menu-probes", String(++probes));
+	menu.contentWindow.postMessage({ type: "omp-fixture-menu-probe", challenge }, menuOrigin);
 }
 window.addEventListener("message", event => {
 	const reply = event.data;
-	if (!challenge || !menu?.isConnected || event.source !== menu.contentWindow || event.origin !== menuOrigin) return;
-	if (reply?.type !== "omp-fixture-menu-reply" || reply.challenge !== challenge ||
-		reply.url !== menuUrl || typeof reply.documentId !== "string" || !reply.documentId) return;
+	if (reply?.type !== "omp-fixture-menu-reply" || !challenge || !menu?.isConnected) return;
+	const rejected = event.source !== menu.contentWindow ? "menu-source" :
+		event.origin !== menuOrigin ? "menu-origin" :
+		reply.challenge !== challenge ? "challenge" :
+		reply.url !== menuUrl ? "menu-url" :
+		typeof reply.documentId !== "string" || !reply.documentId ? "document-id" : undefined;
+	if (rejected) {
+		host.setAttribute("data-omp-fixture-menu-rejected", rejected);
+		return;
+	}
 	host.setAttribute("data-omp-fixture-menu-reply", challenge + ":" + reply.documentId);
 });
 document.addEventListener("omp-fixture-probe-menu", event => {
 	if (!host || typeof event.detail !== "string") return;
-	challenge = event.detail;
-	host.removeAttribute("data-omp-fixture-menu-reply");
+	if (event.detail !== challenge) {
+		challenge = event.detail;
+		probes = 0;
+		host.removeAttribute("data-omp-fixture-menu-reply");
+		host.removeAttribute("data-omp-fixture-menu-rejected");
+	}
 	probeMenu();
 });
 document.addEventListener("omp-fixture-show-menu", () => {
@@ -794,10 +903,10 @@ document.addEventListener("omp-fixture-show-menu", () => {
 		host.setAttribute("data-omp-fixture-menu-loads", String(++loads));
 		probeMenu();
 	});
-	document.body.append(host);
-	host.attachShadow({ mode: "closed" }).append(menu);
-	host.setAttribute("data-omp-fixture-menu-mount", "connected");
+	// Set src while detached so insertion does not schedule an about:blank load first.
 	menu.src = menuUrl;
+	host.attachShadow({ mode: "closed" }).append(menu);
+	document.body.append(host);
 	host.setAttribute("data-omp-fixture-menu-mount", "src-assigned");
 });
 document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
