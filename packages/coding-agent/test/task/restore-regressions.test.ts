@@ -13,10 +13,11 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import * as persistedRoster from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { YieldQueue } from "@oh-my-pi/pi-coding-agent/session/yield-queue";
 import { hasRestorableTurn } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -105,8 +106,8 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 	}
 }
 let manager: AsyncJobManager;
-let registry: AgentRegistry;
-let lifecycle: AgentLifecycleManager;
+let registry: AgentRegistryApi;
+let lifecycle: AgentLifecycleApi;
 let tempDir: TempDir;
 let mainFile: string;
 beforeEach(() => {
@@ -128,6 +129,59 @@ afterEach(async () => {
 	AgentRegistry.resetGlobalForTests();
 	tempDir.removeSync();
 });
+/** Stand-in only for the restore-home API; delivery itself still uses the real manager. */
+function mockHome(id: string, sessionFile: string) {
+	const instanceKey = `fixture:${id}:${Bun.randomUUIDv7("hex")}`;
+	let lease: { token: string; released: boolean } | undefined;
+	let serial = 0;
+	const disposers = new Set<() => void>();
+	const ownerManager = manager;
+	return {
+		instanceKey,
+		sessionFile,
+		asyncJobManager: ownerManager,
+		getAgentId: () => id,
+		sessionManager: { getSessionFile: () => sessionFile, getUsageStatistics: () => ({ cost: 0, subagentCost: 0 }) },
+		isStreaming: false,
+		waitForRunEnd: async () => {},
+		addDisposer: (off: () => void) => disposers.add(off),
+		acquireRestoreIdleHold: async (file: string, jobManager: typeof manager, signal: AbortSignal) => {
+			signal.throwIfAborted();
+			if (file !== sessionFile || jobManager !== ownerManager || lease) throw new Error("Wrong restore home");
+			const token = `${instanceKey}:${++serial}`;
+			lease = { token, released: false };
+			return token;
+		},
+		releaseRestoreIdleHold: async (token: string) => {
+			if (!lease || lease.token !== token) return false;
+			lease.released = true;
+			return true;
+		},
+		hasRestorePendingReceipt: async (token: string) =>
+			lease?.token === token && ownerManager.hasPendingDeliveries({ ownerId: id }),
+		finishRestoreIdleHold: async (token: string, discard: boolean) => {
+			if (!lease || lease.token !== token) return false;
+			if (!discard) {
+				if (!lease.released) throw new Error("Restore idle hold must be released before normal finish");
+				await ownerManager.drainDeliveries({ filter: { ownerId: id } });
+			}
+			if (lease?.token !== token) return false;
+			lease = undefined;
+			return true;
+		},
+		dispose: async () => {
+			lease = undefined;
+			for (const off of disposers) off();
+			disposers.clear();
+		},
+	};
+}
+
+const runMockFollowUp: typeof executor.runSubagentFollowUpTurn = async ({ id, onRestoreSettled }) => {
+	await onRestoreSettled?.();
+	return result(id);
+};
+
 function fixture(tree: Record<string, SessionEntry[]>) {
 	const subs: Record<string, SubSession> = {};
 	for (const [key, messages] of Object.entries(tree)) {
@@ -149,6 +203,14 @@ function fixture(tree: Record<string, SessionEntry[]>) {
 					systemPrompt: ["test"],
 					task: `${id} task`,
 					tools: ["read", "yield"],
+					outputSchema: messages.some(
+						entry =>
+							entry.type === "message" &&
+							entry.message.role === "toolResult" &&
+							entry.message.toolName === "yield",
+					)
+						? { type: "string" }
+						: undefined,
 				},
 				...messages,
 			],
@@ -164,14 +226,20 @@ function fixture(tree: Record<string, SessionEntry[]>) {
 		});
 	}
 	vi.spyOn(subSessions, "collectSubSessions").mockResolvedValue(subs);
-	const restoreTurn = vi.fn(async () => true);
+	// Even leaf homes are revived and generation/file-validated before admission.
+	installOwner(0, []);
+	const listeners = new Set<AgentSessionEventListener>();
+	const restoreTurn = vi.fn(async () => {
+		for (const listener of listeners) listener({ type: "agent_end", messages: [] });
+		return true;
+	});
 	const root = {
-		sessionManager: { getSessionFile: () => mainFile },
-		getAgentId: () => "Main",
-		asyncJobManager: manager,
+		...mockHome("Main", mainFile),
 		settings: Settings.isolated(),
-		yieldQueue: { holdIdleFlush: () => () => {} },
-		waitForIdle: async () => {},
+		subscribe: (listener: AgentSessionEventListener) => {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
 		restoreInterruptedTurn: restoreTurn,
 	} as unknown as AgentSession;
 	return { root, restoreTurn, subs };
@@ -183,19 +251,12 @@ function installOwner(ttl: number, delivered: string[], receipt = Promise.resolv
 				delivered.push(id);
 				await receipt;
 			});
+			const home = mockHome(ref.id, ref.sessionFile!);
 			return {
-				asyncJobManager: manager,
-				isStreaming: false,
-				yieldQueue: { holdIdleFlush: () => () => {} },
-				sessionManager: { getUsageStatistics: () => ({ cost: 0, subagentCost: 0 }) },
-				waitForIdle: async () => {},
-				hasPendingAsyncWork: () => manager.hasPendingDeliveries({ ownerId: ref.id }),
-				settleAsyncWork: async () => {
-					await manager.waitForOwnerJobs(ref.id);
-					await manager.drainDeliveries({ filter: { ownerId: ref.id } });
-				},
+				...home,
 				dispose: async () => {
 					unregister();
+					await home.dispose();
 					manager.cancelAll({ ownerId: ref.id });
 				},
 			} as unknown as AgentSession;
@@ -207,7 +268,7 @@ it("stages a restore above an already-full cap, resumes root, and never executes
 	const blocked = Promise.withResolvers<string>();
 	manager.register("task", "existing", () => blocked.promise, { id: "existing" });
 	const { root, restoreTurn } = fixture({ A: cutOff, B: cutOff });
-	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => result(id));
+	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(runMockFollowUp);
 	const restored = await restoreSession(root);
 	expect(restored.subagents).toEqual(["A", "B"]);
 	expect(restoreTurn).toHaveBeenCalledTimes(1);
@@ -223,7 +284,7 @@ it("lets the descendant finish before its interrupted parent claims the only run
 	const { root } = fixture({ Parent: cutOff, "Parent/Child": cutOff });
 	const delivered: string[] = [];
 	installOwner(0, delivered);
-	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => result(id));
+	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(runMockFollowUp);
 	await restoreSession(root);
 	await manager.waitForAll();
 	await manager.drainDeliveries();
@@ -236,13 +297,19 @@ it("keeps the owner alive until the child's delivery receipt, then restores its 
 	const receipt = Promise.withResolvers<void>();
 	const delivered: string[] = [];
 	installOwner(5, delivered, receipt.promise);
-	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockReturnValue(work.promise);
+	const followUp = vi
+		.spyOn(executor, "runSubagentFollowUpTurn")
+		.mockImplementation(async ({ id, onRestoreSettled }) => {
+			await onRestoreSettled?.();
+			return id === "Child" ? work.promise : result(id);
+		});
 	const restored = await restoreSession(root);
 	expect(restored.subagents).toEqual(["Parent", "Child"]);
 	await Bun.sleep(15);
 	expect(registry.get("Parent")?.session).not.toBeNull();
 	work.resolve(result("Child"));
 	await manager.getJob("Child")!.promise;
+	await waitUntil(() => followUp.mock.calls.length === 2);
 	await Bun.sleep(15);
 	expect(registry.get("Parent")?.session).not.toBeNull();
 	expect(delivered).toEqual(["Child"]);
@@ -256,7 +323,7 @@ it("cancels a queued restore instead of delivering to a replacement owner genera
 	const { root } = fixture({ Parent: done, "Parent/Child": cutOff });
 	const delivered: string[] = [];
 	installOwner(0, delivered);
-	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => result(id));
+	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(runMockFollowUp);
 	await restoreSession(root);
 	const ref = registry.get("Parent")!;
 	registry.unregister("Parent", ref);
@@ -296,7 +363,7 @@ it("restores an unfinished child of a terminal-yield owner without replaying the
 	});
 	const delivered: string[] = [];
 	installOwner(0, delivered);
-	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => result(id));
+	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(runMockFollowUp);
 	const restored = await restoreSession(root);
 	await manager.waitForAll();
 	await manager.drainDeliveries();
@@ -324,6 +391,7 @@ it.each([false, true])(
 		lifecycle.setPersistedSubagentReviverFactory(
 			async ref => async () => {
 				const memory = SessionManager.inMemory();
+				vi.spyOn(memory, "getSessionFile").mockReturnValue(ref.sessionFile!);
 				const sub = Object.values(subs).find(value => value.agentId === ref.id)!;
 				appendFixtureMessages(memory, sub.entries);
 				const mock = createMockModel({ handler: () => ({ content: [`finished ${ref.id}`], stopReason: "stop" }) });
@@ -373,7 +441,6 @@ it.each([false, true])(
 				executor.attachIrcWakeTurnMonitor(session, {
 					id: ref.id,
 					agent: { name: ref.id, description: "", systemPrompt: "Test", source: "user" },
-					structured: false,
 				});
 				sessions.push(session);
 				return session;
@@ -406,8 +473,9 @@ it("replays an interrupted Main batch before a fast child's result can replace i
 	const modelRegistry = new ModelRegistry(auth);
 	const executed: string[] = [];
 	const sessions: AgentSession[] = [];
-	const create = (id: string) => {
+	const create = (id: string, sessionFile: string) => {
 		const memory = SessionManager.inMemory();
+		vi.spyOn(memory, "getSessionFile").mockReturnValue(sessionFile);
 		appendFixtureMessages(memory, pending);
 		const mock = createMockModel({ handler: () => ({ content: [`finished ${id}`], stopReason: "stop" }) });
 		const probe: AgentTool = {
@@ -448,18 +516,17 @@ it("replays an interrupted Main batch before a fast child's result can replace i
 		sessions.push(session);
 		return session;
 	};
-	const root = create("Main");
-	vi.spyOn(root.sessionManager, "getSessionFile").mockReturnValue(mainFile);
+	const root = create("Main", mainFile);
 	lifecycle.setPersistedSubagentReviverFactory(
-		async ref => async () => create(ref.id),
+		async ref => async () => create(ref.id, ref.sessionFile!),
 		() => 0,
 	);
 	try {
 		const restored = await restoreSession(root);
 		expect(restored.turn).toBe(true);
 		await manager.waitForAll();
-		await root.settleAsyncWork();
-		await root.waitForIdle();
+		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
+		await root.waitForRunEnd();
 		expect([...executed].sort()).toEqual(["Child", "Main"]);
 		expect(
 			root.agent.state.messages.filter(message => message.role === "user" && message.content === "work"),
@@ -563,8 +630,8 @@ it("releases delivery holds if manager disposal races owner revival before regis
 	const { root } = fixture({ Parent: done, "Parent/Child": cutOff });
 	installOwner(5, []);
 	const ensure = lifecycle.ensureLive.bind(lifecycle);
-	vi.spyOn(lifecycle, "ensureLive").mockImplementation(async id => {
-		const session = await ensure(id);
+	vi.spyOn(lifecycle, "ensureLive").mockImplementation(async (id, expected) => {
+		const session = await ensure(id, expected);
 		await manager.dispose({ timeoutMs: 100 });
 		return session;
 	});
@@ -658,6 +725,7 @@ it("propagates a child's result through terminal ancestors under cap one without
 	lifecycle.setPersistedSubagentReviverFactory(
 		async ref => async () => {
 			const memory = SessionManager.inMemory();
+			vi.spyOn(memory, "getSessionFile").mockReturnValue(ref.sessionFile!);
 			const sub = Object.values(subs).find(value => value.agentId === ref.id)!;
 			appendFixtureMessages(memory, sub.entries);
 			const mock = createMockModel({
@@ -723,7 +791,7 @@ it("propagates a child's result through terminal ancestors under cap one without
 			executor.attachIrcWakeTurnMonitor(session, {
 				id: ref.id,
 				agent: { name: ref.id, description: "", systemPrompt: "Test", source: "user" },
-				structured: ref.id !== "Child",
+				outputSchema: ref.id === "Child" ? undefined : { type: "string" },
 			});
 			sessions.push(session);
 			return session;
@@ -757,7 +825,7 @@ it("cancels the staged subtree before admission without prompting terminal owner
 	manager.register("task", "existing", () => blocked.promise, { id: "existing" });
 	const { root } = fixture({ Grand: done, "Grand/Parent": done, "Grand/Parent/Child": cutOff });
 	installOwner(5, []);
-	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async ({ id }) => result(id));
+	const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(runMockFollowUp);
 	await restoreSession(root);
 	expect(manager.cancel("Grand")).toBe(true);
 	blocked.resolve("existing");

@@ -15,11 +15,17 @@ import { type Component, TUI } from "../tui";
 import type { AppKeybinding } from "../app-keybindings";
 import { formatTooltipKey } from "../key-hint-format";
 import { MAIN_AGENT_ID } from "../overlays/agent-hub-types";
+import { getNativeBlob, type NativeBlob, nativeBlob, withBlob } from "../native/blobs";
 import { compact, keyed, node, row, span } from "../native/describe";
 import type { DescribeContext, NativeNode, NativeUiEvent } from "../native/node";
 import type { ComposerFacts, ComposerFactsSource } from "../status-line/types";
 import { allowsModelMentions, allowsSkillTokens, SKILL_TOKEN_RE } from "./skill-tokens";
-import { expandModelMentionTags, MODEL_MENTION_RE, modelMentionToken } from "./model-mention-syntax";
+import {
+	expandModelMentionTags,
+	MODEL_MENTION_RE,
+	modelMentionToken,
+	resolveModelMentionToken,
+} from "./model-mention-syntax";
 import { isVideoPath } from "./video";
 import {
 	attachmentSgr,
@@ -39,23 +45,31 @@ import {
 	skillToken,
 } from "./composer-attachments";
 import { type MacOSSpellingFeatures, MacOSSpellingProvider } from "./macos-spelling";
+import { TypingWordTracker } from "./typing-word";
 import { hasMagicKeyword, highlightMagicKeywords, magicKeywordRanges } from "./magic-keywords";
 import type { TspEditorDecoration, TspText } from "@oh-my-pi/pi-wire";
+import { motionEffectsEnabled } from "../motion-effects";
 import { isNativeRendering } from "../native/state";
 import { isQueuedMessageList, parseQueueShorthand, QUEUE_LIST_MARKER_RE } from "./queue-input";
 import { type WordCompletionMethod, WordCompletionProvider } from "./word-completion";
 import { fgOrPlain, theme } from "../theme/theme";
 
-/** A shell-mode draft's sigil (`!`, `!!`, `$`, `$$`) with its surrounding blanks; the mode chip stands in for it natively. */
-const SHELL_SIGIL_RE = /^\s*(?:!!?|\$\$?)[ \t]?/;
+/** A mode draft's sigil (`!`, `!!`, `$`, `$$`, `?`) with its surrounding blanks; the mode chip stands in for it natively. */
+const SHELL_SIGIL_RE = /^\s*(?:!!?|\$\$?|\?)[ \t]?/;
 
 /** The untitled session's TSP placeholder; the rotating ANSI hints (thinking effort, …) move into control tooltips. */
 const NATIVE_COMPOSER_PLACEHOLDER = "What are we cooking?";
+/** The TSP placeholder while an ask waits above the composer. */
+const ASK_PLACEHOLDER = "Answer above, or type here to skip the questions";
 
 /** Live composer state the TSP layout shows; the interactive host wires {@link CustomEditor.composerState}. */
 export interface ComposerNativeState {
-	/** The draft runs as a shell command (`!`, `!!`) or Python (`$`, `$$`); `excluded` keeps it from the model. */
-	readonly shell?: { readonly kind: "bash" | "python"; readonly excluded: boolean };
+	/**
+	 * The draft runs as a shell command (`!`, `!!`), Python (`$`, `$$`) or a `/btw` side question (`?`);
+	 * `excluded` keeps it from the model. Role `omp.editor.<kind>`, except btw's `omp.editor.btw-ask`
+	 * (`omp.editor.btw` is the focused note's).
+	 */
+	readonly shell?: { readonly kind: "bash" | "python" | "btw"; readonly excluded: boolean };
 	/** Thinking effort word (`high`, `off`, `auto`); undefined when the model has no thinking. */
 	readonly thinking?: string;
 	/** The thinking level draws as the model chip's icon instead of its own chip (where the terminal has `effort`). */
@@ -64,8 +78,18 @@ export interface ComposerNativeState {
 	readonly rate?: number;
 	/** A turn is running: the send keycap becomes a Stop button. */
 	readonly running: boolean;
+	/** Native dictation control; undefined hides it for hosts without speech-to-text. */
+	readonly dictation?: "idle" | "starting" | "recording" | "transcribing";
 	/** The viewed subagent's lineage, outermost first and the viewed agent last; undefined on the main session. */
 	readonly viewing?: readonly string[];
+	/** Drafts go to the `/btw` note the user clicked, as its follow-ups: role `omp.editor.btw`, a `btw` chip. */
+	readonly btw?: boolean;
+	/**
+	 * An ask waits inline above the composer (Tern). `pending`: the placeholder says typing here skips it, and
+	 * the composer folds to its compact row while the keys are away from it. `skip`: sending the draft skips
+	 * the ask, so a `skips ask` chip leads the input and send reads Skip & send.
+	 */
+	readonly ask?: "pending" | "skip";
 	/** The session's title, quoted in italics as the TSP placeholder; undefined until it has one. */
 	readonly title?: string;
 }
@@ -75,12 +99,18 @@ const FOCUS_ACTION = "focus:";
 
 const IDLE_COMPOSER: ComposerNativeState = { running: false };
 
+/** Recording and transcription still write into the draft, so sending it then would split the dictation. */
+function dictationHoldsDraft(dictation: ComposerNativeState["dictation"]): boolean {
+	return dictation === "recording" || dictation === "transcribing";
+}
+
 /** The composer's controls around the input, rebuilt when what they show changes; the bar adds the rate and facts. */
 interface ComposerControls {
 	readonly focus: NativeNode | undefined;
 	readonly mode: NativeNode | undefined;
 	readonly model: NativeNode | undefined;
 	readonly effort: NativeNode | undefined;
+	readonly dictation: NativeNode | undefined;
 	readonly submit: NativeNode;
 }
 
@@ -356,6 +386,18 @@ export function extractImagePastePathsFromText(text: string): string[] | undefin
 	return wholePath ? [wholePath] : undefined;
 }
 
+/** What a bracketed paste into an image-accepting prompt means. */
+export type ImagePaste =
+	/** Empty: the terminal's cue that the clipboard holds an image. */
+	{ kind: "clipboard" } | { kind: "paths"; paths: string[] } | { kind: "text" };
+
+/** Classifies the content of a bracketed paste (markers already stripped). */
+export function classifyImagePaste(content: string): ImagePaste {
+	if (content.length === 0) return { kind: "clipboard" };
+	const paths = extractImagePastePathsFromText(content);
+	return paths ? { kind: "paths", paths } : { kind: "text" };
+}
+
 function bracketedPastePayload(data: string): string | undefined {
 	if (!data.startsWith(BRACKETED_PASTE_START)) return undefined;
 	const endIndex = data.indexOf(BRACKETED_PASTE_END, BRACKETED_PASTE_START.length);
@@ -448,11 +490,20 @@ export type ComposerChipDescriptor =
 	| { kind: "image" | "video"; n: number; image: ImageContent; link: string | undefined }
 	| { kind: "paste"; n: number; text: TextAttachment };
 
+/** A draft image's blob id, riding on the image itself so its bytes are hashed once. */
+const kImageBlobId = Symbol("omp.imageBlobId");
+
+interface ImageContentWithBlobId extends ImageContent {
+	[kImageBlobId]?: string;
+}
+
 /**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
 export class CustomEditor extends Editor {
 	#spelling = new MacOSSpellingProvider();
+	/** The word being typed: its typo mark waits until the caret leaves it. */
+	#typing = new TypingWordTracker();
 	#wordCompletion = new WordCompletionProvider();
 	imageLinks?: readonly (string | undefined)[];
 
@@ -609,8 +660,9 @@ export class CustomEditor extends Editor {
 					name => this.skillFilePath(name) !== undefined,
 					register,
 				),
-				selector => this.#mentionLabelFor(selector),
+				selector => this.#mentionChipFor(selector),
 				register,
+				selector => this.resolveModelMention(selector) !== undefined,
 			),
 		);
 		this.#syncComposerTokenPattern();
@@ -624,18 +676,20 @@ export class CustomEditor extends Editor {
 	 */
 	skillFilePath: (name: string) => string | undefined = () => undefined;
 
-	/** Host-owned model probe: maps a mentionable selector to its display chip label. */
-	modelMentionLabel: (selector: string) => string | undefined = () => undefined;
+	/**
+	 * Host-owned model probe: a mentionable `provider/id[:level]` selector's chip label and
+	 * canonical selector, so equivalent spellings (`:hi`/`:high`, bare/`:auto`) share a chip.
+	 */
+	resolveModelMention: (selector: string) => { label: string; selector: string } | undefined = () => undefined;
 
 	/** Host-owned session probe: maps a persisted model pseudonym back to its selector. */
 	modelMentionSelector: (agent: string) => string | undefined = () => undefined;
 
-	#mentionLabelFor(selector: string): string | undefined {
-		const label = this.modelMentionLabel(selector);
-		if (label === undefined) return undefined;
-		const expansion = modelMentionToken(selector);
-		const registered = this.atoms.get(label);
-		return registered !== undefined && registered !== expansion ? undefined : label;
+	#mentionChipFor(selector: string): { label: string; selector: string } | undefined {
+		const chip = this.resolveModelMention(selector);
+		if (chip === undefined) return undefined;
+		const registered = this.atoms.get(chip.label);
+		return registered === undefined || registered === modelMentionToken(chip.selector) ? chip : undefined;
 	}
 
 	/**
@@ -689,9 +743,19 @@ export class CustomEditor extends Editor {
 					const start = match.index + match[1].length;
 					const end = match.index + match[0].length;
 					if (end === line.length && i === lines.length - 1) break;
-					const label = this.#mentionLabelFor(selector);
-					if (label === undefined) continue;
-					this.collapseToAtom(i, start, end, label, modelMentionToken(selector));
+					const mention = resolveModelMentionToken(
+						selector,
+						candidate => this.#mentionChipFor(candidate),
+						candidate => this.resolveModelMention(candidate) !== undefined,
+					);
+					if (!mention) continue;
+					this.collapseToAtom(
+						i,
+						start,
+						end - mention.suffix.length,
+						mention.value.label,
+						modelMentionToken(mention.value.selector),
+					);
 					collapsed = true;
 					anyCollapsed = true;
 					break;
@@ -857,7 +921,11 @@ export class CustomEditor extends Editor {
 		}
 		// One string instance per revision: whole-buffer memos downstream hit on identity.
 		const editorText = this.#decorationText;
-		const animated = this.focused && this.#shimmerEnabled() && hasMagicKeyword(editorText);
+		const caret = this.getCursor();
+		this.#typing.update(this.textRevision, this.#decorationLines, caret.line, caret.col, this.focused);
+		const typing = this.#typing.word;
+		// With decorative motion off the keyword keeps its static highlight; the pending frame chain ends here.
+		const animated = this.focused && this.#shimmerEnabled() && motionEffectsEnabled() && hasMagicKeyword(editorText);
 		const phase = animated ? (Date.now() % CustomEditor.SHIMMER_PERIOD_MS) / CustomEditor.SHIMMER_PERIOD_MS : 0;
 		if (animated) this.#scheduleShimmerFrame();
 		let sourceSearchOffset = 0;
@@ -879,6 +947,7 @@ export class CustomEditor extends Editor {
 							lines: this.#decorationLines,
 							line: context.line,
 							startCol: context.startCol + sourceOffset,
+							typing,
 						},
 						span => highlightMagicKeywords(span, undefined, phase),
 					);
@@ -926,12 +995,22 @@ export class CustomEditor extends Editor {
 		);
 	};
 
+	/** Catch the typed word up with the caret first: its leaving the word (or a blur) re-describes the typo marks. */
+	override describe(cx: DescribeContext): NativeNode {
+		const caret = this.getCursor();
+		if (this.#typing.update(this.textRevision, this.getLines(), caret.line, caret.col, this.focused)) {
+			this.invalidate();
+		}
+		return super.describe(cx);
+	}
+
 	/**
 	 * TSP decorations: magic keywords shimmer (terminal-clocked) in the accent
 	 * color, chips and markers take their token colors, misspellings are marked,
 	 * and queue-composer markers are dimmed/accented, all as ranges over the raw
-	 * buffer instead of painted text. A shell-mode draft is code: only its sigil
-	 * is decorated, hidden behind the mode chip.
+	 * buffer instead of painted text. An image's token or marker names the image's
+	 * blob, so copying it in the terminal copies the image. A shell-mode draft is
+	 * code: only its sigil is decorated, hidden behind the mode chip.
 	 */
 	override describeDecorations = (lines: readonly string[]): readonly TspEditorDecoration[] => {
 		const text = lines.join("\n");
@@ -942,8 +1021,9 @@ export class CustomEditor extends Editor {
 		this.#syncComposerTokenPattern();
 		const decor: TspEditorDecoration[] = [];
 		let offset = 0;
-		const mark = (length: number, s: string): string => {
-			decor.push({ from: offset, to: offset + length, s });
+		const mark = (length: number, s: string, blob?: NativeBlob): string => {
+			const range = { from: offset, to: offset + length, s };
+			decor.push(blob ? withBlob(range, blob) : range);
 			offset += length;
 			return "";
 		};
@@ -956,7 +1036,10 @@ export class CustomEditor extends Editor {
 				},
 				renderSkill: label => mark(label.length, "customMessageLabel strong"),
 				renderMention: label => mark(label.length, "statusLineModel strong"),
-				renderReference: value => mark(value.length, "accent strong"),
+				renderReference: (value, kind, index) => {
+					const image = kind === "image" ? this.pendingImages[index - 1] : undefined;
+					return mark(value.length, "accent strong", image && this.#imageBlob(image));
+				},
 			},
 			this.atomicTokenPattern,
 		);
@@ -966,6 +1049,7 @@ export class CustomEditor extends Editor {
 
 		const queueBody = parseQueueShorthand(text);
 		const queueList = queueBody !== undefined && isQueuedMessageList(queueBody);
+		const typing = this.#typing.word;
 		let lineStart = 0;
 		for (let line = 0; line < lines.length; line++) {
 			const value = lines[line] ?? "";
@@ -979,13 +1063,28 @@ export class CustomEditor extends Editor {
 					decor.push({ from: lineStart + indent, to: lineStart + marker[0].length, s: "accent" });
 				}
 			}
-			for (const typo of this.#spelling.typoRanges(value, { editorText: text, lines, line, startCol: 0 })) {
+			const context = { editorText: text, lines, line, startCol: 0, typing };
+			for (const typo of this.#spelling.typoRanges(value, context)) {
 				decor.push({ from: lineStart + typo.start, to: lineStart + typo.start + typo.length, s: "typo" });
 			}
 			lineStart += value.length + 1;
 		}
 		return decor.sort((a, b) => a.from - b.from);
 	};
+
+	/**
+	 * The blob of pending image `image`'s bytes: the chips band's while its card shows it, else
+	 * made anew. Its `decor` range owns it, so a deleted token's bytes are released.
+	 */
+	#imageBlob(image: ImageContent): NativeBlob {
+		const tagged = image as ImageContentWithBlobId;
+		const known = tagged[kImageBlobId];
+		const alive = known === undefined ? undefined : getNativeBlob(known);
+		if (alive) return alive;
+		const blob = nativeBlob(Buffer.from(image.data, "base64"), image.mimeType);
+		tagged[kImageBlobId] = blob.id;
+		return blob;
+	}
 
 	/** Optional test override for the magic-keyword shimmer gate. */
 	magicKeywordsEnabledOverride: boolean | undefined;
@@ -1034,15 +1133,36 @@ export class CustomEditor extends Editor {
 		}, CustomEditor.SHIMMER_FRAME_MS);
 		this.#shimmerTimer.unref?.();
 	}
-	/** Editing is available during bootstrap; atomic sends wait until submission is wired and enabled. */
+	/** Editing is available during bootstrap; atomic sends wait until submission is wired and enabled
+	 *  and no dictation is still writing into the draft. */
 	protected override get nativeSendable(): boolean {
-		return this.onSubmit !== undefined && !this.disableSubmit;
+		return (
+			!this.nativeKeyPassthrough &&
+			this.onSubmit !== undefined &&
+			!this.disableSubmit &&
+			!dictationHoldsDraft(this.composerState().dictation)
+		);
 	}
+	/** Rows: while it returns true the composer draws faint, its keys with an ask above it. */
+	faint?: () => boolean;
+
+	override render(width: number): readonly string[] {
+		const lines = super.render(width);
+		if (!this.faint?.()) return lines;
+		// Faint every cell: re-applied after each reset the rows carry, so styled runs stay faint too.
+		return lines.map(line => `\x1b[2m${line.replace(/\x1b\[(?:0|22)?m/g, reset => `${reset}\x1b[2m`)}\x1b[22m`);
+	}
+
 	/** The quoted-title placeholder, kept while the title stands so the editor node stays reused. */
 	#titlePlaceholder: { title: string; text: TspText } | undefined;
-	/** Viewing a subagent, the draft goes to it: the placeholder names it; else the session's title, quoted in italics. */
+	/**
+	 * Talking to a `/btw` note, the placeholder asks about it; viewing a subagent, the draft goes to
+	 * it: the placeholder names it; else the session's title, quoted in italics.
+	 */
 	override describePlaceholder = (): TspText => {
-		const { viewing, title } = this.composerState();
+		const { viewing, title, btw, ask } = this.composerState();
+		if (btw) return "Ask about this…";
+		if (ask) return ASK_PLACEHOLDER;
 		const agent = viewing?.at(-1);
 		if (agent !== undefined) return `Message ${agent}`;
 		if (!title) return NATIVE_COMPOSER_PLACEHOLDER;
@@ -1051,8 +1171,11 @@ export class CustomEditor extends Editor {
 		}
 		return this.#titlePlaceholder.text;
 	};
-	/** A shell-mode draft highlights as its language. */
-	override describeLanguage = (): string | undefined => this.composerState().shell?.kind;
+	/** A shell-mode draft highlights as its language; a btw draft is prose. */
+	override describeLanguage = (): string | undefined => {
+		const kind = this.composerState().shell?.kind;
+		return kind === "btw" ? undefined : kind;
+	};
 	/** Host-owned live state for the TSP composer (shell mode, effort chip, send/stop). */
 	composerState: () => ComposerNativeState = () => IDLE_COMPOSER;
 	/** The attachment band, described inside the composer on a TSP terminal (ANSI renders it above). */
@@ -1073,14 +1196,15 @@ export class CustomEditor extends Editor {
 		| undefined;
 
 	/**
-	 * The TSP composer: role `omp.editor[.bash|.python]` (tone `pending` while
+	 * The TSP composer: role `omp.editor[.bash|.python|.btw-ask|.btw]` (tone `pending` while
 	 * a turn runs) over the context hairline, the viewing header while a
 	 * subagent is focused, the attachment chips, a `line` row of the
-	 * shell-mode chip and the input, and the `bar`: model chip, effort chip
+	 * shell-mode (or `btw`) chip and the input, and the `bar`: model chip, effort chip
 	 * (or the effort glyph as the model chip's icon), the generation rate,
-	 * the other status facts, usage, then send (Stop while a turn runs).
-	 * Clicks come back as `status.model`, `thinking.cycle`, `submit`,
-	 * `interrupt` and `focus:<id>` actions.
+	 * the other status facts, usage, dictation, then send (Stop while a turn runs).
+	 * Clicks come back as `status.model`, `thinking.cycle`, `dictation.toggle`,
+	 * `submit`, `interrupt` and `focus:<id>` actions; `thinking.set` (the level
+	 * as `value`) picks a thinking level directly (a phone's effort menu).
 	 */
 	override describeLayout = (input: NativeNode, cx: DescribeContext): NativeEditorLayout => {
 		const effortGlyph = cx.supports("effort");
@@ -1090,15 +1214,21 @@ export class CustomEditor extends Editor {
 		const thinkingKey = this.#actionKeys.get("app.thinking.cycle")?.[0];
 		const modelKey = this.#actionKeys.get("app.model.selectTemporary")?.[0];
 		const interruptKey = this.#actionKeys.get("app.interrupt")?.[0] ?? "escape";
+		// The keys away at an ask above: the composer folds until a click or a key brings them back.
+		const folded = state.ask !== undefined && !this.focused;
 		const key = [
 			shell?.kind,
 			shell?.excluded,
 			state.thinking,
 			state.running,
+			state.dictation,
 			thinkingKey,
 			modelKey,
 			interruptKey,
 			state.viewing?.join("\u0001"),
+			state.btw,
+			state.ask,
+			folded,
 			effortGlyph,
 			state.thinkingInModel,
 		].join("\0");
@@ -1138,6 +1268,7 @@ export class CustomEditor extends Editor {
 								// The status facts are the bar's flexible space; without them a spacer keeps send at the end.
 								facts?.extras ?? node("row", { grow: 1 }, [], "gap"),
 								facts?.usage,
+								controls.dictation,
 								controls.submit,
 							]),
 							{ role: "omp.composer.bar", gap: "sm", align: "center" },
@@ -1149,8 +1280,13 @@ export class CustomEditor extends Editor {
 			"line",
 		);
 		const layout: NativeEditorLayout = {
-			role: shell ? `omp.editor.${shell.kind}` : "omp.editor",
+			role: shell
+				? `omp.editor.${shell.kind === "btw" ? "btw-ask" : shell.kind}`
+				: state.btw
+					? "omp.editor.btw"
+					: "omp.editor",
 			tone: state.running ? "pending" : undefined,
+			...(folded ? { folded: true } : {}),
 			children: compact([facts?.context, controls.focus, chips, line, bar]),
 			caret: "line/input",
 		};
@@ -1213,6 +1349,23 @@ export class CustomEditor extends Editor {
 				},
 			),
 			"focus",
+		);
+	}
+
+	/**
+	 * The `btw` chip before the input while drafts go to a `/btw` note; a click goes back to the
+	 * chat as the interrupt key does (the note owns it first).
+	 */
+	#describeBtwChip(interruptKey: KeyId): NativeNode {
+		return keyed(
+			row([node("text", { spans: [span("btw", "accent")], wrap: "none" }, undefined, "label")], {
+				role: "omp.composer.mode",
+				gap: "xs",
+				align: "center",
+				title: `Asking the side question · back to the chat  ${formatTooltipKey(interruptKey)}`,
+				actions: { click: "interrupt" },
+			}),
+			"mode",
 		);
 	}
 
@@ -1289,43 +1442,106 @@ export class CustomEditor extends Editor {
 						"effort",
 					)
 				: undefined;
-		const submit = state.running
-			? node(
-					"text",
-					{
-						role: "omp.composer.stop",
-						text: "Stop",
-						tone: "error",
-						title: `Stop  ${formatTooltipKey(interruptKey)}`,
-						actions: { click: "interrupt" },
-					},
-					undefined,
-					"stop",
-				)
-			: node(
-					"kbd",
-					{
-						role: "omp.composer.send",
-						keys: ["enter"],
-						title: `Send  ${formatTooltipKey("enter")}`,
-						actions: { click: "submit" },
-					},
-					undefined,
-					"send",
-				);
-		if (!shell) return { focus, mode: undefined, model, effort, submit };
-		const runs = shell.kind === "bash" ? "Runs in your shell" : "Runs in Python";
+		const recording = state.dictation === "recording";
+		const starting = state.dictation === "starting";
+		const transcribing = state.dictation === "transcribing";
+		const dictation =
+			state.dictation === undefined
+				? undefined
+				: node(
+						"row",
+						{
+							role: "omp.composer.dictation",
+							gap: "xs",
+							align: "center",
+							tone: recording ? "error" : starting || transcribing ? "pending" : undefined,
+							title: recording
+								? "Stop recording and transcribe"
+								: starting
+									? "Cancel dictation"
+									: transcribing
+										? "Transcribing dictation"
+										: "Start dictation",
+							// The model can take a while to load on first use, so a start stays cancellable.
+							actions: transcribing ? undefined : { click: "dictation.toggle" },
+						},
+						starting || transcribing
+							? [node("spinner", { label: starting ? "Starting…" : "Transcribing…" }, undefined, "pending")]
+							: compact([
+									node("icon", { name: recording ? "stop" : "mic" }, undefined, "icon"),
+									recording && node("text", { text: "Recording · Stop", wrap: "none" }, undefined, "label"),
+								]),
+						"dictation",
+					);
+		const dictating = dictationHoldsDraft(state.dictation);
+		const submit =
+			state.ask === "skip"
+				? node(
+						"text",
+						{
+							role: "omp.composer.skip",
+							text: "Skip & send",
+							tone: "warning",
+							title: `Send this message instead of answering the questions  ${formatTooltipKey("enter")}`,
+							actions: { click: "submit" },
+						},
+						undefined,
+						"skip",
+					)
+				: state.running
+					? node(
+							"text",
+							{
+								role: "omp.composer.stop",
+								text: "Stop",
+								tone: "error",
+								title: `Stop  ${formatTooltipKey(interruptKey)}`,
+								actions: { click: "interrupt" },
+							},
+							undefined,
+							"stop",
+						)
+					: node(
+							"kbd",
+							{
+								role: "omp.composer.send",
+								keys: ["enter"],
+								title: dictating ? "Finish dictation before sending" : `Send  ${formatTooltipKey("enter")}`,
+								tone: dictating ? "muted" : undefined,
+								actions: dictating ? undefined : { click: "submit" },
+							},
+							undefined,
+							"send",
+						);
+		if (!shell) {
+			const mode = state.btw
+				? this.#describeBtwChip(interruptKey)
+				: state.ask === "skip"
+					? keyed(
+							row([node("text", { spans: [span("skips ask", "warning")], wrap: "none" }, undefined, "label")], {
+								role: "omp.composer.mode",
+								tone: "warning",
+								gap: "xs",
+								align: "center",
+								title: "Sending this message skips the questions above",
+							}),
+							"mode",
+						)
+					: undefined;
+			return { focus, mode, model, effort, dictation, submit };
+		}
+		const runs =
+			shell.kind === "bash"
+				? "Runs in your shell"
+				: shell.kind === "python"
+					? "Runs in Python"
+					: "Asks a /btw side question";
 		const mode = keyed(
 			row(
 				compact([
 					shell.excluded &&
 						node("icon", { name: "eye-off", title: "Not sent to the model" }, undefined, "excluded"),
-					node(
-						"text",
-						{ spans: [span(shell.kind, shell.kind === "bash" ? "bashMode" : "pythonMode")], wrap: "none" },
-						undefined,
-						"label",
-					),
+					node("text", { spans: [span(shell.kind, `${shell.kind}Mode`)], wrap: "none" }, undefined, "label"),
 				]),
 				{
 					role: "omp.composer.mode",
@@ -1336,15 +1552,15 @@ export class CustomEditor extends Editor {
 			),
 			"mode",
 		);
-		return { focus, mode, model, effort, submit };
+		return { focus, mode, model, effort, dictation, submit };
 	}
 
 	/**
-	 * Clicks on the composer's controls take the same paths as their keys: ⇧⇥,
-	 * ⏎ and Esc; the viewing header's links (`focus:<id>`) go to the host,
-	 * the status facts' clicks (`status.*`) to their source. Selection edits
-	 * go to the buffer; `send` submits its own prompt after saving the old draft
-	 * for recall and waiting for in-flight clipboard work.
+	 * Dictation clicks go directly to the host, independent of keybindings.
+	 * Other controls take the same paths as their keys; the viewing header's
+	 * links (`focus:<id>`) go to the host, the status facts' clicks to their source.
+	 * Selection edits go to the buffer; `send` submits its own prompt after
+	 * saving the old draft for recall and waiting for in-flight clipboard work.
 	 */
 	override handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "send") {
@@ -1368,8 +1584,16 @@ export class CustomEditor extends Editor {
 			case "thinking.cycle":
 				this.onCycleThinkingLevel?.();
 				return;
+			case "thinking.set":
+				if (event.value) this.onSetThinkingLevel?.(event.value);
+				return;
+			case "dictation.toggle": {
+				const { dictation } = this.composerState();
+				if (dictation !== undefined && dictation !== "transcribing") this.onToggleDictation?.();
+				return;
+			}
 			case "submit":
-				this.submit();
+				if (this.nativeSendable) this.submit();
 				return;
 			case "interrupt":
 				this.onEscape?.();
@@ -1385,6 +1609,8 @@ export class CustomEditor extends Editor {
 	onExit?: () => void;
 	onDisplayReset?: () => void;
 	onCycleThinkingLevel?: () => void;
+	/** A thinking level (`off`, `auto`, `minimal`…`max`) was picked by pointer. */
+	onSetThinkingLevel?: (level: string) => void;
 	onCycleModelForward?: () => void;
 	onCycleModelBackward?: () => void;
 	onSelectModel?: () => void;
@@ -1404,6 +1630,8 @@ export class CustomEditor extends Editor {
 	onRetry?: () => void;
 	/** Called when Caps Lock is pressed. */
 	onCapsLock?: () => void;
+	/** Called directly by the native microphone/stop control, without synthesizing a keypress. */
+	onToggleDictation?: () => void;
 	/** Called when left-arrow is pressed while the editor is empty (cursor necessarily at start). */
 	onLeftAtStart?: () => void;
 	/** Called when the viewing header asks to view agent `id` ({@link MAIN_AGENT_ID}: the main session). */
@@ -1436,8 +1664,9 @@ export class CustomEditor extends Editor {
 	 *  `pendingImages` (Codex PR #3602 review). */
 	#pasteInFlight = 0;
 	/** Input chunks and explicit prompts deferred behind an in-flight paste,
-	 *  drained in FIFO order once the paste count returns to zero. */
-	#pendingInput: (string | Extract<NativeUiEvent, { type: "send" }>)[] = [];
+	 *  drained in FIFO order once the paste count returns to zero. A `draft` chunk
+	 *  arrived through {@link handleDraftEdit} and drains back through it. */
+	#pendingInput: (string | { draft: string } | Extract<NativeUiEvent, { type: "send" }>)[] = [];
 	#actionKeys = new Map<ConfigurableEditorAction, KeyId[]>(
 		Object.entries(DEFAULT_ACTION_KEYS).map(([action, keys]) => [action as ConfigurableEditorAction, [...keys]]),
 	);
@@ -1516,6 +1745,7 @@ export class CustomEditor extends Editor {
 		const drained = this.#pendingInput.splice(0);
 		for (const input of drained) {
 			if (typeof input === "string") this.handleInput(input);
+			else if ("draft" in input) this.handleDraftEdit(input.draft);
 			else this.handleNativeEvent(input);
 		}
 	}
@@ -1528,6 +1758,11 @@ export class CustomEditor extends Editor {
 	#trackAsyncPaste(promise: Promise<unknown>): void {
 		this.#pasteInFlight++;
 		void promise.then(this.#onPasteSettled, this.#onPasteSettled);
+	}
+
+	/** True while a clipboard-image or image-path paste is still landing; later keys queue behind it. */
+	get pasteInFlight(): boolean {
+		return this.#pasteInFlight > 0;
 	}
 
 	capturesInput(data: string): boolean {
@@ -1550,55 +1785,20 @@ export class CustomEditor extends Editor {
 			this.onCapsLock();
 			return;
 		}
-
-		// Bracketed-paste assembly. Some terminals fragment the start marker,
-		// the payload, and the end marker across separate stdin chunks
-		// (Windows Terminal under heavy load, certain SSH muxes, …); the
-		// inherited handler then sees a zero-length payload and silently
-		// drops it through the normal text-insert path. Running our own
-		// `BracketedPasteHandler` ahead of `super.handleInput` lets us route
-		// the assembled content regardless of chunk boundaries:
-		//  - empty payload → `onPasteImage` (#3601: `Cmd+V`/`Ctrl+V` on an
-		//    image-only macOS pasteboard the terminal stripped to `""` first);
-		//  - explicit image-file paths → `onPasteImagePath` (#3506);
-		//  - anything else → the base editor's `pasteText` so `[Paste #N]`
-		//    markers, autocomplete, and undo state stay intact.
-		const paste = this.#pasteHandler.process(data);
-		if (paste.handled) {
-			if (paste.pasteContent === undefined) return; // still buffering — wait for end marker
-			const content = paste.pasteContent;
-			const remaining = paste.remaining;
-			// Queue any trailing bytes from the same read (typically a follow-up keystroke such as
-			// Enter that the user pressed right after Cmd+V) so they only fire *after* the paste
-			// completes — fixes the race where submit runs against an empty `pendingImages`.
-			if (remaining.length > 0) this.#pendingInput.push(remaining);
-			if (content.length === 0 && this.onPasteImage) {
-				this.#trackAsyncPaste(Promise.resolve(this.onPasteImage()));
-				return;
-			}
-			const attachmentPaths = extractImagePastePathsFromText(content);
-			if (attachmentPaths && this.onPasteImagePath) {
-				this.#trackAsyncPaste(
-					(async () => {
-						for (const p of attachmentPaths) await this.onPasteImagePath?.(p);
-					})(),
-				);
-				return;
-			}
-			// A submit key that shared the read (see `StdinBuffer`'s paste event) is
-			// about to be drained below, so a large-paste host must stage the paste
-			// synchronously instead of opening a menu the submit would land in.
-			if (this.#isSubmitKey(remaining)) this.pasteText(content, { submitAfterPaste: true });
-			else this.pasteText(content);
-			this.#collapseSkillTokens();
-			this.#collapseModelMentions();
-			// No async paste was started; drain the queued trailing bytes ourselves.
-			this.#drainPendingInput();
-			return;
-		}
+		if (this.#routeBracketedPaste(data, false)) return;
 
 		const parsedKey = parseKey(data);
 		const canonical = parsedKey !== undefined ? canonicalKeyId(parsedKey) : undefined;
+
+		// Enter matches the disabled Send button while dictation still writes into the draft;
+		// dictation's own submit trigger goes through submit(), not this key path.
+		if (
+			canonical !== undefined &&
+			getKeybindings().matchesCanonical(canonical, "tui.input.submit") &&
+			dictationHoldsDraft(this.composerState().dictation)
+		) {
+			return;
+		}
 
 		// Space-hold push-to-talk runs before editor shortcuts so a reserved binding can never
 		// delete, move, submit, or invoke an app action while the gesture is enabled.
@@ -1828,10 +2028,64 @@ export class CustomEditor extends Editor {
 		this.#normalizeQueuePrefix(hadBareQueuePrefix);
 	}
 
+	/**
+	 * Bracketed-paste assembly. Some terminals fragment the start marker,
+	 * the payload, and the end marker across separate stdin chunks
+	 * (Windows Terminal under heavy load, certain SSH muxes, …); the
+	 * inherited handler then sees a zero-length payload and silently
+	 * drops it through the normal text-insert path. Running our own
+	 * `BracketedPasteHandler` ahead of `super.handleInput` lets us route
+	 * the assembled content regardless of chunk boundaries:
+	 *  - empty payload → `onPasteImage` (#3601: `Cmd+V`/`Ctrl+V` on an
+	 *    image-only macOS pasteboard the terminal stripped to `""` first);
+	 *  - explicit image-file paths → `onPasteImagePath` (#3506);
+	 *  - anything else → the base editor's `pasteText` so `[Paste #N]`
+	 *    markers, autocomplete, and undo state stay intact.
+	 * True when `data` was consumed. `draft` queues trailing bytes back through
+	 * {@link handleDraftEdit} instead of {@link handleInput}.
+	 */
+	#routeBracketedPaste(data: string, draft: boolean): boolean {
+		const paste = this.#pasteHandler.process(data);
+		if (!paste.handled) return false;
+		if (paste.pasteContent === undefined) return true; // still buffering — wait for end marker
+		const content = paste.pasteContent;
+		const remaining = paste.remaining;
+		// Queue any trailing bytes from the same read (typically a follow-up keystroke such as
+		// Enter that the user pressed right after Cmd+V) so they only fire *after* the paste
+		// completes — fixes the race where submit runs against an empty `pendingImages`.
+		if (remaining.length > 0) this.#pendingInput.push(draft ? { draft: remaining } : remaining);
+		const image = classifyImagePaste(content);
+		if (image.kind === "clipboard" && this.onPasteImage) {
+			this.#trackAsyncPaste(Promise.resolve(this.onPasteImage()));
+			return true;
+		}
+		if (image.kind === "paths" && this.onPasteImagePath) {
+			this.#trackAsyncPaste(
+				(async () => {
+					for (const p of image.paths) await this.onPasteImagePath?.(p);
+				})(),
+			);
+			return true;
+		}
+		// A submit key that shared the read (see `StdinBuffer`'s paste event) is
+		// about to be drained below, so a large-paste host must stage the paste
+		// synchronously instead of opening a menu the submit would land in.
+		if (this.#isSubmitKey(remaining)) this.pasteText(content, { submitAfterPaste: true });
+		else this.pasteText(content);
+		this.#collapseSkillTokens();
+		this.#collapseModelMentions();
+		// No async paste was started; drain the queued trailing bytes ourselves.
+		this.#drainPendingInput();
+		return true;
+	}
+
 	/** Promote a newly formed bare `->` / `=>` prefix to a reserved header line by opening the
 	 *  queue body beneath it. `hadBareQueuePrefix` is the pre-edit state: a prompt that was
-	 *  already just the prefix is left alone so the user can keep editing it. */
+	 *  already just the prefix is left alone so the user can keep editing it. Natively drawn
+	 *  (Tern), the prefix stays as dimmed text rather than a `Queueing` label, so the body
+	 *  goes on the same line and nothing is opened. */
 	#normalizeQueuePrefix(hadBareQueuePrefix: boolean): void {
+		if (isNativeRendering()) return;
 		if (hadBareQueuePrefix || !(this.textEquals("->") || this.textEquals("=>"))) return;
 		const cursor = this.getCursor();
 		if (cursor.line === 0 && cursor.col === 2) {
@@ -1846,9 +2100,16 @@ export class CustomEditor extends Editor {
 	 * an Ask dialog opened over a non-empty prompt — so finishing or submitting
 	 * the draft cannot fire an editor-slot shortcut that clears
 	 * `editorContainer` and orphans the overlay. Only text editing, cursor
-	 * movement, submission, and the clear action reach the buffer.
+	 * movement, submission, the clear action, and pastes (clipboard images and
+	 * image paths attach as on the composer) reach the buffer.
 	 */
 	handleDraftEdit(data: string): void {
+		// Same serialization as handleInput: keys typed behind an image paste wait for it.
+		if (this.#pasteInFlight > 0) {
+			this.#pendingInput.push({ draft: data });
+			return;
+		}
+		if (this.#routeBracketedPaste(data, true)) return;
 		// The base editor reserves Ctrl+C for parent handling and returns without
 		// touching the buffer, so the configured clear action must be dispatched
 		// explicitly here — otherwise the guard's "finish or clear the prompt"
@@ -1860,6 +2121,10 @@ export class CustomEditor extends Editor {
 		if (canonical !== undefined && this.#matchesAction(canonical, "app.clear")) {
 			if (this.onClear) this.onClear();
 			else this.setText("");
+			return;
+		}
+		if (canonical !== undefined && this.#matchesAction(canonical, "app.clipboard.pasteImage") && this.onPasteImage) {
+			this.#trackAsyncPaste(Promise.resolve(this.onPasteImage()));
 			return;
 		}
 		this.#forwardInput(data);
