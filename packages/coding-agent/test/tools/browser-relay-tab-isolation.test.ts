@@ -9,7 +9,7 @@ import {
 	ensureChromiumExecutable,
 	RENDERER_PRIORITY_ARGS,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
-import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import { acquireBrowser, type BrowserHandle, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { unpackedExtensionId } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
@@ -438,7 +438,7 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 			`ready=${progress?.ready ?? false}; mount=${progress?.mount ?? "absent"}; ` +
 			`loads=${progress?.loads ?? "0"}; replied=${Boolean(progress?.reply)}; visibility=${progress?.visibility ?? "unknown"}`;
 		try {
-			let probe = `document.dispatchEvent(new CustomEvent("omp-fixture-probe-menu", { detail: ${JSON.stringify(challenge)} }));`;
+			const probe = `document.dispatchEvent(new CustomEvent("omp-fixture-probe-menu", { detail: ${JSON.stringify(challenge)} }));`;
 			while (performance.now() < deadline) {
 				const { result, exceptionDetails } = await cdp.send(
 					"Runtime.evaluate",
@@ -446,7 +446,6 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 					options(),
 				);
 				if (exceptionDetails) throw new Error(exceptionDetails.text);
-				probe = "";
 				progress = result.value as FixtureMenuProgress | undefined;
 				const documentId = progress?.reply?.startsWith(prefix) && progress.reply.slice(prefix.length);
 				if (documentId) {
@@ -462,6 +461,7 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 						documentId,
 					};
 				}
+				// A probe sent before the genuine menu initializes can be dropped. Reuse one challenge.
 				await Bun.sleep(Math.min(25, options().timeout));
 			}
 		} catch (cause) {
@@ -781,8 +781,10 @@ window.addEventListener("message", event => {
 });
 document.addEventListener("omp-fixture-probe-menu", event => {
 	if (!host || typeof event.detail !== "string") return;
-	challenge = event.detail;
-	host.removeAttribute("data-omp-fixture-menu-reply");
+	if (challenge !== event.detail) {
+		challenge = event.detail;
+		host.removeAttribute("data-omp-fixture-menu-reply");
+	}
 	probeMenu();
 });
 document.addEventListener("omp-fixture-show-menu", () => {
@@ -794,18 +796,19 @@ document.addEventListener("omp-fixture-show-menu", () => {
 		host.setAttribute("data-omp-fixture-menu-loads", String(++loads));
 		probeMenu();
 	});
-	document.body.append(host);
-	host.attachShadow({ mode: "closed" }).append(menu);
-	host.setAttribute("data-omp-fixture-menu-mount", "connected");
+	// Set src while detached so insertion does not schedule an about:blank load first.
 	menu.src = menuUrl;
+	host.attachShadow({ mode: "closed" }).append(menu);
+	document.body.append(host);
 	host.setAttribute("data-omp-fixture-menu-mount", "src-assigned");
 });
 document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 		);
-		const fixture = await launchRelayFixture(undefined, [vaultDir]);
-		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		let fixture: RelayFixture | undefined;
+		let relay: BrowserHandle | undefined;
 		const name = `relay-vault-${process.pid}`;
 		try {
+			fixture = await launchRelayFixture(undefined, [vaultDir]);
 			const vaultId = fixture.extensionIds.get(vaultDir);
 			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
 			const menu = `chrome-extension://${vaultId}/menu.html`;
@@ -830,12 +833,18 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			const user = await fixture.browser.newPage();
 			const userUrl = `${fixture.origin}/login?who=user`;
 			await user.goto(userUrl);
-			// Set the fixture's user tab active before borrowing; never activate the driven tab.
+			// The user's menu is already open when omp first connects. Never activate the driven tab.
 			await user.bringToFront();
-			const userMenu = await showMenu(user, "user tab before borrow");
+			const userMenu = await showMenu(user, "user tab before registry connection");
+			relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+			expect(await observeFixtureMenu(user, menu, "user tab after registry connection")).toEqual(userMenu);
+			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
 			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
+			if (tab.backend !== "worker") throw new Error("Expected a real relay tab worker");
+			expect(tab.ownsPage).toBeFalse();
 			expect(await chromeTab(fixture, chromeTabId(tab.targetId))).toEqual({ active: false });
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
+			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
 			// Trigger the real fixture UI only after borrow, through the independent Chrome connection.
 			const drivenMenu = await showMenu(driven, "driven tab after borrow");
 			expect(drivenMenu.documentId).not.toBe(userMenu.documentId);
@@ -844,14 +853,24 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			expect(await observeFixtureMenu(user, menu, "user tab after relay read")).toEqual(userMenu);
 			expect(drivenMenu.attributes).not.toContain("srcdoc");
 			expect(userMenu.attributes).not.toContain("srcdoc");
+			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
+			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
 			await releaseTab(name);
 			expect(driven.isClosed()).toBeFalse();
 			expect(user.isClosed()).toBeFalse();
 		} finally {
-			await releaseTab(name).catch(() => undefined);
-			await releaseBrowser(relay, { kill: false });
-			await fixture.close();
-			await fs.rm(vaultDir, { recursive: true, force: true });
+			try {
+				if (relay) {
+					await releaseTab(name).catch(() => undefined);
+					await releaseBrowser(relay, { kill: false });
+				}
+			} finally {
+				try {
+					await fixture?.close();
+				} finally {
+					await fs.rm(vaultDir, { recursive: true, force: true });
+				}
+			}
 		}
 	}, 60_000);
 
