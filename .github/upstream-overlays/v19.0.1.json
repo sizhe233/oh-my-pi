@@ -3,8 +3,8 @@
   "releaseTag": "v19.0.1",
   "upstreamSha": "f40f335845f0b136453d12fec8d6057011082766",
   "mergeBaseSha": "81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b",
-  "mergedProductSha256": "b45f0fa8dfa6936c276aa6dde12b20d50d331a38d61653e58b911b4bf90ea75b",
-  "finalProductSha256": "06c9d8865b3bc844b1d8caa97755c6faf48531df61e9047263f0d0f99b4ce06a",
+  "mergedProductSha256": "30474d6c072b4734b0cff876b4fbd77ad20af852fe4fddd5b959b0d8af4f4e5e",
+  "finalProductSha256": "81be3b5e8eb2e9a5a55203c7740ccc39a85cf8893142d553d0861859f979c3bc",
   "entries": [
     {
       "path": "crates/builtins/src/locale.rs",
