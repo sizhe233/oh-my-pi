@@ -425,8 +425,107 @@ async function withFixtureObserver<T>(cdp: CDPSession, read: (cdp: CDPSession) =
 	}
 }
 
+interface FixtureMenuNavigationEvent {
+	frame: string;
+	stage: string;
+	atMs: number;
+	url?: string;
+	loader?: boolean;
+	fragment?: boolean;
+}
+
+interface FixtureMenuTrace {
+	setOwner(frame: string): void;
+	sample(frame: Protocol.Page.Frame, source: "parent-tree" | "iframe-tree"): void;
+	phase(stage: string): void;
+}
+
+function fixtureMenuUrlClass(actual: string, expected: string): string {
+	if (actual === expected) return "expected-menu";
+	if (!actual) return "empty";
+	if (actual === "about:blank") return "about:blank";
+	if (actual.startsWith("chrome-error:")) return "chrome-error";
+	if (actual.startsWith("chrome-extension:")) return "other-extension-url";
+	if (actual.startsWith("http:") || actual.startsWith("https:")) return "other-web-url";
+	return "other";
+}
+
+/** Passively listen to the fixture's already-enabled native Page domain; never attach or resume here. */
+function startFixtureMenuTrace(page: Page, url: string, label: string) {
+	const start = performance.now();
+	const age = () => Math.round(performance.now() - start);
+	const events: FixtureMenuNavigationEvent[] = [];
+	const phases: Array<{ stage: string; atMs: number }> = [];
+	let owner: string | undefined;
+	const record = (frame: string, stage: string, actualUrl?: string, details?: Protocol.Page.Frame) => {
+		if ((owner && owner !== frame) || events.length >= 32) return;
+		events.push({
+			frame,
+			stage,
+			atMs: age(),
+			...(actualUrl !== undefined ? { url: fixtureMenuUrlClass(actualUrl, url) } : {}),
+			...(details ? { loader: Boolean(details.loaderId), fragment: Boolean(details.urlFragment) } : {}),
+		});
+	};
+	const client = page.mainFrame().client;
+	const startNavigation = (event: Protocol.Page.FrameStartedNavigatingEvent) =>
+		record(event.frameId, "navigation-start", event.url);
+	const startLoading = (event: Protocol.Page.FrameStartedLoadingEvent) => record(event.frameId, "load-start");
+	const commit = (event: Protocol.Page.FrameNavigatedEvent) =>
+		record(
+			event.frame.id,
+			event.frame.unreachableUrl ? "committed-error-document" : "committed",
+			event.frame.url,
+			event.frame,
+		);
+	const stopLoading = (event: Protocol.Page.FrameStoppedLoadingEvent) => record(event.frameId, "load-stop");
+	const detach = (event: Protocol.Page.FrameDetachedEvent) => record(event.frameId, "frame-" + event.reason);
+	client.on("Page.frameStartedNavigating", startNavigation);
+	client.on("Page.frameStartedLoading", startLoading);
+	client.on("Page.frameNavigated", commit);
+	client.on("Page.frameStoppedLoading", stopLoading);
+	client.on("Page.frameDetached", detach);
+	const trace: FixtureMenuTrace = {
+		setOwner(frame) {
+			owner ??= frame;
+		},
+		sample(frame, source) {
+			record(frame.id, source + (frame.unreachableUrl ? "-error-document" : ""), frame.url, frame);
+		},
+		phase(stage) {
+			phases.push({ stage, atMs: age() });
+		},
+	};
+	return {
+		trace,
+		finish() {
+			client.off("Page.frameStartedNavigating", startNavigation);
+			client.off("Page.frameStartedLoading", startLoading);
+			client.off("Page.frameNavigated", commit);
+			client.off("Page.frameStoppedLoading", stopLoading);
+			client.off("Page.frameDetached", detach);
+			// No other frame ids, URLs or payloads from the browser appear in the log.
+			console.log(
+				"[fixture menu diagnostic] " +
+					JSON.stringify({
+						label,
+						owner: owner ?? "unobserved",
+						phases,
+						events: events.filter(event => event.frame === owner),
+					}),
+			);
+		},
+	};
+}
+
 /** Sample only the exact disposable menu target on a slow reply. This is never a pass condition. */
-async function sampleFixtureMenuFrame(page: Page, local: CDPSession, url: string, deadline: number): Promise<string> {
+async function sampleFixtureMenuFrame(
+	page: Page,
+	local: CDPSession,
+	url: string,
+	deadline: number,
+	trace?: FixtureMenuTrace,
+): Promise<string> {
 	const options = () => ({ timeout: Math.max(1, Math.ceil(deadline - performance.now())) });
 	const describeFrame = (frame: Protocol.Page.Frame) =>
 		frame.unreachableUrl
@@ -448,10 +547,12 @@ async function sampleFixtureMenuFrame(page: Page, local: CDPSession, url: string
 		const { root } = await local.send("DOM.getDocument", { depth: -1, pierce: true }, options());
 		const owner = fixtureFrameNode(root, url, "VAULT-MENU");
 		if (!owner?.frameId) return "no-owner";
+		trace?.setOwner(owner.frameId);
 		const { frameTree } = await local.send("Page.getFrameTree", undefined, options());
 		const queue = [...(frameTree.childFrames ?? [])];
 		for (const tree of queue) {
 			if (tree.frame.id === owner.frameId) {
+				trace?.sample(tree.frame, "parent-tree");
 				const state = describeFrame(tree.frame);
 				const attributes =
 					owner.contentDocument?.children?.find(node => node.nodeName === "HTML")?.attributes ?? [];
@@ -475,6 +576,7 @@ async function sampleFixtureMenuFrame(page: Page, local: CDPSession, url: string
 				if (performance.now() >= deadline) return "sample-timeout";
 				const { frameTree: childTree } = await child.send("Page.getFrameTree", undefined, options());
 				if (childTree.frame.id !== owner.frameId) return "target-frame-id-mismatch";
+				trace?.sample(childTree.frame, "iframe-tree");
 				const state = describeFrame(childTree.frame);
 				if (state !== "expected-menu") return state;
 				const { result } = await child.send(
@@ -498,7 +600,12 @@ async function sampleFixtureMenuFrame(page: Page, local: CDPSession, url: string
 }
 
 /** Challenge the exact live fixture document, then snapshot its closed-shadow iframe through native CDP. */
-async function observeFixtureMenu(page: Page, url: string, phase: string): Promise<FixtureMenuObservation> {
+async function observeFixtureMenu(
+	page: Page,
+	url: string,
+	phase: string,
+	trace?: FixtureMenuTrace,
+): Promise<FixtureMenuObservation> {
 	return await withFixtureObserver(await page.createCDPSession(), async cdp => {
 		const deadline = performance.now() + 7_500;
 		const options = () => ({ timeout: Math.max(1, Math.ceil(deadline - performance.now())) });
@@ -532,7 +639,11 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 					options(),
 				);
 				if (exceptionDetails) throw new Error(exceptionDetails.text);
-				progress = result.value as FixtureMenuProgress | undefined;
+				const next = result.value as FixtureMenuProgress | undefined;
+				if (!progress && next && trace) {
+					trace.phase(next.visibility === "hidden" ? "visibility-hidden" : "visibility-not-hidden");
+				}
+				progress = next;
 				const documentId = progress?.reply?.startsWith(prefix) && progress.reply.slice(prefix.length);
 				if (documentId) {
 					const { root } = await cdp.send("DOM.getDocument", { depth: -1, pierce: true }, options());
@@ -540,6 +651,7 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 					if (!node?.frameId || !node.attributes?.length) {
 						throw new Error("Reply received, but the fixture iframe owner is missing");
 					}
+					trace?.setOwner(node.frameId);
 					return {
 						attributes: node.attributes,
 						backendNodeId: node.backendNodeId,
@@ -556,6 +668,7 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 						cdp,
 						url,
 						Math.min(deadline, performance.now() + 400),
+						trace,
 					);
 				}
 				await Bun.sleep(Math.min(25, options().timeout));
@@ -857,8 +970,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 		}
 	}, 60_000);
 
-	it("does not change either fixture extension menu when the relay borrows a tab", async () => {
-		const vaultDir = await writeStandInVault(
+	function writeStandInMenuVault(): Promise<string> {
+		return writeStandInVault(
 			`const menuUrl = chrome.runtime.getURL("menu.html");
 const menuOrigin = "chrome-extension://" + chrome.runtime.id;
 let menu;
@@ -911,6 +1024,87 @@ document.addEventListener("omp-fixture-show-menu", () => {
 });
 document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 		);
+	}
+
+	async function showFixtureMenu(
+		page: Page,
+		menu: string,
+		phase: string,
+		nativeTrace?: "hidden-unclaimed" | "hidden-borrowed",
+	): Promise<FixtureMenuObservation> {
+		const diagnostics = nativeTrace ? startFixtureMenuTrace(page, menu, nativeTrace) : undefined;
+		try {
+			try {
+				await page.waitForFunction("document.documentElement.hasAttribute('data-omp-fixture-menu-ready')", {
+					polling: 25,
+					timeout: 5_000,
+				});
+			} catch (cause) {
+				throw new Error(`Fixture menu content script did not become ready (${phase})`, { cause });
+			}
+			diagnostics?.trace.phase("content-script-ready");
+			const mounted = await page.evaluate(`(() => {
+	document.dispatchEvent(new Event("omp-fixture-show-menu"));
+	return !!document.querySelector("vault-menu");
+})()`);
+			if (!mounted) throw new Error(`Fixture menu trigger did not mount its host (${phase})`);
+			diagnostics?.trace.phase("mounted");
+			const observation = await observeFixtureMenu(page, menu, phase, diagnostics?.trace);
+			diagnostics?.trace.phase("exact-menu-replied");
+			return observation;
+		} finally {
+			try {
+				diagnostics?.finish();
+			} catch {
+				// Diagnostics must not hide the original result or error.
+			}
+		}
+	}
+
+	// A fresh matching profile is not connected to a relay browser client. Its result
+	// is diagnostic evidence only and cannot replace the borrowed production assertion.
+	it("samples a hidden unclaimed menu before any relay client (diagnostic control)", async () => {
+		const vaultDir = await writeStandInMenuVault();
+		let fixture: RelayFixture | undefined;
+		let phase = "start-fixture";
+		try {
+			fixture = await launchRelayFixture(undefined, [vaultDir]);
+			const vaultId = fixture.extensionIds.get(vaultDir);
+			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
+			const menu = `chrome-extension://${vaultId}/menu.html`;
+			phase = "navigate-control-pages";
+			const driven = await fixture.browser.newPage();
+			await driven.goto(`${fixture.origin}/login?who=driven`);
+			const user = await fixture.browser.newPage();
+			await user.goto(`${fixture.origin}/login?who=user`);
+			await user.bringToFront();
+			phase = "user-control-menu";
+			await showFixtureMenu(user, menu, phase);
+			const hidden = () => driven.evaluate("document.visibilityState === 'hidden'");
+			if (!(await hidden())) {
+				console.log("[fixture menu diagnostic] hidden-unclaimed control ineligible: driven page is not hidden");
+				return;
+			}
+			phase = "hidden-unclaimed-menu";
+			await showFixtureMenu(driven, menu, phase, "hidden-unclaimed");
+			console.log(
+				(await hidden())
+					? "[fixture menu diagnostic] hidden-unclaimed control answered while hidden"
+					: "[fixture menu diagnostic] hidden-unclaimed control ineligible: visibility changed",
+			);
+		} catch {
+			console.log(`[fixture menu diagnostic] hidden-unclaimed control did not complete: ${phase}`);
+		} finally {
+			try {
+				await fixture?.close();
+			} finally {
+				await fs.rm(vaultDir, { recursive: true, force: true });
+			}
+		}
+	}, 60_000);
+
+	it("does not change either fixture extension menu when the relay borrows a tab", async () => {
+		const vaultDir = await writeStandInMenuVault();
 		const fixture = await launchRelayFixture(undefined, [vaultDir]);
 		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
 		const name = `relay-vault-${process.pid}`;
@@ -918,22 +1112,6 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			const vaultId = fixture.extensionIds.get(vaultDir);
 			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
 			const menu = `chrome-extension://${vaultId}/menu.html`;
-			const showMenu = async (page: Page, phase: string): Promise<FixtureMenuObservation> => {
-				try {
-					await page.waitForFunction("document.documentElement.hasAttribute('data-omp-fixture-menu-ready')", {
-						polling: 25,
-						timeout: 5_000,
-					});
-				} catch (cause) {
-					throw new Error(`Fixture menu content script did not become ready (${phase})`, { cause });
-				}
-				const mounted = await page.evaluate(`(() => {
-	document.dispatchEvent(new Event("omp-fixture-show-menu"));
-	return !!document.querySelector("vault-menu");
-})()`);
-				if (!mounted) throw new Error(`Fixture menu trigger did not mount its host (${phase})`);
-				return await observeFixtureMenu(page, menu, phase);
-			};
 			const driven = await fixture.browser.newPage();
 			await driven.goto(`${fixture.origin}/login?who=driven`);
 			const user = await fixture.browser.newPage();
@@ -941,12 +1119,12 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			await user.goto(userUrl);
 			// Set the fixture's user tab active before borrowing; never activate the driven tab.
 			await user.bringToFront();
-			const userMenu = await showMenu(user, "user tab before borrow");
+			const userMenu = await showFixtureMenu(user, menu, "user tab before borrow");
 			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
 			expect(await chromeTab(fixture, chromeTabId(tab.targetId))).toEqual({ active: false });
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
 			// Trigger the real fixture UI only after borrow, through the independent Chrome connection.
-			const drivenMenu = await showMenu(driven, "driven tab after borrow");
+			const drivenMenu = await showFixtureMenu(driven, menu, "driven tab after borrow", "hidden-borrowed");
 			expect(drivenMenu.documentId).not.toBe(userMenu.documentId);
 			await checkTitleWithoutHidingFrame(name, "Login driven");
 			expect(await observeFixtureMenu(driven, menu, "driven tab after relay read")).toEqual(drivenMenu);
