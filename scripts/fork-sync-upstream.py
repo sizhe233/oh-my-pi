@@ -23,6 +23,15 @@ DESTINATION = "sizhe233/oh-my-pi"
 WORKFLOWS = ".github/workflows"
 MANIFEST = ".github/upstream-sync.json"
 RESOLUTIONS = ".github/upstream-resolutions"
+# v19 has a preserved executable and two upstream deletions. These are not
+# generic privileges for future releases or for any other product path.
+V19_RESOLUTION_RELEASE = ("v19.0.1", "f40f335845f0b136453d12fec8d6057011082766")
+V19_EXECUTABLE = "packages/coding-agent/src/cli.ts"
+V19_SORT_RENAME = ("crates/pi-builtins/src/sort.rs", "crates/builtins/src/sort.rs")
+V19_DELETIONS = frozenset((
+    "crates/pi-shell/src/shell.rs",
+    "packages/coding-agent/test/tools/browser-shared-wedge.test.ts",
+))
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 TAG_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -94,7 +103,7 @@ def restore_workflows(base: str) -> None:
         raise RuntimeError("Fork workflow boundary changed")
 
 
-def tree_file(revision: str, path: str) -> tuple[str, str] | None:
+def tree_file(revision: str, path: str, *, expected_mode: str = "100644") -> tuple[str, str] | None:
     """Inspect literal Git paths, never dereference a checkout symlink."""
     entries = git("ls-tree", "-z", revision, "--", f":(literal){path}").stdout.split("\0")
     entries = [entry for entry in entries if entry]
@@ -104,8 +113,8 @@ def tree_file(revision: str, path: str) -> tuple[str, str] | None:
         raise ValueError(f"Ambiguous reviewed resolution path: {path}")
     metadata, name = entries[0].split("\t", 1)
     mode, kind, blob = metadata.split()
-    if name != path or kind != "blob" or mode != "100644" or not SHA_PATTERN.fullmatch(blob):
-        raise ValueError(f"Reviewed resolution requires a regular 100644 blob: {path}")
+    if name != path or kind != "blob" or mode != expected_mode or not SHA_PATTERN.fullmatch(blob):
+        raise ValueError(f"Reviewed resolution requires a regular {expected_mode} blob: {path}")
     return mode, blob
 
 
@@ -138,11 +147,25 @@ def load_resolutions(base: str, upstream_sha: str, merge_base: str, tag: str) ->
         if path in paths:
             raise ValueError(f"Duplicate reviewed resolution path: {path}")
         paths.add(path)
-        for revision, key in ((merge_base, "mergeBaseBlob"), (base, "forkBlob"), (upstream_sha, "upstreamBlob")):
+        records, output_mode = resolution_layout(data, path)
+        for stage, revision in (("1", merge_base), ("2", base), ("3", upstream_sha)):
+            key = RESOLUTION_STAGES[stage]
             blob = entry[key]
-            if not isinstance(blob, str) or not SHA_PATTERN.fullmatch(blob) or tree_file(revision, path) != ("100644", blob):
-                raise ValueError(f"Reviewed resolution input pin mismatch: {path} ({key})")
-        check_reviewed_content(entry)
+            mode = records.get(stage)
+            if mode is None:
+                if blob is not None or tree_file(revision, path) is not None:
+                    raise ValueError(f"Reviewed deletion input pin mismatch: {path} ({key})")
+            else:
+                pin_path = resolution_pin_path(data, stage, path)
+                if (not isinstance(blob, str) or not SHA_PATTERN.fullmatch(blob)
+                        or tree_file(revision, pin_path, expected_mode=mode) != (mode, blob)
+                        or (pin_path != path and tree_file(revision, path) is not None)):
+                    raise ValueError(f"Reviewed resolution input pin mismatch: {path} ({key})")
+        if output_mode is None:
+            if entry["content"] is not None or entry["resolvedSha256"] is not None:
+                raise ValueError(f"Reviewed deletion cannot write replacement bytes: {path}")
+        else:
+            check_reviewed_content(entry)
     tests = data.get("postMergeTests", [])
     if not isinstance(tests, list):
         raise ValueError("Invalid reviewed post-merge tests")
@@ -161,6 +184,33 @@ def load_resolutions(base: str, upstream_sha: str, merge_base: str, tag: str) ->
     return source[1], data
 
 
+RESOLUTION_STAGES = {
+    "1": "mergeBaseBlob",
+    "2": "forkBlob",
+    "3": "upstreamBlob",
+}
+
+
+def resolution_layout(review: dict, path: str) -> tuple[dict[str, str], str | None]:
+    if (review.get("releaseTag"), review.get("upstreamSha")) == V19_RESOLUTION_RELEASE:
+        if path == V19_EXECUTABLE:
+            return dict.fromkeys(RESOLUTION_STAGES, "100755"), "100755"
+        if path in V19_DELETIONS:
+            return {"1": "100644", "2": "100644"}, None
+    return dict.fromkeys(RESOLUTION_STAGES, "100644"), "100644"
+
+
+def resolution_pin_path(review: dict, stage: str, path: str) -> str:
+    # Git places the common ancestor and fork's sort blobs under the new filename
+    # in the conflict index. Pin them at their literal old tree path on those two
+    # exact parents; the upstream tree and output still use the new filename.
+    old, new = V19_SORT_RENAME
+    if ((review["releaseTag"], review["upstreamSha"]) == V19_RESOLUTION_RELEASE
+            and path == new and stage in ("1", "2")):
+        return old
+    return path
+
+
 def check_reviewed_content(entry: dict) -> None:
     content, digest = entry["content"], entry["resolvedSha256"]
     if (not isinstance(content, str) or "\0" in content or not isinstance(digest, str)
@@ -169,15 +219,16 @@ def check_reviewed_content(entry: dict) -> None:
         raise ValueError(f"Reviewed resolution content hash mismatch: {entry['path']}")
 
 
-def check_checkout_file(path: str) -> None:
+def check_checkout_file(path: str, *, executable: bool = False) -> None:
     destination = Path(path)
     for component in (*reversed(destination.parents), destination):
         mode = component.lstat().st_mode
         if stat.S_ISLNK(mode):
             raise RuntimeError(f"Refusing a symlink in reviewed resolution path: {path}")
         if component == destination:
-            if not stat.S_ISREG(mode) or mode & 0o111:
-                raise RuntimeError(f"Reviewed resolution requires a non-executable regular file: {path}")
+            if not stat.S_ISREG(mode) or bool(mode & 0o111) != executable:
+                qualifier = "executable" if executable else "non-executable"
+                raise RuntimeError(f"Reviewed resolution requires a {qualifier} regular file: {path}")
         elif not stat.S_ISDIR(mode):
             raise RuntimeError(f"Invalid reviewed resolution directory: {path}")
 
@@ -193,8 +244,8 @@ def apply_resolutions(review: dict | None, conflicts: list[str]) -> list[str]:
     # Validate every stage and checkout component before writing any resolution.
     for entry in entries:
         path = entry["path"]
-        expected = {str(stage): ("100644", entry[key]) for stage, key in
-                    ((1, "mergeBaseBlob"), (2, "forkBlob"), (3, "upstreamBlob"))}
+        records, output_mode = resolution_layout(review, path)
+        expected = {stage: (mode, entry[RESOLUTION_STAGES[stage]]) for stage, mode in records.items()}
         actual = {}
         for record in git("ls-files", "--unmerged", "-z", "--", f":(literal){path}").stdout.split("\0"):
             if not record:
@@ -206,7 +257,7 @@ def apply_resolutions(review: dict | None, conflicts: list[str]) -> list[str]:
             actual[stage] = (mode, blob)
         if actual != expected:
             raise RuntimeError(f"Reviewed resolution conflict stages mismatch: {path}")
-        check_checkout_file(path)
+        check_checkout_file(path, executable=output_mode == "100755")
     tests = review.get("postMergeTests", [])
     for entry in tests:
         path = entry["path"]
@@ -216,10 +267,15 @@ def apply_resolutions(review: dict | None, conflicts: list[str]) -> list[str]:
         check_checkout_file(path)
     for entry in [*entries, *tests]:
         path = entry["path"]
+        _, mode = resolution_layout(review, path)
+        if mode is None:
+            Path(path).unlink()
+            git("update-index", "--force-remove", "--", path)
+            continue
         Path(path).write_bytes(entry["content"].encode("utf-8"))
         # Bypass attributes/clean filters: the exact reviewed bytes are the blob.
         blob = git("hash-object", "-w", "--no-filters", "--", path).stdout.strip()
-        git("update-index", "--add", "--cacheinfo", "100644", blob, path)
+        git("update-index", "--add", "--cacheinfo", mode, blob, path)
     return sorted(conflicts)
 
 
