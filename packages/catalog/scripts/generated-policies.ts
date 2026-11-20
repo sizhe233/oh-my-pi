@@ -83,7 +83,9 @@ export function rebakeModelThinking(model: ModelSpec<Api>): void {
 	if (
 		model.compat &&
 		"thinkingFormat" in model.compat &&
-		model.compat.thinkingFormat === "chat-template" &&
+		// These wire formats carry provider-authored controls that cannot be
+		// recovered from model identity (including Kimi's live effort ladder).
+		(model.compat.thinkingFormat === "chat-template" || model.compat.thinkingFormat === "kimi") &&
 		model.thinking
 	)
 		return;
@@ -260,9 +262,5 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 	if (model.provider === "alibaba-token-plan") {
 		const reference = seedModels("alibaba-token-plan").find(candidate => candidate.id === model.id);
 		if (reference) model.name = reference.name;
-	}
-
-	if (model.provider === "ollama-cloud") {
-		model.omitMaxOutputTokens = true;
 	}
 }

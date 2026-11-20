@@ -3,8 +3,8 @@ import { captureScreenshotBuffer } from "@oh-my-pi/pi-coding-agent/tools/browser
 import {
 	describeInflight,
 	describeScreenshot,
-	type InflightOp,
 	preparePageForScreenshot,
+	type InflightOp,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 
 type ScreenshotPage = Parameters<typeof preparePageForScreenshot>[0];
@@ -43,7 +43,7 @@ describe("browser op tracking — timeout diagnostics", () => {
 });
 
 describe("browser screenshot activation", () => {
-	it("activates owned targets before capture", async () => {
+	it("can explicitly activate a target when requested by its caller", async () => {
 		let activations = 0;
 		const page = {
 			bringToFront: async () => {
@@ -57,6 +57,20 @@ describe("browser screenshot activation", () => {
 		await preparePageForScreenshot(page as ScreenshotPage, undefined, true);
 
 		expect(activations).toBe(1);
+	});
+
+	it("permits capture preparation for an owned background page without activation", async () => {
+		const page = {
+			bringToFront: async () => {
+				throw new Error("unexpected activation");
+			},
+			evaluate: async () => {
+				throw new Error("owned page visibility is not required");
+			},
+		};
+		await expect(
+			preparePageForScreenshot(page as ScreenshotPage, undefined, false, { requireVisible: false }),
+		).resolves.toBeUndefined();
 	});
 
 	it("leaves a visible user-driven target in place", async () => {

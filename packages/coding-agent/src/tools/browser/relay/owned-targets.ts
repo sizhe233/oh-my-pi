@@ -10,16 +10,18 @@
  * runtime dir) so a later omp process can close them once their creator has
  * died without running its own cleanup (crash, TerminateProcess, SIGKILL).
  */
-import { getGlobalDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
+import { createHash } from "node:crypto";
+import { daemonDir } from "../../../daemon/paths";
 import type { SharedTargetScope } from "../orphan-registry";
-import { RELAY_BROKER_SCOPE } from "./daemon";
 
 const ROOT_COMMAND_TIMEOUT_MS = 5_000;
 
 /** Durable-ownership scope for omp-created tabs behind one relay endpoint. */
 export function relayTargetScope(cdpUrl: string): SharedTargetScope {
-	const runtimeDir = getGlobalDaemonRuntimeDir(RELAY_BROKER_SCOPE);
-	const endpoint = new URL(cdpUrl).host.replace(/[^a-z0-9.-]/gi, "_");
+	const runtimeDir = daemonDir();
+	const url = new URL(cdpUrl);
+	// Include origin and discovery path; never put endpoint credentials in the filename.
+	const endpoint = createHash("sha256").update(url.origin + url.pathname + url.search).digest("hex").slice(0, 32);
 	return { projectDir: runtimeDir, runtimeDir, daemonName: `omp.browser.relay-${endpoint}` };
 }
 
@@ -83,8 +85,8 @@ export async function closeRelayTarget(wsEndpoint: string, targetId: string): Pr
  */
 export async function closeRelayOwnedTarget(wsEndpoint: string, targetId: string): Promise<boolean> {
 	try {
-		await sendRootCommand(wsEndpoint, "OMP.closeOwnedTarget", { targetId });
-		return true;
+		const result = await sendRootCommand(wsEndpoint, "OMP.closeOwnedTarget", { targetId });
+		return result.resolved === true;
 	} catch {
 		return false;
 	}

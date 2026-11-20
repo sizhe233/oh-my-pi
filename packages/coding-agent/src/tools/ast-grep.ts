@@ -18,15 +18,23 @@ import { ensureGrammar, missingGrammarsNote, rerunWithGrammars } from "../utils/
 import type { ToolSession } from ".";
 import { resolveToolTier } from "./approval";
 import { materializeReadUrlToFile, parseReadUrlTarget } from "./fetch";
-import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file-recorder";
+import { createFileRecorder, formatResultPath, resultSnapshotPath, targetResultBase } from "./file-recorder";
 import { type FileMatchSection, formatFileMatches } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
 
-import { relativeSearchResultPath, resolveSearchResultPath, resolveToolSearchScope } from "./path-utils";
+import {
+	parseSearchPath,
+	relativeSearchResultPath,
+	resolveSearchResultPath,
+	resolveToolSearchScope,
+	searchPathTier,
+} from "./path-utils";
+import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isRawSelector } from "./read-selector";
 import { capParseErrors, formatCodeFrameLine, formatParseErrors } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { singleLine } from "@oh-my-pi/pi-tui/utils";
 import { toolResult } from "./tool-result";
 
 import { cfgTaskDisabledAgents } from "../task/settings";
@@ -113,8 +121,9 @@ async function runMultiTargetAstGrep(
 		limitReached = limitReached || targetResult.limitReached;
 		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
 		for (const language of targetResult.missingGrammars ?? []) missingGrammars.add(language);
+		const resultBase = await targetResultBase(target.basePath);
 		for (const match of targetResult.matches) {
-			const absolute = resolveSearchResultPath(target.basePath, match.path);
+			const absolute = resolveSearchResultPath(resultBase, match.path);
 			const rebased = relativeSearchResultPath(options.commonBasePath, absolute);
 			retainAstFindMatch(retainedMatches, retainedCapacity, { ...match, path: rebased });
 		}
@@ -135,9 +144,16 @@ async function runMultiTargetAstGrep(
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
 	readonly name = "ast_grep";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	/** `always-ask-cached` keys: the tree (or file) of every root it searches, as `grep` reports them. */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined =>
+		searchApprovalCacheTargets(
+			toPathList((args as { path?: string } | null | undefined)?.path),
+			this.session.cwd,
+			entry => parseSearchPath(entry).basePath,
+		);
 	readonly label = "AST Grep";
-	readonly summary = "Search code with AST patterns (structural grep)";
+	readonly summary = "Search code with AST patterns (SHOULD be preferred for structural search)";
 	get description(): string {
 		const eagerDelegation = sessionDelegationBias(this.session) === "eager";
 		const scoutAvailable = isScoutSpawnable(
@@ -345,7 +361,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 							.map(([key, value]) => `${key}=${value}`)
 							.join(", ");
 						modelOut.push(`  meta: ${serializedMeta}`);
-						displayOut.push(`  meta: ${serializedMeta}`);
+						// A capture can span lines; its display row stays one row, so the
+						// renderer can tell it from the match's code frames and file headers.
+						displayOut.push(`  meta: ${singleLine(serializedMeta)}`);
 					}
 					fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
 				}
@@ -372,7 +390,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				displayContent: displayLines.join("\n"),
 			};
 			if (result.limitReached) {
-				outputLines.push("", "Result limit reached; narrow path or increase limit.");
+				outputLines.push("", "Result limit reached; narrow path or use skip to page through results.");
 			}
 			if (cappedParseErrors.length) {
 				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
