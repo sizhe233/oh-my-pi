@@ -9,7 +9,7 @@ import {
 	ensureChromiumExecutable,
 	RENDERER_PRIORITY_ARGS,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
-import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import { acquireBrowser, type BrowserHandle, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { unpackedExtensionId } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
@@ -1030,7 +1030,7 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 		page: Page,
 		menu: string,
 		phase: string,
-		nativeTrace?: "hidden-unclaimed" | "hidden-borrowed",
+		nativeTrace?: string,
 	): Promise<FixtureMenuObservation> {
 		const diagnostics = nativeTrace ? startFixtureMenuTrace(page, menu, nativeTrace) : undefined;
 		try {
@@ -1061,44 +1061,93 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 		}
 	}
 
-	// A fresh matching profile is not connected to a relay browser client. Its result
-	// is diagnostic evidence only and cannot replace the borrowed production assertion.
-	it("samples a hidden unclaimed menu before any relay client (diagnostic control)", async () => {
+	type RegistryMenuArm = "before-acquire-browser" | "after-acquire-browser";
+
+	/** Sequential arms, fresh pages in the same disposable profile; never borrow either page. */
+	async function sampleRegistryMenuPair(fixture: RelayFixture, menu: string, arm: RegistryMenuArm): Promise<void> {
+		const pages: Page[] = [];
+		const report = (phase: string, condition: string, visibility?: unknown) =>
+			console.log("[fixture menu comparator] " + JSON.stringify({ arm, phase, condition, visibility }));
+		try {
+			const driven = await fixture.browser.newPage();
+			pages.push(driven);
+			await driven.goto(`${fixture.origin}/login?who=driven`);
+			const user = await fixture.browser.newPage();
+			pages.push(user);
+			const userUrl = `${fixture.origin}/login?who=user`;
+			await user.goto(userUrl);
+			await user.bringToFront();
+			const readVisibility = async () => {
+				const [activeUrl, active, hidden] = await Promise.all([
+					activeChromeTabUrl(fixture),
+					user.evaluate(() => document.visibilityState),
+					driven.evaluate(() => document.visibilityState),
+				]);
+				return { userIsActive: activeUrl === userUrl, user: active, driven: hidden };
+			};
+			const eligible = (state: { userIsActive: boolean; user: string; driven: string }) =>
+				state.userIsActive && state.user === "visible" && state.driven === "hidden";
+			const observe = async (page: Page, phase: "visible-user-menu" | "hidden-driven-menu") => {
+				const before = await readVisibility();
+				if (!eligible(before)) {
+					report(phase, "ineligible-before-observation", { before });
+					return;
+				}
+				const label = `registry-comparator/${arm}/${phase}`;
+				let observed = "no-exact-observation";
+				try {
+					await showFixtureMenu(page, menu, label, label);
+					observed = "exact-menu-replied";
+				} catch {
+					// Trace phases retain the failure context without printing arbitrary browser errors.
+				}
+				const after = await readVisibility();
+				report(phase, eligible(after) ? observed : "ineligible-after-observation", {
+					before,
+					after,
+					observed,
+				});
+			};
+			await observe(user, "visible-user-menu");
+			await observe(driven, "hidden-driven-menu");
+		} catch {
+			report("page-setup-or-visibility", "could-not-complete");
+		} finally {
+			// Do not leave the first arm's foreign frames in registry discovery for the second arm.
+			await Promise.all(pages.map(page => page.close()));
+		}
+	}
+
+	// Diagnostic only: registry connection may attach to pages even without a named borrow.
+	// Same-profile sequencing controls for extension/profile identity, not warmup or order.
+	it("compares fresh fixture menus before and after a registry connection (diagnostic control)", async () => {
 		const vaultDir = await writeStandInMenuVault();
 		let fixture: RelayFixture | undefined;
-		let phase = "start-fixture";
+		let relay: BrowserHandle | undefined;
+		let phase: RegistryMenuArm | "start-fixture" | "acquire-browser" = "start-fixture";
 		try {
 			fixture = await launchRelayFixture(undefined, [vaultDir]);
 			const vaultId = fixture.extensionIds.get(vaultDir);
 			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
 			const menu = `chrome-extension://${vaultId}/menu.html`;
-			phase = "navigate-control-pages";
-			const driven = await fixture.browser.newPage();
-			await driven.goto(`${fixture.origin}/login?who=driven`);
-			const user = await fixture.browser.newPage();
-			await user.goto(`${fixture.origin}/login?who=user`);
-			await user.bringToFront();
-			phase = "user-control-menu";
-			await showFixtureMenu(user, menu, phase);
-			const hidden = () => driven.evaluate("document.visibilityState === 'hidden'");
-			if (!(await hidden())) {
-				console.log("[fixture menu diagnostic] hidden-unclaimed control ineligible: driven page is not hidden");
-				return;
-			}
-			phase = "hidden-unclaimed-menu";
-			await showFixtureMenu(driven, menu, phase, "hidden-unclaimed");
-			console.log(
-				(await hidden())
-					? "[fixture menu diagnostic] hidden-unclaimed control answered while hidden"
-					: "[fixture menu diagnostic] hidden-unclaimed control ineligible: visibility changed",
-			);
+			phase = "before-acquire-browser";
+			await sampleRegistryMenuPair(fixture, menu, phase);
+			phase = "acquire-browser";
+			relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+			console.log('[fixture menu comparator] {"phase":"acquire-browser","condition":"registry-connected"}');
+			phase = "after-acquire-browser";
+			await sampleRegistryMenuPair(fixture, menu, phase);
 		} catch {
-			console.log(`[fixture menu diagnostic] hidden-unclaimed control did not complete: ${phase}`);
+			console.log("[fixture menu comparator] " + JSON.stringify({ phase, condition: "could-not-complete" }));
 		} finally {
 			try {
-				await fixture?.close();
+				if (relay) await releaseBrowser(relay, { kill: false });
 			} finally {
-				await fs.rm(vaultDir, { recursive: true, force: true });
+				try {
+					await fixture?.close();
+				} finally {
+					await fs.rm(vaultDir, { recursive: true, force: true });
+				}
 			}
 		}
 	}, 60_000);
@@ -1119,7 +1168,7 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			await user.goto(userUrl);
 			// Set the fixture's user tab active before borrowing; never activate the driven tab.
 			await user.bringToFront();
-			const userMenu = await showFixtureMenu(user, menu, "user tab before borrow");
+			const userMenu = await showFixtureMenu(user, menu, "user tab before borrow", "visible-user-pre-borrow");
 			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
 			expect(await chromeTab(fixture, chromeTabId(tab.targetId))).toEqual({ active: false });
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
