@@ -438,15 +438,67 @@ return { errors, dropped: await tab.evaluate(() => window.dropped.map(file => fi
 			await fs.mkdir(path.join(folder, "nested"), { recursive: true });
 			await Bun.write(path.join(folder, "one.txt"), "one");
 			await Bun.write(path.join(folder, "nested", "two.txt"), "two");
-			expect(await run(collectErrors(`() => tab.uploadFile("#folder", "album"),`))).toEqual([]);
-			const received = await run(`return await tab.evaluate(() => Promise.all(
-	[...document.querySelector("#folder").files].map(async file => [file.webkitRelativePath, await file.text()]),
-).then(files => files.sort()));`);
-			// Chrome expands a folder path into its files, as it does for a user's pick of that folder.
-			expect(received).toEqual([
-				["album/nested/two.txt", "two"],
-				["album/one.txt", "one"],
-			]);
+			const postUpload = await run(`await tab.evaluate(() => {
+	const input = document.querySelector("#folder");
+	const isOriginalInput = () => input instanceof HTMLInputElement && input.isConnected &&
+		document.querySelector("#folder") === input && input.type === "file" && input.webkitdirectory;
+	if (!isOriginalInput() || input.files.length !== 0) throw new Error("Expected the original empty directory input");
+	const files = () => [...(input.files ?? [])];
+	const { promise: change, resolve } = Promise.withResolvers();
+	let changeSeen = false;
+	input.addEventListener("change", event => {
+		changeSeen = true;
+		resolve({
+			trusted: event.isTrusted && event.target === input,
+			original: isOriginalInput(),
+			files: files(),
+		});
+	}, { once: true });
+	window.ompFolderUploadWitness = {
+		change,
+		isOriginalInput,
+		files,
+		snapshot: () => ({ changeSeen, original: isOriginalInput(), paths: files().map(file => file.webkitRelativePath).sort() }),
+	};
+});
+await tab.uploadFile("#folder", "album");
+return await tab.evaluate(() => window.ompFolderUploadWitness.snapshot());`);
+			const received = await run(`return await tab.evaluate(async () => {
+	const witness = window.ompFolderUploadWitness;
+	const { promise: deadline, resolve: expire } = Promise.withResolvers();
+	const timer = setTimeout(() => expire(null), 5000);
+	let selection;
+	try {
+		selection = await Promise.race([witness.change, deadline]);
+	} finally {
+		clearTimeout(timer);
+	}
+	if (!selection) throw new Error("No change event on the original directory input within 5s: " + JSON.stringify(witness.snapshot()));
+	if (!selection.trusted || !selection.original || !witness.isOriginalInput()) {
+		throw new Error("Expected a native change event on the original directory input");
+	}
+	const readFiles = files => Promise.all(files.map(async file => [
+		file.webkitRelativePath,
+		[...new Uint8Array(await file.arrayBuffer())],
+	])).then(rows => rows.sort());
+	const [eventFiles, currentFiles] = await Promise.all([readFiles(selection.files), readFiles(witness.files())]);
+	if (!witness.isOriginalInput()) throw new Error("Directory input was replaced while reading its files");
+	return { eventFiles, currentFiles };
+});`);
+			// Chrome expands a directory asynchronously; the immediate post-return sample is diagnostic only.
+			const expected = [
+				["album/nested/two.txt", [116, 119, 111]],
+				["album/one.txt", [111, 110, 101]],
+			];
+			expect(received, `Immediately after uploadFile: ${JSON.stringify(postUpload)}`).toEqual({
+				eventFiles: expected,
+				currentFiles: expected,
+			});
+			if (!(postUpload as { changeSeen: boolean }).changeSeen) {
+				console.log(
+					`[folder upload] change completed after the immediate post-return read: ${JSON.stringify(postUpload)}`,
+				);
+			}
 		} finally {
 			await close();
 		}
