@@ -1,9 +1,16 @@
-import { type AgentMessage, ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD } from "@oh-my-pi/pi-agent-core";
-import { logger } from "@oh-my-pi/pi-utils";
+import {
+	type AgentMessage,
+	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DISCARD,
+	ASIDE_MESSAGE_REFRESH,
+} from "@oh-my-pi/pi-agent-core";
+import { logger, toError } from "@oh-my-pi/pi-utils";
 
 export interface YieldDispatcher<P> {
 	/** Drop entries already delivered through another path. Called per-entry at flush time. */
 	isStale?(entry: P): boolean;
+	/** Rebuild this batch if any such entry was drained before an asynchronous commit boundary. */
+	refreshBeforeCommit?(entry: P): boolean;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 	/** If true, entries for this kind are drained only by {@link drainLazy} and never trigger the idle flush. */
@@ -21,6 +28,7 @@ type YieldFlushMode = "streaming" | "idle";
 
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
+	refreshBeforeCommit?: (entry: unknown) => boolean;
 	build: (survivors: unknown[]) => AgentMessage | null;
 	skipIdleFlush?: boolean;
 }
@@ -69,6 +77,9 @@ export class YieldQueue {
 	register<P>(kind: string, dispatcher: YieldDispatcher<P>): () => void {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
+			...(dispatcher.refreshBeforeCommit
+				? { refreshBeforeCommit: entry => dispatcher.refreshBeforeCommit?.(entry as P) ?? false }
+				: {}),
 			build: survivors => dispatcher.build(survivors as P[]),
 			...(dispatcher.skipIdleFlush ? { skipIdleFlush: true } : {}),
 		};
@@ -166,7 +177,7 @@ export class YieldQueue {
 					this.#options.injectStreaming(built.message);
 					this.#resolveEntries(built.entries);
 				} catch (error) {
-					const dispatchError = error instanceof Error ? error : new Error(String(error));
+					const dispatchError = toError(error);
 					this.#rejectEntries(built.entries, dispatchError);
 					logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
 				}
@@ -182,7 +193,7 @@ export class YieldQueue {
 					(item.message as AgentMessage & { [ASIDE_MESSAGE_COMMIT]?: () => void })[ASIDE_MESSAGE_COMMIT]?.();
 				}
 			} catch (error) {
-				const dispatchError = error instanceof Error ? error : new Error(String(error));
+				const dispatchError = toError(error);
 				for (const item of idleMessages) {
 					(item.message as AgentMessage & { [ASIDE_MESSAGE_DISCARD]?: (error: Error) => void })[
 						ASIDE_MESSAGE_DISCARD
@@ -210,10 +221,36 @@ export class YieldQueue {
 				const built = this.#build(kind, dispatcher, entries);
 				if (!built) return null;
 				this.#attachEntrySettlement(built);
+				if (
+					dispatcher.refreshBeforeCommit &&
+					built.entries.some(entry => dispatcher.refreshBeforeCommit!(entry.value))
+				) {
+					Object.defineProperty(built.message, ASIDE_MESSAGE_REFRESH, {
+						value: () => {
+							const fresh = this.#build(kind, dispatcher, built.entries);
+							if (!fresh) return null;
+							this.#attachEntrySettlement(fresh);
+							return fresh.message;
+						},
+					});
+				}
 				return built.message;
 			});
 		}
 		return thunks;
+	}
+
+	/** Discard only matching receipts still queued for this kind. */
+	discardWhere<P>(kind: string, predicate: (entry: P) => boolean): void {
+		const entries = this.#entries.get(kind);
+		if (!entries) return;
+		const discarded = entries.filter(entry => predicate(entry.value as P));
+		if (discarded.length === 0) return;
+		const discardedSet = new Set(discarded);
+		const retained = entries.filter(entry => !discardedSet.has(entry));
+		if (retained.length > 0) this.#entries.set(kind, retained);
+		else this.#entries.delete(kind);
+		this.#rejectEntries(discarded, new Error(`Yield queue entries discarded before dispatch: ${kind}`));
 	}
 
 	/** Drop queued entries. With `kind`, drop only that kind's entries (leaving
@@ -265,7 +302,7 @@ export class YieldQueue {
 				try {
 					stale = dispatcher.isStale(entry.value);
 				} catch (error) {
-					const staleError = error instanceof Error ? error : new Error(String(error));
+					const staleError = toError(error);
 					entry.reject?.(staleError);
 					logger.warn("Yield queue stale check failed", { kind, error: formatError(error) });
 					continue;
@@ -286,7 +323,7 @@ export class YieldQueue {
 			}
 			return { message, entries: survivors };
 		} catch (error) {
-			const buildError = error instanceof Error ? error : new Error(String(error));
+			const buildError = toError(error);
 			this.#rejectEntries(survivors, buildError);
 			logger.warn("Yield queue build failed", { kind, error: formatError(error) });
 			return null;

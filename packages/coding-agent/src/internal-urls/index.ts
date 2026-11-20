@@ -9,7 +9,6 @@
  */
 
 export * from "./agent-protocol";
-export * from "./artifact-protocol";
 export * from "./attachment-protocol";
 export * from "./cfg-protocol";
 export * from "./conflict-protocol";
@@ -21,6 +20,7 @@ export * from "./mcp-protocol";
 export * from "./memory-protocol";
 export * from "./omp-protocol";
 export * from "./omp-scope";
+export * from "./out-protocol";
 export * from "./parse";
 export * from "./router";
 export * from "./rule-protocol";

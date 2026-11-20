@@ -2,16 +2,22 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, describe, expect, it, onTestFinished, spyOn } from "bun:test";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
-import { applyIgnoreHttpsErrors, resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
+import { resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
+import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { DownloadManager } from "@oh-my-pi/pi-coding-agent/tools/browser/downloads";
 import {
 	buildHeadlessLaunchArgs,
+	closeLaunchedBrowser,
+	ensureChromiumExecutable,
 	launchHeadlessBrowser,
+	loadPuppeteer,
+	privateTargetId,
+	RENDERER_PRIORITY_ARGS,
 	removeUserDataDir,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
@@ -19,12 +25,27 @@ import {
 	recordSharedTarget,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
-import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import {
+	acquireBrowser,
+	type BrowserHandle,
+	holdBrowser,
+	type PuppeteerBrowserHandle,
+	releaseBrowser,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
+import { startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 import * as relayOwnedTargets from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
-import { acquireTab, getTab, releaseAllTabs, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import {
+	acquireTab,
+	getTab,
+	releaseAllTabs,
+	releaseTab,
+	runInTab,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import type { Browser, Page, Target } from "puppeteer-core";
+import { CLAUDE_TRACE_DEBUG_CERT, CLAUDE_TRACE_DEBUG_KEY } from "@oh-my-pi/pi-coding-agent/cli/claude-trace-cli";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 import {
@@ -32,21 +53,97 @@ import {
 	type DownloadIsolationDiagnostics,
 } from "./download-isolation-diagnostics";
 
+async function launchIsolatedRelay(root: string, scope: SharedTargetScope) {
+	const port = await findFreeCdpPort();
+	const relay = startRelayServer({ port, group: false });
+	const extension = path.join(root, "extension");
+	const userDataDir = path.join(root, "profile");
+	let chrome: Browser | undefined;
+	let held: BrowserHandle | undefined;
+	let restoreScope: (() => void) | undefined;
+	let closing: Promise<void> | undefined;
+	const dispose = async () => {
+		try {
+			if (held) await releaseBrowser(held, { kill: false });
+		} finally {
+			try {
+				if (chrome) await closeLaunchedBrowser({ browser: chrome, userDataDir });
+			} finally {
+				restoreScope?.();
+				relay.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		}
+	};
+	const close = () => (closing ??= dispose());
+	try {
+		const assets = path.resolve(import.meta.dir, "../../src/tools/browser/relay/extension-assets");
+		for (const file of ["manifest.json", "options.html", "options.js"]) {
+			await Bun.write(path.join(extension, file), Bun.file(path.join(assets, `${file}.txt`)));
+		}
+		const bundle = await Bun.file(path.join(assets, "background.js.txt")).text();
+		const defaultPort = "var DEFAULT_PORT = 9224;";
+		if (!bundle.includes(defaultPort)) throw new Error("Relay extension default port not found");
+		await Bun.write(
+			path.join(extension, "background.js"),
+			bundle.replace(defaultPort, `var DEFAULT_PORT = ${port};`),
+		);
+		chrome = await (
+			await loadPuppeteer()
+		).launch({
+			executablePath: await ensureChromiumExecutable(),
+			headless: true,
+			pipe: true,
+			userDataDir,
+			enableExtensions: true,
+			args: [
+				"--no-sandbox",
+				"--no-first-run",
+				"--no-default-browser-check",
+				"--use-mock-keychain",
+				...RENDERER_PRIORITY_ARGS,
+			],
+		});
+		await chrome.installExtension(extension);
+		const cdpUrl = `http://127.0.0.1:${port}`;
+		const outcome = await waitForRelayExtension(cdpUrl);
+		if (outcome !== "ready") throw new Error(`Relay fixture handshake failed: ${outcome}`);
+		const scopeSpy = spyOn(relayOwnedTargets, "relayTargetScope").mockReturnValue(scope);
+		restoreScope = () => scopeSpy.mockRestore();
+		const handle = await acquireBrowser({ kind: "relay", cdpUrl }, { cwd: root });
+		// The fixture is the observer across open, release and rollback. Acquire
+		// does not take a reference; the fixture owns exactly this one hold.
+		holdBrowser(handle);
+		held = handle;
+		if (!("browser" in handle)) throw new Error("Expected Puppeteer relay");
+		expect(handle.refCount).toBe(1);
+		// Also release if caller-side setup fails before reaching its own finally.
+		onTestFinished(close);
+		return { browser: chrome, handle, close };
+	} catch (error) {
+		await close();
+		throw error;
+	}
+}
+
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const tempDirs: string[] = [];
 
-function browserHost(cwd: string = process.cwd()) {
+function browserHost(cwd: string = process.cwd(), settings: Record<string, unknown> = {}) {
 	const session: ToolSession = {
 		cwd,
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({
+			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+			"browser.webkit": false,
 			"browser.enabled": true,
 			"browser.headless": true,
 			"browser.cmux": false,
 			"browser.tern": false,
 			"tools.maxTimeout": 0,
+			...settings,
 		}),
 	};
 	const prelude = createBrowserPrelude(session);
@@ -65,37 +162,56 @@ afterAll(async () => {
 });
 
 describe("browser open options CDP helpers", () => {
-	it("sends the invalid-certificate override through CDP", async () => {
-		const args = buildHeadlessLaunchArgs(
-			{ width: 800, height: 600 },
-			{ ignoreHttpsErrors: true, allowFileAccess: true },
-		);
+	it("adds the per-open launch switches when requested", () => {
+		const args = buildHeadlessLaunchArgs({ width: 800, height: 600 }, { insecure: true });
 		expect(args).toContain("--hide-scrollbars");
-		expect(args).toContain("--enable-features=WebMCPTesting,DevToolsWebMCPSupport");
 		expect(args).toContain("--ignore-certificate-errors");
 		expect(args).toContain("--allow-file-access-from-files");
-		const calls: Array<{ method: string; params: unknown }> = [];
-		let detached = false;
-		const page = {
-			createCDPSession: async () => ({
-				send: async (method: string, params: unknown) => {
-					calls.push({ method, params });
-				},
-				detach: async () => {
-					detached = true;
-				},
-			}),
-		} as unknown as Page;
-
-		await applyIgnoreHttpsErrors(page);
-
-		expect(calls).toEqual([{ method: "Security.setIgnoreCertificateErrors", params: { ignore: true } }]);
-		expect(detached).toBe(true);
 	});
 
-	it("omits per-open launch switches unless requested", () => {
+	it("rejects insecure and a downloads folder on the relay before opening a tab", async () => {
+		// No relay listens here, so an option refused only after connecting fails differently, and no test reaches a real one.
+		const port = await findFreeCdpPort();
+		const host = browserHost(process.cwd(), { "browser.relayUrl": `http://127.0.0.1:${port}` });
+		for (const option of [{ insecure: true }, { downloads: "relay-downloads" }]) {
+			const name = `relay-option-${crypto.randomUUID()}`;
+			const error = await rejectionOf(host({ action: "open", name, app: "relay", ...option }));
+			expect(error).toBeInstanceOf(ToolError);
+			expect(error).toMatchObject({
+				message: expect.stringContaining(
+					"downloads" in option ? "cannot choose where Chrome saves downloads" : "Security domain",
+				),
+			});
+			expect(getTab(name)).toBeUndefined();
+		}
+	});
+
+	it("rejects browser-wide download and certificate overrides before creating a connected worker", async () => {
+		const browser = {} as Browser;
+		const handle: PuppeteerBrowserHandle = {
+			key: `connected-options-${crypto.randomUUID()}`,
+			kind: { kind: "connected", cdpUrl: "http://127.0.0.1:1" },
+			wsEndpoint: "ws://127.0.0.1:1/unused",
+			browser,
+			refCount: 1,
+			stealth: { browserSession: null, override: null },
+		};
+		// No browser methods or connection are available: these options must fail in the supervisor.
+		for (const option of [{ insecure: true }, { downloadsPath: "/unrequested-downloads" }]) {
+			const name = `connected-option-${crypto.randomUUID()}`;
+			const error = await rejectionOf(acquireTab(name, handle, { ...option, timeoutMs: 1000 }));
+			expect(error).toBeInstanceOf(ToolError);
+			expect(error).toMatchObject({
+				message: expect.stringMatching("downloadsPath" in option ? /download/i : /insecure|certificate/i),
+			});
+			expect(getTab(name)).toBeUndefined();
+			expect(handle.refCount).toBe(1);
+		}
+	});
+
+	it("enables file access always and certificate errors only when requested", () => {
 		const args = buildHeadlessLaunchArgs({ width: 800, height: 600 });
-		expect(args).not.toContain("--allow-file-access-from-files");
+		expect(args).toContain("--allow-file-access-from-files");
 		if (!process.env.PUPPETEER_PROXY_IGNORE_CERT_ERRORS) {
 			expect(args).not.toContain("--ignore-certificate-errors");
 		}
@@ -127,7 +243,7 @@ describe("browser open options CDP helpers", () => {
 		};
 		const browser = { target: () => ({ createCDPSession: async () => session }) } as unknown as Browser;
 		const page = { frames: () => [{ _id: "frame" }], browserContext: () => ({}) } as unknown as Page;
-		const downloads = new DownloadManager(browser, page, "tab", { perTab });
+		const downloads = new DownloadManager(browser, page, "tab", { perTab, pageEvents: false });
 		const complete = async (
 			guid: unknown,
 			filePath: string | undefined,
@@ -182,15 +298,29 @@ describe("browser open options CDP helpers", () => {
 		expect(await Bun.file(path.join(directory, "report.txt")).exists()).toBe(false);
 	});
 
-	it("leaves a directory named by a UUID GUID in place", async () => {
+	it("leaves a directory named by a UUID GUID in place and fails the wait, since no file was saved", async () => {
 		const { directory, elsewhere, complete } = await fakeDownloads();
 		const guid = crypto.randomUUID();
 		const folder = path.join(elsewhere, guid);
 		await Bun.write(path.join(folder, "notes.txt"), "notes");
 
-		expect(await complete(guid, folder)).toBe(folder);
+		const error = await rejectionOf(complete(guid, folder));
+		expect(error).toBeInstanceOf(ToolError);
+		expect((error as ToolError).message).toContain(`no file is at ${folder} on this machine`);
 		expect(await Bun.file(path.join(folder, "notes.txt")).text()).toBe("notes");
 		expect(await Bun.file(path.join(directory, "report.txt")).exists()).toBe(false);
+	});
+
+	// The wait gives Chromium's rename into place about a second before it fails.
+	it("fails the wait on a completed download whose file is not on this machine, as a remote browser's is", async () => {
+		const { directory, elsewhere, downloads, complete } = await fakeDownloads(async () => undefined, false);
+		const remote = path.join(elsewhere, "report.txt");
+
+		const error = await rejectionOf(complete(crypto.randomUUID(), remote));
+		expect(error).toBeInstanceOf(ToolError);
+		expect((error as ToolError).message).toContain(`no file is at ${remote} on this machine`);
+		expect(downloads.list()).toEqual([]);
+		expect(await fs.readdir(directory)).toEqual([]);
 	});
 
 	it("keeps a directory named like the download when the rename takes the Windows replacement path", async () => {
@@ -310,30 +440,109 @@ describe("browser open options CDP helpers", () => {
 		expect(await waiting).toBe(reason);
 		enabling.resolve();
 	});
+
+	/** A relay tab's downloads: page events on each frame's session, and `OMP.downloadPath` answered by `savedPath`. */
+	function fakePageDownloads(savedPath: (guid: string) => Promise<unknown>) {
+		const fakeSession = () => {
+			const listeners = new Map<string, (event: unknown) => void>();
+			return {
+				listeners,
+				on: (event: string, listener: (event: unknown) => void) => listeners.set(event, listener),
+				off: (event: string) => listeners.delete(event),
+				send: (_method: string, params: { guid: string }) => savedPath(params.guid),
+			};
+		};
+		const main = { _id: "main", client: fakeSession() };
+		const frame = { _id: "frame", client: fakeSession() };
+		const frames = [main, frame];
+		const pageListeners = new Map<string, () => void>();
+		const page = {
+			frames: () => frames,
+			mainFrame: () => main,
+			on: (event: string, listener: () => void) => pageListeners.set(event, listener),
+			off: (event: string) => pageListeners.delete(event),
+		} as unknown as Page;
+		const downloads = new DownloadManager({} as Browser, page, "tab", { perTab: false, pageEvents: true });
+		return { downloads, main, frame, frames, pageListeners };
+	}
+
+	it("fails the next wait on a relay download whose saved file was not found before any wait", async () => {
+		const asked = Promise.withResolvers<void>();
+		const { downloads, main } = fakePageDownloads(async () => {
+			asked.resolve();
+			throw new Error("the omp relay extension in this browser predates download tracking");
+		});
+		await downloads.start();
+		const guid = crypto.randomUUID();
+		main.client.listeners.get("Page.downloadWillBegin")!({
+			guid,
+			url: "https://example.com/r.csv",
+			suggestedFilename: "r.csv",
+			frameId: "main",
+		});
+		main.client.listeners.get("Page.downloadProgress")!({ guid, state: "completed", receivedBytes: 5 });
+		await asked.promise;
+		// Let the lookup's rejection settle before anything waits.
+		await Bun.sleep(0);
+		const error = await rejectionOf(downloads.wait());
+		expect(error).toBeInstanceOf(ToolError);
+		expect((error as ToolError).message).toContain("predates download tracking");
+		expect(downloads.list()).toEqual([]);
+	});
+
+	it("gives waiters relay downloads in the order they ended while a lookup is still out", async () => {
+		const saved = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-order-")), "a.csv");
+		tempDirs.push(path.dirname(saved));
+		await Bun.write(saved, "a");
+		const lookup = Promise.withResolvers<unknown>();
+		const { downloads, main } = fakePageDownloads(() => lookup.promise);
+		await downloads.start();
+		const first = downloads.wait();
+		const second = rejectionOf(downloads.wait());
+		const emit = (event: string, params: object) => main.client.listeners.get(`Page.${event}`)!(params);
+		for (const guid of ["a", "b"]) {
+			emit("downloadWillBegin", {
+				guid,
+				url: `https://example.com/${guid}.csv`,
+				suggestedFilename: guid,
+				frameId: "main",
+			});
+		}
+		emit("downloadProgress", { guid: "a", state: "completed", receivedBytes: 1 });
+		emit("downloadProgress", { guid: "b", state: "canceled", receivedBytes: 0 });
+		lookup.resolve({ filePath: saved });
+		expect((await first).path).toBe(saved);
+		expect(String(await second)).toContain("Download canceled: https://example.com/b.csv");
+	});
+
+	it("stops hearing a relay frame's session once the frame detaches", async () => {
+		const { downloads, frame, frames, pageListeners } = fakePageDownloads(async () => ({}));
+		await downloads.start();
+		expect([...frame.client.listeners.keys()]).toEqual(["Page.downloadWillBegin", "Page.downloadProgress"]);
+		frames.pop();
+		pageListeners.get("framedetached")!();
+		expect(frame.client.listeners.size).toBe(0);
+		await downloads.close();
+		expect(pageListeners.size).toBe(0);
+	});
 });
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 	it.each([false, true])(
-		"keeps user download names before and after relay worker recycle (ownsTarget=%s)",
-		async ownsTarget => {
-			// Real Chromium checks the browser-wide effect on an unrelated user page.
-			// A relay-kind fixture exercises the supervisor and worker policy, not
-			// the extension's grouping or minimized-window screenshot transport.
-			const launched = await launchHeadlessBrowser({ headless: true });
-			const browser = launched.browser;
+		"rejects relay download tracking without changing user download names before and after recycle (ownsPage=%s)",
+		async ownsPage => {
+			// This is an independent, disposable Chromium fixture. Its CDP observer alone
+			// seeds a download folder. The relay-kind worker must never set or disclose one.
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-download-policy-"));
-			const scope: SharedTargetScope = { projectDir: root, runtimeDir: root, daemonName: "relay-download" };
-			const scopeSpy = spyOn(relayOwnedTargets, "relayTargetScope").mockReturnValue(scope);
-			const name = `relay-download-${crypto.randomUUID()}`;
-			const cdpUrl = `http://${new URL(browser.wsEndpoint()).host}`;
-			const handle: PuppeteerBrowserHandle = {
-				key: name,
-				kind: { kind: "relay", cdpUrl },
-				cdpUrl,
-				browser,
-				refCount: 1,
-				stealth: { browserSession: null, override: null },
+			const directory = path.join(root, "user-downloads");
+			await fs.mkdir(directory);
+			const scope: SharedTargetScope = {
+				projectDir: root,
+				runtimeDir: root,
+				daemonName: "relay-download",
 			};
+			const name = `relay-download-${crypto.randomUUID()}`;
+			const { browser, handle, close } = await launchIsolatedRelay(root, scope);
 			const session: ToolSession = {
 				cwd: root,
 				hasUI: false,
@@ -341,17 +550,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				getSessionSpawns: () => "*",
 				settings: Settings.isolated({ "browser.enabled": true, "tools.maxTimeout": 0 }),
 			};
-			let gateReached = Promise.withResolvers<void>();
-			let gateOpened = Promise.withResolvers<void>();
 			const server = Bun.serve({
+				hostname: "127.0.0.1",
 				port: 0,
-				async fetch(request) {
+				fetch(request) {
 					const url = new URL(request.url);
-					if (url.pathname === "/gate") {
-						gateReached.resolve();
-						await gateOpened.promise;
-						return new Response("open");
-					}
 					if (url.pathname === "/file") {
 						const filename = url.searchParams.get("name")!;
 						return new Response(filename, {
@@ -361,112 +564,99 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 							},
 						});
 					}
-					return new Response(`<title>${name}</title><a id="download" href="/file?name=managed.txt">download</a>`, {
-						headers: { "content-type": "text/html" },
-					});
+					return new Response(
+						`<title>${name}</title><a id="download" href="/file?name=fixture.txt">download</a>`,
+						{
+							headers: { "content-type": "text/html" },
+						},
+					);
 				},
 			});
-			let recycledDirectory: string | undefined;
+			const observer = await browser.target().createCDPSession();
 			try {
+				await observer.send("Browser.setDownloadBehavior", {
+					behavior: "allow",
+					downloadPath: directory,
+					eventsEnabled: true,
+				});
 				const adopted = await browser.newPage();
 				await adopted.goto(server.url.href);
 				const userPage = await browser.newPage();
 				await userPage.goto(server.url.href);
-				// Keep explicit adoption unambiguous while leaving a separate user page.
 				await userPage.evaluate('document.title = "unrelated user page";');
 				const { tab } = await acquireTab(name, handle, {
 					url: server.url.href,
-					target: ownsTarget ? undefined : name,
+					target: ownsPage ? undefined : name,
 					ownerSessionId: "relay-download-policy-session",
-					downloadsPath: path.join(root, "downloads"),
 					timeoutMs: 15_000,
 				});
 				if (tab.backend !== "worker") throw new Error("Expected a relay worker");
-				expect(tab.ownsTarget).toBe(ownsTarget);
+				expect(tab.ownsPage).toBe(ownsPage);
 				const targetId = tab.targetId;
-				recycledDirectory = path.join(os.tmpdir(), `omp-downloads-${targetId}`);
 				for (const phase of ["initial", "recycled"] as const) {
 					if (phase === "recycled") {
 						const previousWorker = tab.worker;
-						// Require the real worker path: inline fallback cannot recycle safely.
 						expect(previousWorker.mode).toBe("worker");
-						expect(await rejectionOf(runInTab(name, {
-							code: "await new Promise(() => {});",
-							timeoutMs: 5_000,
-							session,
-						}))).toMatchObject({ message: expect.stringContaining("Browser code execution timed out after ") });
+						expect(
+							await rejectionOf(
+								runInTab(name, {
+									code: "await Promise.withResolvers().promise;",
+									timeoutMs: 5_000,
+									session,
+								}),
+							),
+						).toMatchObject({
+							message: expect.stringContaining("Browser code execution timed out after "),
+						});
 						expect(getTab(name)).toBe(tab);
 						expect(tab.state).toBe("alive");
 						expect(tab.worker).not.toBe(previousWorker);
 						expect(tab.targetId).toBe(targetId);
-						expect(tab.ownsTarget).toBe(ownsTarget);
+						expect(tab.ownsPage).toBe(ownsPage);
 					}
-					gateReached = Promise.withResolvers<void>();
-					gateOpened = Promise.withResolvers<void>();
-					const running = runInTab(name, {
-						code: [
-							"const pending = tab.waitForDownload({ timeout: 15000 });",
-							"await tab.title();", // waits for download policy to arm
-							`await fetch(${JSON.stringify(`${server.url.href}gate`)});`,
-							"await tab.evaluate(() => document.querySelector('#download').click());",
-							"return await pending;",
-						].join("\n"),
-						timeoutMs: 20_000,
-						session,
-					});
-					void running.catch(() => undefined);
-					try {
-						await Promise.race([gateReached.promise, running.then(() => { throw new Error("Run ended before gate"); })]);
-						const filename = `user-${phase}.txt`;
-						const directory = phase === "initial" ? path.join(root, "downloads") : recycledDirectory;
-						await userPage.evaluate(`{
-							const link = document.querySelector("#download");
-							link.href = ${JSON.stringify(`/file?name=${filename}`)};
-							link.click();
-						}`);
-						const savedPath = path.join(directory, filename);
-						let savedText: string | undefined;
-						// Chromium may create the final filename before it finishes writing.
-						// Read fresh bytes until the exact payload arrives, not just file existence.
-						for (let attempt = 0; attempt < 200; attempt++) {
-							try {
-								savedText = await fs.readFile(savedPath, "utf8");
-							} catch (error) {
-								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-							}
-							if (savedText === filename) break;
-							await Bun.sleep(25);
+					for (const code of [
+						"return await tab.waitForDownload({ timeout: 1000 });",
+						"return await tab.downloads();",
+					]) {
+						expect(await rejectionOf(runInTab(name, { code, timeoutMs: 5_000, session }))).toMatchObject({
+							message: expect.stringContaining("Download tracking is not supported through the browser relay"),
+						});
+					}
+					// Independent fixture CDP drives the unrelated page, not the rejected worker API.
+					const filename = `user-${phase}.txt`;
+					await userPage.evaluate(`{
+						const link = document.querySelector("#download");
+						link.href = ${JSON.stringify(`/file?name=${filename}`)};
+						link.click();
+					}`);
+					const savedPath = path.join(directory, filename);
+					let savedText: string | undefined;
+					for (let attempt = 0; attempt < 200; attempt++) {
+						try {
+							savedText = await fs.readFile(savedPath, "utf8");
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 						}
-						expect(await Bun.file(savedPath).exists()).toBe(true);
-						expect(savedText).toBe(filename);
-						// The user's file has no manager to rename it: allowAndName would
-						// leave a bare UUID here and fail the real-filename assertion above.
-						gateOpened.resolve();
-						await running;
-					} finally {
-						gateOpened.resolve();
-						await running.catch(() => undefined);
+						if (savedText === filename) break;
+						await Bun.sleep(25);
 					}
+					expect(await Bun.file(savedPath).exists()).toBe(true);
+					expect(savedText).toBe(filename);
+					// A worker switching the browser to allowAndName would leave an unrenamed UUID.
 				}
 				await releaseTab(name, { kill: false });
 				expect(adopted.isClosed()).toBe(false);
 				expect(userPage.isClosed()).toBe(false);
-				const client = await browser.target().createCDPSession();
-				const remaining = (await client.send("Target.getTargets")).targetInfos.map(target => target.targetId);
-				expect(remaining.includes(targetId)).toBe(!ownsTarget);
-				await client.detach();
+				const remaining = handle.browser.targets().map(target => privateTargetId(target));
+				expect(remaining.includes(targetId)).toBe(!ownsPage);
 				expect(handle.refCount).toBe(1);
 			} finally {
-				gateOpened.resolve();
 				try {
 					await releaseTab(name, { kill: false });
 				} finally {
-					scopeSpy.mockRestore();
+					await observer.detach().catch(() => undefined);
 					await server.stop(true);
-					await browser.close();
-					if (launched.userDataDir) await removeUserDataDir(launched.userDataDir);
-					if (recycledDirectory) await fs.rm(recycledDirectory, { recursive: true, force: true });
-					await fs.rm(root, { recursive: true, force: true });
+					await close();
 				}
 			}
 		},
@@ -482,24 +672,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		"rolls back a relay open after %s, closing only its owned target (ownsTarget=%s)",
 		async (outcome, ownsTarget) => {
 			// Real Chromium and workers exercise attach-mode ownership through post-init
-			// navigation. The relay-kind handle selects the fork's fresh/adopted paths;
-			// this deliberately does not claim extension, focus, or tab-group coverage.
-			const launched = await launchHeadlessBrowser({ headless: true });
-			const browser = launched.browser;
+			// navigation. The disposable extension exercises actual claim and close acknowledgement.
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-open-rollback-"));
-			const scope: SharedTargetScope = { projectDir: root, runtimeDir: root, daemonName: "relay-open" };
-			const scopeSpy = spyOn(relayOwnedTargets, "relayTargetScope").mockReturnValue(scope);
-			const name = `relay-rollback-${crypto.randomUUID()}`;
-			const cdpUrl = `http://${new URL(browser.wsEndpoint()).host}`;
-			const handle: PuppeteerBrowserHandle = {
-				key: name,
-				kind: { kind: "relay", cdpUrl },
-				cdpUrl,
-				browser,
-				// The fixture keeps its observation connection through the open's rollback.
-				refCount: 1,
-				stealth: { browserSession: null, override: null },
+			const scope: SharedTargetScope = {
+				projectDir: root,
+				runtimeDir: root,
+				daemonName: "relay-open",
 			};
+			const name = `relay-rollback-${crypto.randomUUID()}`;
+			const { browser, handle, close } = await launchIsolatedRelay(root, scope);
 			const requested = Promise.withResolvers<void>();
 			const answer = Promise.withResolvers<void>();
 			const server = Bun.serve({
@@ -559,7 +740,10 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 				}
 				const error = await open;
 				if (outcome === "cancellation") expect(error).toBeInstanceOf(ToolAbortError);
-				else expect(error).toMatchObject({ message: expect.stringContaining("net::ERR_CONNECTION_REFUSED") });
+				else
+					expect(error).toMatchObject({
+						message: expect.stringContaining("net::ERR_CONNECTION_REFUSED"),
+					});
 				expect(getTab(name)).toBeUndefined();
 				expect(created).toHaveLength(ownsTarget ? 1 : 0);
 				expect(await pageTargets()).toEqual(before);
@@ -574,11 +758,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 					await releaseTab(name, { kill: false });
 					await ownedTargets();
 				} finally {
-					scopeSpy.mockRestore();
 					await server.stop(true);
-					await browser.close();
-					if (launched.userDataDir) await removeUserDataDir(launched.userDataDir);
-					await fs.rm(root, { recursive: true, force: true });
+					await close();
 				}
 			}
 		},
@@ -680,38 +861,125 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		}
 	});
 
-	it("keeps the tab on what loaded when the page outlasts the open timeout", async () => {
+	it("accepts an untrusted certificate only for an owned tab, across recycle, and restores checks on close", async () => {
+		const serveUntrusted = () =>
+			Bun.serve({
+				port: 0,
+				tls: { cert: CLAUDE_TRACE_DEBUG_CERT, key: CLAUDE_TRACE_DEBUG_KEY },
+				fetch: () => new Response("<title>untrusted</title>", { headers: { "content-type": "text/html" } }),
+			});
+		const server = serveUntrusted();
+		// Fresh origins after the recycle and after close: Chromium reuses an accepted connection to an origin.
+		const recycled = serveUntrusted();
+		const later = serveUntrusted();
+		// Independent fixture launch omits process-wide certificate overrides. Only an
+		// explicitly OMP-owned worker may install the temporary tab-scoped override.
+		const { browser, wsEndpoint, userDataDir } = await launchHeadlessBrowser({ headless: true });
+		const name = `tls-${crypto.randomUUID()}`;
+		const session: ToolSession = {
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({ "browser.enabled": true, "tools.maxTimeout": 0 }),
+		};
+		const handle: PuppeteerBrowserHandle = {
+			key: name,
+			kind: { kind: "headless", headless: true },
+			browser,
+			wsEndpoint,
+			refCount: 1,
+			stealth: { browserSession: null, override: null },
+		};
+		const run = (code: string) => runInTab(name, { code, timeoutMs: 15_000, session });
+		try {
+			const [page] = await browser.pages();
+			if (!page) throw new Error("Expected the launched browser to expose a page");
+			// The same override on an external connected endpoint is explicitly refused.
+			const invoke = browserHost();
+			expect(
+				await rejectionOf(
+					invoke({
+						action: "open",
+						name: `${name}-connected`,
+						app: `http://${new URL(wsEndpoint).host}`,
+						insecure: true,
+					}),
+				),
+			).toMatchObject({ message: expect.stringMatching(/insecure|certificate/i) });
+			expect(getTab(`${name}-connected`)).toBeUndefined();
+			const { tab: opened } = await acquireTab(name, handle, {
+				url: server.url.href,
+				insecure: true,
+				timeoutMs: 15_000,
+			});
+			if (opened.backend !== "worker") throw new Error("Expected an owned worker tab");
+			expect(opened.ownsPage).toBe(true);
+			expect((await run("await tab.reload(); return await tab.title();")).returnValue).toBe("untrusted");
+			const worker = opened.worker;
+			const endWorker = `const err = new Error("library-internal");
+err.stack = "Error: library-internal\\n    at #onFileChooser (puppeteer/Page.js:1:1)";
+Promise.reject(err);
+await Promise.withResolvers().promise;`;
+			expect(await rejectionOf(run(endWorker))).toMatchObject({
+				message: expect.stringContaining("the tab is being reattached"),
+			});
+			const tab = getTab(name);
+			if (tab?.backend !== "worker") throw new Error("Expected a worker tab");
+			expect(await tab.workerRecovery).toBe(true);
+			expect(tab.worker).not.toBe(worker);
+			expect(
+				(await run(`await tab.goto(${JSON.stringify(recycled.url.href)}); return await tab.title();`)).returnValue,
+			).toBe("untrusted");
+			await releaseTab(name, { kill: false });
+			expect(browser.targets().some(target => target === page.target())).toBe(true);
+			expect(page.isClosed()).toBe(false);
+			expect(await rejectionOf(page.goto(later.url.href))).toMatchObject({
+				message: expect.stringContaining("net::ERR_CERT_AUTHORITY_INVALID"),
+			});
+		} finally {
+			await releaseTab(name, { kill: false });
+			server.stop(true);
+			recycled.stop(true);
+			later.stop(true);
+			await closeLaunchedBrowser({ browser, userDataDir });
+			if (userDataDir) await removeUserDataDir(userDataDir);
+		}
+	}, 30_000);
+
+	it("reports an open on one line, naming the page only when it is not the requested URL", async () => {
 		const server = Bun.serve({
 			port: 0,
 			fetch(request) {
-				// The image never answers, so the page never fires `load`.
-				if (new URL(request.url).pathname === "/hang.png") return new Promise<Response>(() => {});
-				return new Response('<title>slow</title><p>partial</p><img src="/hang.png">', {
-					headers: { "content-type": "text/html" },
-				});
+				const { pathname } = new URL(request.url);
+				if (pathname === "/moved") return Response.redirect(new URL("/landed", request.url).href, 302);
+				const title = pathname === "/landed" ? "Landed" : "Requested page";
+				return new Response(`<title>${title}</title>`, { headers: { "content-type": "text/html" } });
 			},
 		});
 		try {
 			const invoke = browserHost();
-			const name = `slow-${crypto.randomUUID()}`;
-			const open = () => rejectionOf(invoke({ action: "open", name, url: server.url.href, timeout: 3 }));
-			const keptTab = { message: expect.stringContaining(`browser.tab(${JSON.stringify(name)})`) };
-			// The first open creates the tab; the second reuses the one it kept.
-			expect(await open()).toMatchObject(keptTab);
-			expect(await open()).toMatchObject(keptTab);
-			expect(
-				returnedValue(
-					await invoke({
-						action: "run",
-						name,
-						code: "return { url: tab.url(), text: await tab.evaluate(() => document.body.innerText) };",
-					}),
-				),
-			).toEqual({ url: server.url.href, text: "partial" });
+			const name = `one-line-${crypto.randomUUID()}`;
+
+			const first = await invoke({ action: "open", name, url: server.url.origin });
+			const opened = first.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+			expect(opened).toMatch(new RegExp(`^Opened tab "${name}" on [^\\n]+, titled "Requested page"$`));
+			expect(opened).not.toContain(", at http");
+
+			const landed = new URL("/landed", server.url).href;
+			const second = await invoke({ action: "open", name, url: new URL("/moved", server.url).href });
+			const reused = second.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+			expect(reused).toBe(reused.split("\n")[0]);
+			expect(reused).toStartWith(`Reused tab "${name}" on `);
+			expect(reused).toEndWith(`, at ${landed}, titled "Landed"`);
+
+			const adopted = await invoke({ action: "open", name });
+			const withoutUrl = adopted.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+			expect(withoutUrl).toEndWith(`, at ${landed}, titled "Landed"`);
 		} finally {
 			server.stop(true);
 		}
-	}, 20_000);
+	});
 
 	it("closes the tab its open created when the navigation fails outright, but keeps a reused one", async () => {
 		const refused = Bun.serve({ port: 0, fetch: () => new Response("") });
@@ -764,7 +1032,9 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 			// Opens of one name run in order, so this one starts after the
 			// cancelled open finished unwinding, and finds no tab to reuse.
 			const reopened = await invoke({ action: "open", name });
-			expect(reopened.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/^Opened tab /) })]);
+			expect(reopened.content).toEqual([
+				expect.objectContaining({ text: expect.stringMatching(/^Opened tab [^\n]+, at about:blank$/) }),
+			]);
 			expect(getTab(name)).not.toBe(cancelled);
 		} finally {
 			server.stop(true);
@@ -1007,5 +1277,42 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser open options", () => {
 		} finally {
 			server.stop(true);
 		}
+	});
+
+	it("answers a click beside a direct waitForDownload with a run that downloads the file", async () => {
+		const invoke = browserHost();
+		const name = `download-busy-${crypto.randomUUID()}`;
+		const link = '<a id="export" href="data:text/plain,export payload" download="export.txt">export</a>';
+		await invoke({ action: "open", name, url: `data:text/html,${encodeURIComponent(link)}` });
+		const tab = getTab(name);
+		if (!tab) throw new Error("Expected the opened tab");
+		// The wait holds the tab a few host awaits after its call starts.
+		const holding = Promise.withResolvers<void>();
+		const register = tab.pending.set.bind(tab.pending);
+		const registered = spyOn(tab.pending, "set").mockImplementation((id, run) => {
+			holding.resolve();
+			return register(id, run);
+		});
+		const stopWaiting = new AbortController();
+		let refused: unknown;
+		try {
+			const waiting = invoke(
+				{ action: "call", name, chain: [{ method: "waitForDownload", args: [] }] },
+				stopWaiting.signal,
+			).catch(() => undefined);
+			await holding.promise;
+			registered.mockRestore();
+			refused = await rejectionOf(invoke({ action: "call", name, chain: [{ method: "click", args: ["#export"] }] }));
+			stopWaiting.abort();
+			await waiting;
+		} finally {
+			registered.mockRestore();
+		}
+		// The refusal's own run, as an agent would paste it.
+		const code = /tab\.run\("(.+)"\)$/.exec(refused instanceof Error ? refused.message : "")?.[1];
+		if (!code) throw new Error(`Expected a tab.run to paste in: ${String(refused)}`);
+		const download = returnedValue(await invoke({ action: "run", name, code })) as { path: string };
+		tempDirs.push(path.dirname(download.path));
+		expect(await Bun.file(download.path).text()).toBe("export payload");
 	});
 });
