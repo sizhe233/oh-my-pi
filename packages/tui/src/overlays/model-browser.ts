@@ -10,10 +10,15 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getModelPricingStatus, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import {
+	getEffectiveTokenCost,
+	getFactoryDroidCreditRate,
+	getModelPricingStatus,
+	modelsAreEqual,
+} from "@oh-my-pi/pi-catalog/models";
 import { modelKind, type ModelKind, type ModelPricingStatus } from "@oh-my-pi/pi-catalog/types";
 import type { Component } from "../tui";
-import { FuzzyCorpus, fuzzyRank } from "../fuzzy";
+import { FuzzyCorpus, FuzzyQuery, FuzzyText, fuzzyRank } from "../fuzzy";
 import { Input } from "../components/input";
 import { ScrollView } from "../components/scroll-view";
 import { matchesKey } from "../keys";
@@ -42,6 +47,7 @@ import type {
 	TspPickerGroup,
 	TspPickerItem,
 	TspPickerMark,
+	TspPickerProps,
 	TspSpan,
 	TspText,
 } from "@oh-my-pi/pi-wire";
@@ -63,6 +69,7 @@ export type ModelRole =
 	| "memory"
 	| "task"
 	| "advisor"
+	| "widget"
 	| "image"
 	| "web"
 	| "speech"
@@ -79,6 +86,7 @@ export const MODEL_ROLE_IDS: ModelRole[] = [
 	"memory",
 	"task",
 	"advisor",
+	"widget",
 	"image",
 	"web",
 	"speech",
@@ -96,6 +104,7 @@ export const CHAT_MODEL_ROLE_IDS: ModelRole[] = [
 	"memory",
 	"task",
 	"advisor",
+	"widget",
 ];
 export const KIND_ROLE_IDS: ModelRole[] = ["image", "web", "speech", "dictation", "judge"];
 
@@ -597,6 +606,43 @@ function compactModelSearchText(value: string): string {
 	return value.toLowerCase().replace(/[^\p{Letter}\p{Mark}\p{Number}]+/gu, "");
 }
 
+/**
+ * A `provider/model` search: the text before the first `/` prefixes a
+ * provider id, the rest searches that provider's model ids.
+ */
+interface ProviderScopedQuery {
+	/** Typed provider prefix (trimmed, as typed). */
+	provider: string;
+	/** {@link provider} lowercased without punctuation, compared against compact provider ids. */
+	providerKey: string;
+	/** Model query after the slash; blank lists every model of the matched providers. */
+	model: string;
+}
+
+/** Split a `provider/model` query; undefined when the text before the first `/` is blank or spans words. */
+function parseProviderScopedQuery(query: string): ProviderScopedQuery | undefined {
+	const trimmed = query.trim();
+	const slash = trimmed.indexOf("/");
+	if (slash <= 0) return undefined;
+	const provider = trimmed.slice(0, slash);
+	const providerKey = compactModelSearchText(provider);
+	if (/\s/.test(provider) || !providerKey) return undefined;
+	return { provider, providerKey, model: trimmed.slice(slash + 1) };
+}
+
+/** Provider rank under a scoped query: an exact provider, then a provider prefix, then rows outside the scope. */
+const enum ProviderScope {
+	Exact = 0,
+	Prefix = 1,
+	None = 2,
+}
+
+/** How `compactProvider` relates to the compact typed provider prefix. */
+function providerScope(compactPrefix: string, compactProvider: string): ProviderScope {
+	if (compactProvider === compactPrefix) return ProviderScope.Exact;
+	return compactProvider.startsWith(compactPrefix) ? ProviderScope.Prefix : ProviderScope.None;
+}
+
 /** Exact id/selector → contiguous literal → fuzzy-only, against precomputed compact forms. */
 function modelSearchTier(query: string, id: string, selector: string): number {
 	if (!query) return 2;
@@ -616,6 +662,7 @@ export interface ModelRankOptions {
 interface ModelRankKeys {
 	compactId: string;
 	compactSelector: string;
+	compactProvider: string;
 	modelAffinity: number;
 	providerAffinity: number;
 	/** Position class in the MRU/version order; comparator-equal items share it. */
@@ -633,6 +680,8 @@ export class ModelItemRanker {
 	readonly options: ModelRankOptions;
 	readonly #corpus: FuzzyCorpus<ModelBrowserItem>;
 	readonly #keys = new Map<ModelBrowserItem, ModelRankKeys>();
+	/** Id-only haystacks for provider-scoped queries, built on first use per item. */
+	readonly #idTexts = new Map<ModelBrowserItem, FuzzyText>();
 
 	constructor(items: ReadonlyArray<ModelBrowserItem>, options: ModelRankOptions) {
 		this.items = items;
@@ -647,6 +696,7 @@ export class ModelItemRanker {
 			this.#keys.set(item, {
 				compactId: compactModelSearchText(item.id),
 				compactSelector: compactModelSearchText(item.selector),
+				compactProvider: compactModelSearchText(item.provider),
 				modelAffinity: options.affinity.models.get(item.selector.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
 				providerAffinity: options.affinity.providers.get(item.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
 				orderGroup: group,
@@ -654,34 +704,74 @@ export class ModelItemRanker {
 		}
 	}
 
-	/** Rank by text relevance, user affinity, and MRU/version order. */
+	/**
+	 * Rank by text relevance, user affinity, and MRU/version order. A
+	 * `provider/model` query ({@link parseProviderScopedQuery}) lists the
+	 * prefixed providers' models first, matched on the model part alone; the
+	 * whole-text matches follow, so a model id that itself contains `/` stays
+	 * reachable.
+	 */
 	rank(query: string): ModelBrowserItem[] {
 		if (!query.trim()) return [...this.items];
+		const rows = new Map<ModelBrowserItem, RankRow>();
+		const scoped = parseProviderScopedQuery(query);
+		if (scoped) this.#rankScoped(scoped, rows);
 		const queryKey = compactModelSearchText(query);
-		// Exact and contiguous matches stay ahead of fuzzy-only candidates; affinity
-		// breaks ties before fuzzy quality and the normal MRU/version ordering, and
-		// fuzzy order settles items that ordering cannot tell apart.
-		const rows = this.#corpus.rank(query).map((result, fuzzyIndex) => {
-			const keys = this.#keys.get(result.item)!;
-			return {
-				item: result.item,
-				keys,
-				tier: modelSearchTier(queryKey, keys.compactId, keys.compactSelector),
-				bucket: Math.round(result.score / 10),
-				fuzzyIndex,
-			};
-		});
-		rows.sort(
-			(a, b) =>
-				a.tier - b.tier ||
-				a.keys.modelAffinity - b.keys.modelAffinity ||
-				a.keys.providerAffinity - b.keys.providerAffinity ||
-				a.bucket - b.bucket ||
-				a.keys.orderGroup - b.keys.orderGroup ||
-				a.fuzzyIndex - b.fuzzyIndex,
-		);
-		return rows.map(row => row.item);
+		for (const { item, score } of this.#corpus.rank(query)) {
+			if (rows.has(item)) continue;
+			const keys = this.#keys.get(item)!;
+			const tier = modelSearchTier(queryKey, keys.compactId, keys.compactSelector);
+			rows.set(item, { item, keys, scope: ProviderScope.None, tier, score });
+		}
+		// Scope, then exact and contiguous matches stay ahead of fuzzy-only candidates;
+		// affinity breaks ties before fuzzy quality and the normal MRU/version ordering,
+		// and fuzzy score settles items that ordering cannot tell apart.
+		return [...rows.values()]
+			.sort(
+				(a, b) =>
+					a.scope - b.scope ||
+					a.tier - b.tier ||
+					a.keys.modelAffinity - b.keys.modelAffinity ||
+					a.keys.providerAffinity - b.keys.providerAffinity ||
+					Math.round(a.score / 10) - Math.round(b.score / 10) ||
+					a.keys.orderGroup - b.keys.orderGroup ||
+					a.score - b.score,
+			)
+			.map(row => row.item);
 	}
+
+	/** Add a row for every model of a prefixed provider whose id matches the model part. */
+	#rankScoped(scoped: ProviderScopedQuery, rows: Map<ModelBrowserItem, RankRow>): void {
+		const modelKey = compactModelSearchText(scoped.model);
+		const modelQuery = modelKey ? new FuzzyQuery(scoped.model) : undefined;
+		for (const item of this.items) {
+			const keys = this.#keys.get(item)!;
+			const scope = providerScope(scoped.providerKey, keys.compactProvider);
+			if (scope === ProviderScope.None) continue;
+			let score = 0;
+			if (modelQuery) {
+				let text = this.#idTexts.get(item);
+				if (!text) {
+					text = new FuzzyText(modelIdSearchText(item));
+					this.#idTexts.set(item, text);
+				}
+				const match = text.match(modelQuery);
+				if (!match.matches) continue;
+				score = match.score;
+			}
+			rows.set(item, { item, keys, scope, tier: modelSearchTier(modelKey, keys.compactId, keys.compactId), score });
+		}
+	}
+}
+
+/** One candidate's sort keys for a single {@link ModelItemRanker.rank} call. */
+interface RankRow {
+	item: ModelBrowserItem;
+	keys: ModelRankKeys;
+	scope: ProviderScope;
+	tier: number;
+	/** Fuzzy score; lower is better. */
+	score: number;
 }
 
 /** Rank picker and mention candidates by text relevance, user affinity, and MRU/version order. */
@@ -742,8 +832,8 @@ function declaredPricingStatus(model: Model): Exclude<ModelPricingStatus, "fixed
 function isFreeModel(model: Model): boolean {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return declared === "free";
-	const cost = model.cost;
-	const credits = model.factoryDroidCredits;
+	const cost = model.cost ? getEffectiveTokenCost(model.cost) : undefined;
+	const credits = getFactoryDroidCreditRate(model)?.rate;
 	return (!cost || (cost.input === 0 && cost.output === 0)) && (credits === undefined || credits === 0);
 }
 
@@ -757,16 +847,24 @@ function formatCostLeg(n: number): string {
 	return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
 }
 
+/** `2× from 2026-11-22` when a dated Factory Droid credit card changes the rate in force now; undefined otherwise. */
+function nextCreditRateNote(model: Model): string | undefined {
+	const next = getFactoryDroidCreditRate(model)?.next;
+	return next ? `${formatCostLeg(next.rate)}× from ${new Date(next.at).toISOString().slice(0, 10)}` : undefined;
+}
+
 /**
- * Adds Factory Droid's `N×` base Standard Credits rate to a dollar price,
- * replacing the price when the model has no dollar reference. Neither the
- * reference price nor the base credit rate includes live promotions.
+ * Adds Factory Droid's `N×` Standard Credits rate in force now (its dated
+ * `credit-rates` card applied) to a dollar price, replacing the price when the
+ * model has no dollar reference. The dollar reference never includes vendor
+ * promotions; the preview and detail facts name the next rate (`nextCreditRateNote`).
  */
 function withCreditBadge(model: Model, price: string): string {
-	const credits = model.factoryDroidCredits;
+	const credits = getFactoryDroidCreditRate(model);
 	if (credits === undefined) return price;
-	const badge = `${formatCostLeg(credits)}×`;
-	return model.cost.input !== 0 || model.cost.output !== 0 ? `${price} ${badge}` : badge;
+	const badge = `${formatCostLeg(credits.rate)}×`;
+	const cost = getEffectiveTokenCost(model.cost);
+	return cost.input !== 0 || cost.output !== 0 ? `${price} ${badge}` : badge;
 }
 
 const PRICING_STATUS_LABELS: Record<Exclude<ModelPricingStatus, "fixed">, { short: string; detail: string }> = {
@@ -781,7 +879,8 @@ function formatCostPair(model: Model): string {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
-	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`);
+	const cost = getEffectiveTokenCost(model.cost);
+	return withCreditBadge(model, `$${formatCostLeg(cost.input)}/${formatCostLeg(cost.output)}`);
 }
 
 /** Detail-pane price fact: `$3/15 per M`, or the declared pricing state in words. */
@@ -792,10 +891,10 @@ function formatCostDetail(model: Model): string {
 
 /** Fact columns of a model picker (Stencil `NATIVE_REDESIGN.md` §4.7); the lowest priority hides first. */
 export const MODEL_PICKER_COLUMNS: readonly TspPickerColumn[] = [
-	{ id: "int", head: "Int", format: "num", priority: 1 },
-	{ id: "speed", head: "t/s", format: "num", priority: 2 },
-	{ id: "ctx", head: "Ctx", format: "num", priority: 4 },
-	{ id: "price", head: "$/M", format: "price", priority: 3 },
+	{ id: "int", head: "Int", format: "num", priority: 4 },
+	{ id: "speed", head: "t/s", format: "num", priority: 3 },
+	{ id: "ctx", head: "Ctx", format: "num", priority: 1 },
+	{ id: "price", head: "$/M", format: "price", priority: 2 },
 ];
 
 /** `$3·15` price fact of a picker row; `free` at zero cost; a declared pricing state otherwise. */
@@ -803,17 +902,20 @@ function pickerPrice(model: Model): string {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
-	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`);
+	const cost = getEffectiveTokenCost(model.cost);
+	return withCreditBadge(model, `$${formatCostLeg(cost.input)}·${formatCostLeg(cost.output)}`);
 }
 
 /** `$2 in · $10 out · $0.2 cache` for a model preview. */
 function previewPrice(model: Model): string {
 	const declared = declaredPricingStatus(model);
 	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].detail;
-	const cost = model.cost;
+	const cost = getEffectiveTokenCost(model.cost);
 	const parts = [`$${formatCostLeg(cost.input)} in`, `$${formatCostLeg(cost.output)} out`];
 	if (cost.cacheRead > 0) parts.push(`$${formatCostLeg(cost.cacheRead)} cache`);
-	return withCreditBadge(model, parts.join(" · "));
+	const priced = withCreditBadge(model, parts.join(" · "));
+	const note = nextCreditRateNote(model);
+	return note ? `${priced} (${note})` : priced;
 }
 
 /**
@@ -845,9 +947,13 @@ export function thinkingDotToken(level: ConfiguredThinkingLevel): string | undef
  * caches match indices keyed on this string and stops admitting new entries
  * past its cap, so a query-dependent haystack would thrash that cache.
  */
-export function modelSearchText({ provider, id, model }: ModelBrowserItem): string {
-	const base = `${provider}/${id}`;
-	return isFreeModel(model) ? `${base} free` : base;
+export function modelSearchText(item: ModelBrowserItem): string {
+	return `${item.provider}/${modelIdSearchText(item)}`;
+}
+
+/** {@link modelSearchText} without the provider: what the model part of a `provider/model` query searches. */
+function modelIdSearchText({ id, model }: ModelBrowserItem): string {
+	return isFreeModel(model) ? `${id} free` : id;
 }
 
 /** Provider-supplied blurb, flattened to a single renderable detail-line cell. */
@@ -911,6 +1017,22 @@ export interface ModelPickerCatalogue {
 	readonly itemsAdd?: readonly TspPickerItem[];
 	readonly itemsDel?: readonly string[];
 }
+
+/** The search, fact-column and row props every model `picker` sheet sends ({@link ModelBrowser.pickerRows}). */
+export type ModelPickerRows = Pick<
+	TspPickerProps,
+	| "query"
+	| "cursor"
+	| "columns"
+	| "items"
+	| "itemsAdd"
+	| "itemsDel"
+	| "order"
+	| "hits"
+	| "selected"
+	| "current"
+	| "total"
+>;
 
 /** How {@link ModelBrowser.pickerOrder} heads its rows. */
 export interface ModelPickerGrouping {
@@ -1002,11 +1124,15 @@ export class ModelBrowser implements Component {
 		| undefined;
 	/** Theme-formatted catalog metric cells per item; rebuilt when the item's model or the theme changes. */
 	#metricCells = new WeakMap<ModelBrowserItem, MetricCells>();
+	/** Earliest dated credit-rate change among models whose rows are memoized; passing it rebuilds them. */
+	#nextCreditChange = Number.POSITIVE_INFINITY;
 	/** Non-separator items of the last ranked visible list, for {@link queryMatches}. */
 	#queryMatches: { visible: readonly ModelBrowserItem[]; matches: readonly ModelBrowserItem[] } | undefined;
 	#hoveredIndex: number | null = null;
 	#maxVisible = 10;
 	#showProvider: boolean;
+	/** Native rows name the provider before the model id (off where a logo already says it). */
+	#pickerProvider = true;
 	#currentContextTokens: number;
 	#markOverContext: boolean;
 	#emptyText?: () => string | undefined;
@@ -1093,6 +1219,7 @@ export class ModelBrowser implements Component {
 
 	/** Replace the scope's base items; the live query re-applies and selection is pinned by selector. */
 	setItems(items: ModelBrowserItem[]): void {
+		for (const item of items) this.#noteCreditChange(item.model);
 		const selectedKey = this.getSelected()?.selector;
 		this.#menu.setItems(this.#insertSeparator(items), selectedKey);
 		this.onSelectionChange?.(this.getSelected());
@@ -1130,6 +1257,26 @@ export class ModelBrowser implements Component {
 	setShowProvider(show: boolean): void {
 		if (show !== this.#showProvider) this.#bumpNativeEpoch();
 		this.#showProvider = show;
+	}
+
+	/** Whether native rows' labels lead with `provider/` (search hits follow the label). */
+	setPickerProvider(show: boolean): void {
+		if (show !== this.#pickerProvider) this.#bumpNativeEpoch();
+		this.#pickerProvider = show;
+	}
+
+	/** A native row's tooltip: its provider when the label leaves it out, and its intelligence. */
+	#pickerTitle(item: ModelBrowserItem, int: number | undefined): { title?: string } {
+		const parts = [
+			...(this.#pickerProvider || item.provider === "" ? [] : [item.provider]),
+			...(int !== undefined ? [`Intelligence ${Math.round(int)}`] : []),
+		];
+		return parts.length > 0 ? { title: parts.join(" · ") } : {};
+	}
+
+	/** A native row's label: the model id, after `provider/` unless {@link setPickerProvider} moved it to the tooltip. */
+	#pickerLabel(item: ModelBrowserItem): string {
+		return item.provider === "" || !this.#pickerProvider ? item.id : item.selector;
 	}
 	/** Keep the source order after fuzzy filtering instead of applying model-specific ranking. */
 	setPreserveQueryOrder(preserve: boolean): void {
@@ -1488,6 +1635,7 @@ export class ModelBrowser implements Component {
 	#metricCellsFor(item: ModelBrowserItem): MetricCells {
 		const cached = this.#metricCells.get(item);
 		if (cached?.model === item.model && cached.theme === theme) return cached;
+		this.#noteCreditChange(item.model);
 		const intelligence = formatIntelligence(item.model);
 		const ctx = formatContext(item.model);
 		const cost = formatCostPair(item.model);
@@ -1604,6 +1752,9 @@ export class ModelBrowser implements Component {
 		} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 			facts.push(`~${formatTps(model.tps)}`);
 		}
+		// Last fact before prose, so narrow widths cut it before capability and perf facts.
+		const nextCredits = nextCreditRateNote(model);
+		if (nextCredits) facts.push(nextCredits);
 		if (model.description) {
 			const description = formatDescription(model.description);
 			if (description) facts.push(description);
@@ -1635,6 +1786,7 @@ export class ModelBrowser implements Component {
 	}
 
 	render(width: number): string[] {
+		this.#syncCreditClock();
 		const lines: string[] = [];
 
 		const searchIcon = theme.fg("accent", theme.symbol("icon.search"));
@@ -1726,6 +1878,30 @@ export class ModelBrowser implements Component {
 
 	invalidate(): void {}
 
+	/** Called for every listed model and before a row is memoized: its credit rate changes at its next dated card. */
+	#noteCreditChange(model: Model): void {
+		const at = getFactoryDroidCreditRate(model)?.next?.at;
+		if (at !== undefined && at < this.#nextCreditChange) this.#nextCreditChange = at;
+	}
+
+	/**
+	 * A dated credit rate took effect since rows were memoized: rebuild every
+	 * memoized row, and re-rank the list, whose `free` search word follows the
+	 * rate too.
+	 */
+	#syncCreditClock(): void {
+		if (Date.now() < this.#nextCreditChange) return;
+		this.#nextCreditChange = Number.POSITIVE_INFINITY;
+		this.#metricCells = new WeakMap();
+		this.#pickerPreview = undefined;
+		this.#bumpPickerEpoch();
+		this.#ranker = undefined;
+		this.#menu.setItems(this.#menu.items);
+		for (const item of this.#menu.items) {
+			if (item.id !== "separator") this.#noteCreditChange(item.model);
+		}
+	}
+
 	#bumpNativeEpoch(): void {
 		this.#nativeEpoch++;
 		this.#itemNodes.clear();
@@ -1744,6 +1920,7 @@ export class ModelBrowser implements Component {
 	 * scrolls), and the selection's facts and role chips.
 	 */
 	describe(): NativeNode {
+		this.#syncCreditClock();
 		this.#nativeSearch ??= row([text([span(theme.symbol("icon.search"), "accent")]), this.#searchInput], {
 			gap: "sm",
 			align: "center",
@@ -1814,6 +1991,7 @@ export class ModelBrowser implements Component {
 		if (item.id === "separator") return node("rule", undefined, undefined, "separator");
 		const cached = this.#itemNodes.get(item.selector);
 		if (cached?.item === item) return cached.node;
+		this.#noteCreditChange(item.model);
 
 		const label: TspSpan[] = [];
 		if (this.#showProvider) label.push(span(`${item.provider}/`, "dim"));
@@ -1856,6 +2034,7 @@ export class ModelBrowser implements Component {
 			return prev.node;
 		}
 
+		if (selected) this.#noteCreditChange(selected.model);
 		const children: NativeChild[] = [];
 		if (selected) {
 			const model = selected.model;
@@ -1880,6 +2059,8 @@ export class ModelBrowser implements Component {
 			} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 				facts.push(`~${formatTps(model.tps)}`);
 			}
+			const nextCredits = nextCreditRateNote(model);
+			if (nextCredits) facts.push(nextCredits);
 			children.push(text([span(facts.join(" · "), "muted")], { wrap: "word" }));
 			const description = model.description ? formatDescription(model.description) : "";
 			if (description) children.push(text([span(description, "dim")], { wrap: "word", lines: 2 }));
@@ -1928,12 +2109,33 @@ export class ModelBrowser implements Component {
 	}
 
 	/**
+	 * A model picker's search field, fact columns and rows: `catalogue` (from
+	 * {@link pickerItems}) in `view` order (from {@link pickerOrder}), the
+	 * selection, and `current` checked. Memoize hosts on its inputs plus
+	 * {@link query}, {@link cursor} and {@link pickerSelected}.
+	 */
+	pickerRows(catalogue: ModelPickerCatalogue, view: ModelPickerOrder, current: string | undefined): ModelPickerRows {
+		return {
+			query: this.query,
+			cursor: this.cursor,
+			columns: MODEL_PICKER_COLUMNS,
+			...catalogue,
+			order: view.order,
+			...(view.hits ? { hits: view.hits } : {}),
+			selected: this.pickerSelected,
+			...(current ? { current: [current] } : {}),
+			total: this.baseCount,
+		};
+	}
+
+	/**
 	 * Picker rows for `catalogue`: the same object while the catalogue, roles
 	 * and row inputs are unchanged, so typing and scope hops never resend it.
 	 * A rebuilt catalogue that differs in a few rows (a provider refresh, a
 	 * role moving) keeps the last whole `items` and patches it.
 	 */
 	pickerItems(catalogue: readonly ModelBrowserItem[]): ModelPickerCatalogue {
+		this.#syncCreditClock();
 		const memo = this.#pickerItems;
 		if (memo?.catalogue === catalogue && memo.epoch === this.#pickerEpoch && memo.roles === this.#roles) {
 			return memo.value;
@@ -1985,6 +2187,7 @@ export class ModelBrowser implements Component {
 		) {
 			return cached.value;
 		}
+		this.#noteCreditChange(model);
 		const facts: Record<string, TspText | number> = {};
 		const int = model.int != null && Number.isFinite(model.int) ? model.int : undefined;
 		if (int !== undefined) facts.int = String(Math.round(int));
@@ -2019,14 +2222,14 @@ export class ModelBrowser implements Component {
 		const quickRole = item.provider === "" && item.id.startsWith("@");
 		const value: TspPickerItem = {
 			id: item.selector,
-			label: quickRole ? item.id : item.selector,
+			label: this.#pickerLabel(item),
 			mark: providerMark(item.model.provider),
 			mono: true,
 			...(quickRole ? { detail: `${item.model.provider}/${item.model.id}` } : {}),
 			facts,
 			...(badges.length > 0 ? { badges: badges.slice(0, 3) } : {}),
 			...(chips.length > 0 ? { chips } : {}),
-			...(int !== undefined ? { title: `Intelligence ${Math.round(int)}` } : {}),
+			...this.#pickerTitle(item, int),
 		};
 		// Discovery re-mints Model objects for unchanged models; an equal row keeps its identity.
 		const kept = cached && Bun.deepEquals(cached.value, value) ? cached.value : value;
@@ -2095,16 +2298,31 @@ export class ModelBrowser implements Component {
 		let hits: Record<string, [number, number][]> | undefined;
 		if (query) {
 			hits = {};
+			const scoped = parseProviderScopedQuery(query);
 			for (const item of visible) {
 				if (this.#isDisabled(item)) continue;
-				const label = item.provider === "" ? item.id : item.selector;
-				const ranges = pickerFuzzyHits(label, query);
+				const ranges =
+					scoped && providerScope(scoped.providerKey, compactModelSearchText(item.provider)) !== ProviderScope.None
+						? this.#scopedPickerHits(item, scoped)
+						: pickerFuzzyHits(this.#pickerLabel(item), query);
 				if (ranges) hits[item.selector] = ranges;
 			}
 		}
 		const value: ModelPickerOrder = { order, hits, count };
 		this.#pickerOrder = { visible, key, value };
 		return value;
+	}
+
+	/** Hit ranges of a provider-scoped row: the provider part on the provider, the model part on the id. */
+	#scopedPickerHits(item: ModelBrowserItem, scoped: ProviderScopedQuery): [number, number][] | undefined {
+		const idHits = pickerFuzzyHits(item.id, scoped.model) ?? [];
+		if (this.#pickerLabel(item) === item.id) return idHits.length > 0 ? idHits : undefined;
+		const offset = item.provider.length + 1;
+		const ranges = [
+			...(pickerFuzzyHits(item.provider, scoped.provider) ?? []),
+			...idHits.map(([start, end]): [number, number] => [start + offset, end + offset]),
+		];
+		return ranges.length > 0 ? ranges : undefined;
 	}
 
 	/** One group head per run of same-provider rows (the unfiltered list is provider-sorted past the Recent block). */
@@ -2131,6 +2349,7 @@ export class ModelBrowser implements Component {
 	 * below the list): one inline fact line and the held-role chips.
 	 */
 	pickerPreview(mode: "full" | "compact", current?: string): readonly NativeChild[] {
+		this.#syncCreditClock();
 		const selected = this.getSelected();
 		const item = selected && !this.#isDisabled(selected) ? selected : undefined;
 		const key = `${mode}\0${current ?? ""}\0${this.#settings.revision}`;
@@ -2144,6 +2363,7 @@ export class ModelBrowser implements Component {
 		) {
 			return memo.children;
 		}
+		if (item) this.#noteCreditChange(item.model);
 		const children = item ? this.modelPreview(item, mode, current) : [];
 		this.#pickerPreview = { item, epoch: this.#pickerEpoch, roles: this.#roles, key, children };
 		return children;
@@ -2189,6 +2409,8 @@ export class ModelBrowser implements Component {
 			if (ctx > 0) facts.push({ k: "ctx", v: formatNumber(ctx).toLowerCase() });
 			if (out > 0) facts.push({ k: "out", v: formatNumber(out).toLowerCase() });
 			facts.push({ k: "price", v: isFreeModel(model) ? "free" : formatCostDetail(model) });
+			const nextCredits = nextCreditRateNote(model);
+			if (nextCredits) facts.push({ k: "then", v: nextCredits });
 			facts.push({ k: "reasoning", v: model.reasoning ? "yes" : "no" });
 			const children: NativeChild[] = [node("kv", { items: facts, layout: "inline" })];
 			const chips: NativeChild[] = [];

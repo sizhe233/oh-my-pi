@@ -4,9 +4,11 @@ import * as path from "node:path";
 import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { getAgentTombstonePath } from "@oh-my-pi/pi-coding-agent/registry/agent-tombstone";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
@@ -51,14 +53,20 @@ const finished: Message[] = [
 ];
 
 /** Writes subagent `id`'s transcript under the main session `mainFile`, with its spawn contract. */
-async function writeSubagent(mainFile: string, cwd: string, id: string, messages: Message[]): Promise<string> {
+async function writeSubagent(
+	mainFile: string,
+	cwd: string,
+	id: string,
+	messages: Message[],
+	agent?: string,
+): Promise<string> {
 	const file = path.join(mainFile.slice(0, -6), `${id}.jsonl`);
 	const manager = await SessionManager.open(file, undefined, undefined, {
 		initialCwd: cwd,
 		parentSession: mainFile,
 		suppressBreadcrumb: true,
 	});
-	manager.appendSessionInit({ systemPrompt: ["sub prompt"], task: `${id} task`, tools: ["read", "yield"] });
+	manager.appendSessionInit({ systemPrompt: ["sub prompt"], task: `${id} task`, tools: ["read", "yield"], agent });
 	for (const message of messages) manager.appendMessage(message);
 	await manager.close();
 	return file;
@@ -86,7 +94,7 @@ describe("restoreSession (omp --restore)", () => {
 		const mainFile = main.getSessionFile();
 		if (!mainFile) throw new Error("Expected a persisted session file");
 		await main.close();
-		await writeSubagent(mainFile, cwd, "Cut", cutOff);
+		const cutFile = await writeSubagent(mainFile, cwd, "Cut", cutOff, "scout");
 		await writeSubagent(mainFile, cwd, "Done", finished);
 		const killed = await writeSubagent(mainFile, cwd, "Killed", cutOff);
 		await fs.writeFile(getAgentTombstonePath(killed), "");
@@ -111,13 +119,55 @@ describe("restoreSession (omp --restore)", () => {
 			requests: 1,
 		};
 		const followUp = vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockResolvedValue(result);
-		const restoreTurn = vi.fn(async () => true);
+		const registry = AgentRegistry.global();
+		const home = { instanceKey: "main:restore-unit-child", sessionFile: cutFile } as AgentSession;
+		const ensureLive = vi
+			.spyOn(AgentLifecycleManager.global(), "ensureLive")
+			.mockImplementation(async (id, expected) => {
+				const ref = registry.get(id);
+				expect(id).toBe("Cut");
+				expect(expected).toBe(ref);
+				if (!ref || !registry.attachSession(id, home, cutFile, ref)) throw new Error("Cut home attach rejected");
+				return home;
+			});
+		let listener: AgentSessionEventListener | undefined;
+		const receiptId = "main:restore-unit:receipt";
+		const releaseReceipt = vi.fn(async (token: string) => token === receiptId);
+		const receiptFinished = Promise.withResolvers<void>();
+		const runEnded = vi.fn(async () => {});
+		const restoreTurn = vi.fn(async () => {
+			// The final boundary can arrive before scheduling is acknowledged.
+			listener?.({ type: "agent_end", messages: [] });
+			return true;
+		});
 		const session = {
+			instanceKey: "main:restore-unit",
+			sessionFile: mainFile,
+			getAgentId: () => MAIN_AGENT_ID,
+			addDisposer: () => {},
+			subscribe: (callback: AgentSessionEventListener) => {
+				listener = callback;
+				return () => {
+					listener = undefined;
+				};
+			},
 			sessionManager: { getSessionFile: () => mainFile },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
-			yieldQueue: { holdIdleFlush: () => () => {} },
-			waitForIdle: async () => {},
+			acquireRestoreIdleHold: async (file: string, jobs: AsyncJobManager, signal: AbortSignal) => {
+				expect(file).toBe(mainFile);
+				expect(jobs === manager).toBe(true);
+				signal.throwIfAborted();
+				return receiptId;
+			},
+			releaseRestoreIdleHold: releaseReceipt,
+			finishRestoreIdleHold: async (token: string, discard: boolean) => {
+				expect(token).toBe(receiptId);
+				expect(discard).toBe(false);
+				receiptFinished.resolve();
+				return true;
+			},
+			waitForRunEnd: runEnded,
 			restoreInterruptedTurn: restoreTurn,
 		} as unknown as AgentSession;
 
@@ -127,8 +177,20 @@ describe("restoreSession (omp --restore)", () => {
 		// Restore publishes queued jobs before their runners necessarily start.
 		await manager.getJob("Cut")!.promise;
 		expect(followUp).toHaveBeenCalledTimes(1);
-		expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Cut", restore: true, message: "Cut task" });
+		expect(ensureLive).toHaveBeenCalledTimes(1);
+		expect(followUp.mock.calls[0]![0]).toMatchObject({
+			id: "Cut",
+			agent: { name: "Cut" },
+			restore: true,
+			message: "Cut task",
+			softRequestBudget: 100,
+		});
 		await manager.drainDeliveries({ filter: { ownerId: MAIN_AGENT_ID } });
 		expect(delivered).toEqual(["Cut"]);
+		await receiptFinished.promise;
+		expect(restoreTurn).toHaveBeenCalledTimes(1);
+		expect(releaseReceipt).toHaveBeenCalledWith(receiptId);
+		expect(runEnded).toHaveBeenCalledTimes(1);
+		expect(listener).toBeUndefined();
 	});
 });
