@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
-import { closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
+import { closeRelayOwnedTarget, closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/owned-targets";
 import type { RelayToExtMessage } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 
 const WS_ENDPOINT = "ws://relay.test/cdp";
@@ -15,7 +15,10 @@ function connectOwnedTab(bridge: RelayBridge): { extension: RelaySocket; removed
 			removed.push(request.tabId);
 			queueMicrotask(() => {
 				bridge.extMessage(extension, JSON.stringify({ t: "tabRemoved", tabId: request.tabId }));
-				bridge.extMessage(extension, JSON.stringify({ t: "rpcResult", id: request.id, ok: true, result: {} }));
+				bridge.extMessage(
+					extension,
+					JSON.stringify({ t: "rpcResult", id: request.id, ok: true, result: { closed: true } }),
+				);
 			});
 		},
 		close() {},
@@ -49,7 +52,11 @@ function connectOwnedTab(bridge: RelayBridge): { extension: RelaySocket; removed
 	return { extension, removed, targetId };
 }
 
-function installRelayTransport(bridge: RelayBridge, mapReply: (raw: string) => string = raw => raw): void {
+function installRelayTransport(
+	bridge: RelayBridge,
+	mapReply: (raw: string) => string = raw => raw,
+	claim?: string,
+): void {
 	class RelayWebSocket {
 		onopen: (() => void) | null = null;
 		onmessage: ((event: { data: string }) => void) | null = null;
@@ -59,10 +66,13 @@ function installRelayTransport(bridge: RelayBridge, mapReply: (raw: string) => s
 		#closed = false;
 
 		constructor() {
-			this.#connId = bridge.cdpConnected({
-				send: raw => queueMicrotask(() => this.onmessage?.({ data: mapReply(raw) })),
-				close: () => this.close(),
-			});
+			this.#connId = bridge.cdpConnected(
+				{
+					send: raw => queueMicrotask(() => this.onmessage?.({ data: mapReply(raw) })),
+					close: () => this.close(),
+				},
+				claim,
+			);
 			queueMicrotask(() => this.onopen?.());
 		}
 
@@ -89,7 +99,7 @@ describe("relay owned-target close confirmation", () => {
 	it("confirms closure when the extension removes the requested tab", async () => {
 		const bridge = new RelayBridge({});
 		const { removed, targetId } = connectOwnedTab(bridge);
-		installRelayTransport(bridge);
+		installRelayTransport(bridge, undefined, targetId);
 
 		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(true);
 		expect(removed).toEqual([9]);
@@ -103,21 +113,25 @@ describe("relay owned-target close confirmation", () => {
 		bridge.extClosed(extension);
 		expect(bridge.listTargets()).toEqual([]);
 
-		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(false);
+		expect(await closeRelayOwnedTarget(WS_ENDPOINT, targetId)).toBe(false);
 		expect(removed).toEqual([]);
 
 		const reconnected = connectOwnedTab(bridge);
-		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(true);
+		expect(await closeRelayOwnedTarget(WS_ENDPOINT, targetId)).toBe(true);
 		expect(reconnected.removed).toEqual([9]);
 	});
 
 	it.each([{ success: false }, {}])("does not confirm an absent target after a close reply of %j", async result => {
 		const bridge = new RelayBridge({});
 		const { targetId } = connectOwnedTab(bridge);
-		installRelayTransport(bridge, raw => {
-			const reply = JSON.parse(raw) as { id?: number; result?: { success?: boolean } };
-			return reply.result?.success === true ? JSON.stringify({ id: reply.id, result }) : raw;
-		});
+		installRelayTransport(
+			bridge,
+			raw => {
+				const reply = JSON.parse(raw) as { id?: number; result?: { success?: boolean } };
+				return reply.result?.success === true ? JSON.stringify({ id: reply.id, result }) : raw;
+			},
+			targetId,
+		);
 
 		expect(await closeRelayTarget(WS_ENDPOINT, targetId)).toBe(false);
 		expect(bridge.listTargets()).toEqual([]);
