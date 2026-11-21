@@ -1,4 +1,4 @@
-name: OMP v19.0.1 full Linux relay comparison only
+name: OMP v19.0.1 focused Linux relay comparison only
 on:
   push:
     branches: ['diagnostics/omp-v19.0.1-chunk88-native-trace']
@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   chunk88-diagnostic:
-    name: Full Linux diagnostic (reattach hold ${{ matrix.reattach_hold }})
+    name: Focused Linux diagnostic (reattach hold ${{ matrix.reattach_hold }})
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -14,11 +14,11 @@ jobs:
         reattach_hold: ['0', '1']
     if: github.repository == 'sizhe233/oh-my-pi'
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 100
     env:
       OMP_TEST_TIMEOUT: "120"
       PINNED_BASE: 5b48d435a42b581a87c7e9d8d7b8c75d3329b805
-      PREVIOUS_DIAGNOSTIC: 0c129bb905ec3234d965cc85a51709fe144ef568
+      PREVIOUS_DIAGNOSTIC: 2d5f5a84c34ffd67f2cae4dbdb61409c749b1be1
       TEST_SOURCE: packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
       ORIGINAL_BLOB: 0b94a0edd6a3b9df39fd5e17f68f99e3d5c6fcfb
       DIAGNOSTIC_BLOB: d09f6e03e144286b4ee1a7175f2ac017f643d858
@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 6
+          fetch-depth: 7
           persist-credentials: false
       - name: Prove exact pinned candidate and diagnostic-only diff
         shell: bash
@@ -34,11 +34,12 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git show -s --format=%P HEAD)" = "$PREVIOUS_DIAGNOSTIC"
-          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = a144f82ebaeabcb9b19336e389cf4d1b35d168fe
+          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = 0c129bb905ec3234d965cc85a51709fe144ef568
+          test "$(git show -s --format=%P 0c129bb905ec3234d965cc85a51709fe144ef568)" = a144f82ebaeabcb9b19336e389cf4d1b35d168fe
           test "$(git show -s --format=%P a144f82ebaeabcb9b19336e389cf4d1b35d168fe)" = 2f38a8f936c421bb86702064b374929616c575d0
           test "$(git show -s --format=%P 2f38a8f936c421bb86702064b374929616c575d0)" = a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
           test "$(git show -s --format=%P a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5)" = "$PINNED_BASE"
-          test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = "$(printf '%s\n%s' .github/workflows/fork-v1901-chunk88-diagnostic.yml "$TEST_SOURCE")"
+          test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = .github/workflows/fork-v1901-chunk88-diagnostic.yml
           test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
           test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
           test "$(git diff --name-only "$PINNED_BASE" HEAD)" = "$(printf '%s\n%s' .github/workflows/fork-v1901-chunk88-diagnostic.yml "$TEST_SOURCE")"
@@ -53,13 +54,6 @@ jobs:
           set -euo pipefail
           bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
           bun install --frozen-lockfile
-      - name: Restore the original test blob for the prelude
-        shell: bash
-        run: |
-          set -euo pipefail
-          git show "$PINNED_BASE:$TEST_SOURCE" > "$TEST_SOURCE"
-          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
-          git diff --exit-code "$PINNED_BASE" -- packages scripts
       - name: Build extension and check committed embedded assets
         shell: bash
         run: |
@@ -107,8 +101,9 @@ jobs:
             console.log(JSON.stringify({ revision, executablePath: result.executablePath }));
             await appendFile(GITHUB_OUTPUT, "executable=" + result.executablePath + "\nrevision=" + revision + "\n");
           '
-      - name: Run complete browser regression suite and image/clipboard contracts on Linux
+      - name: Run complete focused browser sequence with matched observer and optional hold
         env:
+          REATTACH_HOLD: ${{ matrix.reattach_hold }}
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
         working-directory: packages/coding-agent
         shell: bash
@@ -116,6 +111,13 @@ jobs:
           set -euo pipefail
           test -f "${PUPPETEER_EXECUTABLE_PATH:?Missing pinned Chrome executable}"
           test -x "$PUPPETEER_EXECUTABLE_PATH"
+          case "$REATTACH_HOLD" in
+            0|1) ;;
+            *) exit 2 ;;
+          esac
+          printf 'Focused diagnostic only; reattach hold = %s\n' "$REATTACH_HOLD"
+          export OMP_TEST_RELAY_MENU_JOINED_TRACE=1
+          export OMP_TEST_RELAY_MENU_REATTACH_HOLD="$REATTACH_HOLD"
           bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
             test/tools/browser-*.test.ts \
             test/utils/image-resize.test.ts \
@@ -137,30 +139,7 @@ jobs:
             ../catalog/test/model-thinking.test.ts \
             ../catalog/test/compat-cascade.test.ts \
             ../catalog/test/published-effort-ladders.test.ts
-      - name: Compare the original full TypeScript sequence
-        env:
-          REATTACH_HOLD: ${{ matrix.reattach_hold }}
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f "${PUPPETEER_EXECUTABLE_PATH:?Missing pinned Chrome executable}"
-          test -x "$PUPPETEER_EXECUTABLE_PATH"
-          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
-          bun run gen:export-viewer --check
-          git show "HEAD:$TEST_SOURCE" > "$TEST_SOURCE"
-          test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
-          # One runner invocation captures the same cold-plan prefix and all actual tests.
-          test -z "${OMP_TEST_SHARD:-}"
-          case "$REATTACH_HOLD" in
-            0|1) ;;
-            *) exit 2 ;;
-          esac
-          printf 'Diagnostic only; reattach hold = %s\n' "$REATTACH_HOLD"
-          export OMP_TEST_RELAY_MENU_JOINED_TRACE=1
-          export OMP_TEST_RELAY_MENU_REATTACH_HOLD="$REATTACH_HOLD"
-          bun run ci:test:ts
-      - name: Record pinned Linux browser version after both test suites
+      - name: Record pinned Linux browser version after the diagnostic
         if: ${{ always() && steps.linux-chrome.outcome == 'success' }}
         shell: bash
         env:
