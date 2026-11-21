@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fixed the Chrome relay interrupting extension menus in background tabs it had borrowed; the next operation reuses the same tab without reloading or focusing it.
+
 - Preserve refused CDP WebSocket endpoint context on Bun 1.4.4 while restricting additional diagnostics to bounded local HTTP probes ([#67](https://github.com/sizhe233/oh-my-pi/pull/67) by [@sizhe233](https://github.com/sizhe233)).
 
 - Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.

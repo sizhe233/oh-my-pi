@@ -105,6 +105,10 @@ class CdpConnection {
 	readonly claims = new Set<string>();
 	/** One retry for the exact borrowed page this explicit operation successfully claimed. */
 	retryForeignFrame?: { tab: TabState; refusal: string };
+	/** The exact page the worker named at connect and then claimed from its own live page. */
+	pageClaim?: string;
+	pageClaimConfirmed = false;
+	resumeDeferred?: { tab: TabState; marker: symbol };
 	/** Real child session id → the session it was announced on; its events and detach go there. */
 	readonly childParents = new Map<string, string>();
 	readonly explicitChildren = new Set<string>();
@@ -218,6 +222,8 @@ class TabState {
 	/** Discard cancels the waiter but keeps the extension RPC alive for late cleanup. */
 	attachCancelled = false;
 	attachGeneration = 0;
+	/** A background borrow Chrome detached: passive discovery must not compete with the user's page. */
+	deferredAttach?: symbol;
 	cancelAttach: (() => void) | null = null;
 	/** Retry when a revived tab's canceled attach request finally settles. */
 	retryAttachAfterDiscard = false;
@@ -780,6 +786,9 @@ export class RelayBridge {
 			tab.cancelAttach = null;
 			tab.attachCancelled = false;
 			if (!tab.attached) this.#forgetChildren(tab);
+			if (tab.ompCreated) tab.deferredAttach = undefined;
+			// A deferred worker may have lost its receipt at reconnect. Do not strand an unheld debugger.
+			if (tab.deferredAttach !== undefined) this.#detachIfUnheld(tab.tabKey);
 			if (tab.discarded) {
 				// Retire held sessions now; revival will reannounce and attach the tab.
 				this.#retractTab(tab);
@@ -936,6 +945,10 @@ export class RelayBridge {
 		if (tab) {
 			try {
 				this.#claimTab(conn, tab.tabKey, undefined, true);
+				if (claim === pageTargetIdFromKey(tab.tabKey)) {
+					conn.pageClaim = tab.tabKey;
+					if (tab.deferredAttach !== undefined) conn.resumeDeferred = { tab, marker: tab.deferredAttach };
+				}
 				if (
 					retryForeignFrame &&
 					claim === pageTargetIdFromKey(tab.tabKey) &&
@@ -1261,6 +1274,7 @@ export class RelayBridge {
 					typeof msg.params?.label === "string" ? msg.params.label : undefined,
 					msg.params?.ownsTarget === true,
 				);
+				if (conn.pageClaim === tabKey) conn.pageClaimConfirmed = true;
 				this.#reply(conn, msg, {});
 				return true;
 			} catch (err) {
@@ -1412,6 +1426,14 @@ export class RelayBridge {
 		return false;
 	}
 
+	/** The tab was adopted by a worker that can request it again before acquiring a Puppeteer Page. */
+	#confirmedPageClaim(tabKey: string): boolean {
+		for (const conn of this.#conns.values()) {
+			if (conn.pageClaimConfirmed && conn.pageClaim === tabKey && conn.claims.has(tabKey)) return true;
+		}
+		return false;
+	}
+
 	/** Tab pseudo-sessions only exist to satisfy puppeteer's Target hierarchy. */
 	#handleTabSessionCommand(conn: CdpConnection, msg: CdpCommand, ref: SessionRef): void {
 		switch (msg.method) {
@@ -1478,7 +1500,7 @@ export class RelayBridge {
 			case "Target.setDiscoverTargets": {
 				conn.discover = true;
 				for (const tab of this.#tabs.values()) {
-					if (!this.#eligible(tab)) continue;
+					if (!this.#eligible(tab) || tab.deferredAttach !== undefined) continue;
 					tab.announced = true;
 					this.#emit(conn, "Target.targetCreated", { targetInfo: this.#tabInfo(tab, tab.attached) });
 					this.#emit(conn, "Target.targetCreated", { targetInfo: this.#pageInfo(tab, tab.attached) });
@@ -1490,15 +1512,28 @@ export class RelayBridge {
 				conn.autoAttach = true;
 				// Discarded tabs can stall debugger calls. Retract targets already
 				// announced by Target.setDiscoverTargets so Puppeteer can connect().
-				const tabs = [...this.#tabs.values()].filter(tab => this.#eligible(tab) && !tab.discarded);
+				const tabs = [...this.#tabs.values()].filter(
+					tab => this.#eligible(tab) && !tab.discarded && tab.deferredAttach === undefined,
+				);
 				const retry = msg.params?.autoAttach === true ? conn.retryForeignFrame : undefined;
 				if (retry) conn.retryForeignFrame = undefined;
+				const resume = msg.params?.autoAttach === true ? conn.resumeDeferred : undefined;
+				if (resume) conn.resumeDeferred = undefined;
 				const pending = tabs.map(tab => this.#ensureAttached(tab, { retryAfterDiscard: true }));
 				if (retry && !tabs.includes(retry.tab)) {
 					pending.push(this.#ensureAttached(retry.tab, { foreignRetry: { conn, refusal: retry.refusal } }));
 				}
+				if (resume) {
+					pending.push(
+						this.#ensureAttached(resume.tab, {
+							resumeDeferred: { conn, marker: resume.marker, autoAttach: true },
+						}),
+					);
+				}
 				await Promise.all(pending);
+				if (this.#conns.get(conn.id) !== conn) return;
 				for (const tab of tabs) {
+					if (this.#tabs.get(tab.tabKey) !== tab || tab.deferredAttach !== undefined) continue;
 					if (!tab.attached || tab.discarded || !this.#eligible(tab)) {
 						// Failed or newly discarded tabs must not hold up connect().
 						this.#retractTab(tab);
@@ -1527,14 +1562,31 @@ export class RelayBridge {
 					this.#replyError(conn, msg, `Cannot attach to discarded tab ${tab.tabKey}`);
 					return;
 				}
-				if (!(await this.#ensureAttached(tab))) {
+				const resume = parsed.kind === "page" && conn.resumeDeferred?.tab === tab ? conn.resumeDeferred : undefined;
+				if (resume) conn.resumeDeferred = undefined;
+				const generation = tab.attachGeneration;
+				if (!(await this.#ensureAttached(tab, { resumeDeferred: resume && { conn, marker: resume.marker } }))) {
 					const reason = tab.refusal ? `: ${tab.refusal}` : "";
 					this.#replyError(conn, msg, `Cannot attach to tab ${tab.tabKey} (${tab.url})${reason}`);
+					return;
+				}
+				if (this.#conns.get(conn.id) !== conn) {
+					if (this.#tabs.get(tab.tabKey) === tab) this.#detachIfUnheld(tab.tabKey);
+					return;
+				}
+				if (
+					this.#tabs.get(tab.tabKey) !== tab ||
+					!tab.attached ||
+					tab.deferredAttach !== undefined ||
+					(resume && generation !== tab.attachGeneration)
+				) {
+					this.#replyError(conn, msg, `Tab ${tab.tabKey} detached while attaching`);
 					return;
 				}
 				const sessionId = this.#mintSession(conn, parsed.kind, tab);
 				const info = parsed.kind === "tab" ? this.#tabInfo(tab, true) : this.#pageInfo(tab, true);
 				this.#emit(conn, "Target.attachedToTarget", { sessionId, targetInfo: info, waitingForDebugger: false });
+				if (resume) this.#announceTab(tab);
 				this.#reply(conn, msg, { sessionId });
 				return;
 			}
@@ -1875,11 +1927,27 @@ export class RelayBridge {
 		}
 		this.#log("tab detached", { tabKey, reason });
 		tab.attached = false;
+		const waitForDemand =
+			reason === "target_closed" &&
+			!tab.closing &&
+			!tab.ompCreated &&
+			!tab.discarded &&
+			(tab.deferredAttach !== undefined || (!tab.active && this.#confirmedPageClaim(tabKey)));
+		if (waitForDemand || tab.deferredAttach !== undefined) {
+			// Retire any waiter for the previous attachment before notifying its worker.
+			tab.attachGeneration++;
+			tab.cancelAttach?.();
+			tab.cancelAttach = null;
+			tab.attachCancelled = false;
+			tab.retryAttachAfterDiscard = false;
+			tab.deferredAttach = waitForDemand ? Symbol() : undefined;
+		}
 		tab.attaching = null;
 		this.#resetRuntime(tab);
 		// Only the user pressing Cancel on Chrome's debugging bar is a refusal. Chrome also detaches when
 		// another extension's frame (a password manager's inline menu) starts loading in the tab: that tab
-		// stays adoptable and is announced again at once; an attach Chrome refuses still bans it (#ensureAttached).
+		// stays adoptable. For an exact background borrow, passive discovery waits for the next worker claim
+		// instead of competing with the page as the menu loads. A Chrome refusal still bars it (#ensureAttached).
 		const cancelledByUser = reason === "canceled_by_user";
 		if (cancelledByUser) tab.refusal = "the user cancelled Chrome's debugging bar";
 		// A user cancel releases the tab's omp-group membership; any other detach keeps it.
@@ -1963,6 +2031,7 @@ export class RelayBridge {
 
 	/** Announce an unannounced tab to discovering connections and attach it for auto-attaching ones. */
 	#announceTab(tab: TabState): void {
+		if (tab.deferredAttach !== undefined) return;
 		tab.announced = true;
 		for (const conn of this.#conns.values()) {
 			if (!conn.discover) continue;
@@ -1982,13 +2051,15 @@ export class RelayBridge {
 		}
 		if (!hasAutoAttach) return;
 		void this.#ensureAttached(tab, { retryAfterDiscard: true }).then(ok => {
+			if (this.#tabs.get(tab.tabKey) !== tab || tab.deferredAttach !== undefined) return;
 			if (!ok) {
 				// A refused attach bars the tab until its URL changes. Withdraw the announcement too, or the URL change
 				// finds the tab already announced and neither announces nor attaches it again.
-				if (tab.refusal && tab.announced && this.#tabs.get(tab.tabKey) === tab) this.#retractTab(tab);
+				if (tab.refusal && tab.announced) this.#retractTab(tab);
 				return;
 			}
-			if (tab.discarded || !this.#eligible(tab) || this.#tabs.get(tab.tabKey) !== tab) {
+			if (!tab.attached) return;
+			if (tab.discarded || !this.#eligible(tab)) {
 				this.#retractTab(tab);
 				this.#detachIfUnheld(tab.tabKey);
 				return;
@@ -2346,16 +2417,43 @@ export class RelayBridge {
 
 	async #ensureAttached(
 		tab: TabState,
-		opts: { retryAfterDiscard?: boolean; foreignRetry?: { conn: CdpConnection; refusal: string } } = {},
+		opts: {
+			retryAfterDiscard?: boolean;
+			foreignRetry?: { conn: CdpConnection; refusal: string };
+			resumeDeferred?: { conn: CdpConnection; marker: symbol; autoAttach?: boolean };
+		} = {},
 	): Promise<boolean> {
 		if (tab.discarded) return false;
 		const retry = opts.foreignRetry;
+		const resume = opts.resumeDeferred;
+		const canResume = () =>
+			resume !== undefined &&
+			tab.deferredAttach === resume.marker &&
+			!tab.closing &&
+			!tab.ompCreated &&
+			!tab.discarded &&
+			!tab.refusal &&
+			this.#eligible(tab) &&
+			this.#tabs.get(tab.tabKey) === tab &&
+			this.#conns.get(resume.conn.id) === resume.conn &&
+			resume.conn.claims.has(tab.tabKey);
 		// An explicit check belongs to this operation, not a queue that can outlive it.
 		if (retry && tab.detaching) return false;
+		// An earlier claimant may have disconnected while Chrome was processing its attach. A new
+		// exact claimant waits for that single receipt and its cleanup, never sends a competing RPC.
+		if (resume) {
+			if (!canResume()) return false;
+			if (tab.attaching) await tab.attaching;
+			if (!canResume()) return false;
+		}
 		// The extension emits the detach echo before resolving the RPC. Awaiting
 		// prevents a replacement attach racing either operation.
 		while (tab.detaching) await tab.detaching;
 		if (tab.discarded) return false;
+		if (resume || tab.deferredAttach !== undefined) {
+			// An exact claimant's root and page attaches must not race another generation.
+			if (!canResume() || !this.#eligible(tab) || tab.attached || tab.attaching) return false;
+		}
 		if (
 			retry &&
 			(tab.attached ||
@@ -2381,11 +2479,20 @@ export class RelayBridge {
 		const cancelled = Promise.withResolvers<boolean>();
 		const request = this.#rpc({ op: "attach", tabId: tab.tabId }, inst)
 			.then(() => {
+				// A detach, hello, replacement, or removal can retire this exact attempt.
+				if (
+					(retry || resume || tab.deferredAttach !== undefined || generation !== tab.attachGeneration) &&
+					(tab.attaching !== attempt || this.#tabs.get(tab.tabKey) !== tab || inst.socket !== socket)
+				)
+					return false;
+				if (resume && (!canResume() || generation !== tab.attachGeneration)) {
+					// The exact requester left or this same tab was discarded. Release this acknowledged
+					// native attachment only if its identity is still current, without publishing to discovery.
+					tab.attached = true;
+					this.#detachIfUnheld(tab.tabKey);
+					return false;
+				}
 				if (retry) {
-					// A detach, hello, replacement, or removal can retire this exact attempt. Its
-					// receipt must not revive the tab or erase a newer decision from Chrome.
-					if (tab.attaching !== attempt || this.#tabs.get(tab.tabKey) !== tab || inst.socket !== socket)
-						return false;
 					if (
 						generation !== tab.attachGeneration ||
 						tab.closing ||
@@ -2404,6 +2511,14 @@ export class RelayBridge {
 				tab.attached = true;
 				tab.reattachedAfterDetach = true;
 				if (tab.discarded) this.#detachIfUnheld(tab.tabKey);
+				if (resume) {
+					tab.deferredAttach = undefined;
+					if (resume.autoAttach) {
+						this.#announceTab(tab);
+						// Give the requester its session before unrelated startup RPCs finish.
+						this.#emitTabAttached(resume.conn, tab);
+					}
+				}
 				if (retry) {
 					// Associate this exact receipt with its requester before unrelated startup RPCs
 					// settle. A close then drops the attachment only if no real session holds it.
@@ -2419,6 +2534,7 @@ export class RelayBridge {
 					!(err instanceof ExtensionReplacedError) &&
 					!(err instanceof RpcTimeoutError) &&
 					generation === tab.attachGeneration &&
+					(!resume || (tab.attaching === attempt && inst.socket === socket && canResume())) &&
 					(!retry ||
 						(tab.attaching === attempt &&
 							this.#tabs.get(tab.tabKey) === tab &&
@@ -2428,6 +2544,7 @@ export class RelayBridge {
 					!/busy|not ready|settling|temporar|rpc failed|reattach failed|^debugger unavailable$/i.test(error)
 				) {
 					tab.refusal = error || "Chrome refused the attach";
+					if (resume) tab.deferredAttach = undefined;
 				}
 				return false;
 			})
@@ -2436,12 +2553,12 @@ export class RelayBridge {
 					tab.attaching = null;
 					tab.cancelAttach = null;
 					tab.attachCancelled = false;
+					const retry = tab.retryAttachAfterDiscard;
+					tab.retryAttachAfterDiscard = false;
+					if (retry && !tab.discarded) this.#attachForAutoAttach(tab);
 				}
-				const retry = tab.retryAttachAfterDiscard;
-				tab.retryAttachAfterDiscard = false;
-				if (retry && !tab.discarded) this.#attachForAutoAttach(tab);
 				// Every client left while Chrome attached: nobody can take a session on the tab, so release it.
-				if (this.#conns.size === 0) this.#detachIfUnheld(tab.tabKey);
+				if (this.#conns.size === 0 && this.#tabs.get(tab.tabKey) === tab) this.#detachIfUnheld(tab.tabKey);
 			});
 		// Stop waiting for discarded tabs without dropping the extension RPC's late result.
 		const attempt = Promise.race([request, cancelled.promise]);

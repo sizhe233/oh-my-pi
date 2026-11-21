@@ -583,6 +583,7 @@ async function fetchRelayEntries(
 	relayJson: string,
 	signal?: AbortSignal,
 	timeoutMs = RELAY_JSON_TIMEOUT_MS,
+	strictPages = false,
 ): Promise<RelayJsonEntry[] | null> {
 	try {
 		const res = await probeCdpResponse(`${relayJson.replace(/\/$/, "")}/json`, {
@@ -591,7 +592,20 @@ async function fetchRelayEntries(
 		});
 		if (!res || res.status < 200 || res.status >= 300) return null;
 		const body: unknown = JSON.parse(Buffer.from(res.body, "latin1").toString("utf8"));
-		return Array.isArray(body) ? (body as RelayJsonEntry[]) : null;
+		return Array.isArray(body) &&
+			(!strictPages ||
+				body.every(
+					entry =>
+						isRecord(entry) &&
+						typeof entry.type === "string" &&
+						(entry.type !== "page" ||
+							(typeof entry.id === "string" &&
+								entry.id.length > 0 &&
+								typeof entry.url === "string" &&
+								typeof entry.title === "string")),
+				))
+			? (body as RelayJsonEntry[])
+			: null;
 	} catch {
 		throwIfAborted(signal);
 		return null;
@@ -682,58 +696,82 @@ function selectRelayEntry(entries: RelayJsonEntry[], options: PickTargetOptions)
 	return usable.find(e => e.active === "true") ?? usable[0] ?? null;
 }
 
+async function selectRelayPage(
+	relayJson: string,
+	options: PickTargetOptions,
+	authoritative = false,
+): Promise<RelayJsonEntry | null | undefined> {
+	let entries = await fetchRelayEntries(relayJson, options.signal, RELAY_JSON_TIMEOUT_MS, authoritative);
+	const matcher = options.matcher;
+	const settleDeadline = Date.now() + RELAY_MATCH_SETTLE_MS;
+	// Generic attachment keeps its old fallback; the relay worker may wait for authoritative metadata.
+	while (
+		matcher &&
+		entries !== null &&
+		(authoritative || entries.some(e => e.type === "page")) &&
+		!entries.some(e => e.type === "page" && relayEntryMatches(e, matcher)) &&
+		Date.now() < settleDeadline
+	) {
+		await abortable(options.signal, () => Bun.sleep(Math.min(RELAY_MATCH_POLL_MS, settleDeadline - Date.now())));
+		const polled = await fetchRelayEntries(
+			relayJson,
+			options.signal,
+			Math.max(1, settleDeadline - Date.now()),
+			authoritative,
+		);
+		throwIfAborted(options.signal);
+		entries = polled ?? entries;
+	}
+	if (entries === null) return undefined;
+	const pages = entries.filter(entry => entry.type === "page");
+	return authoritative || pages.length > 0 ? selectRelayEntry(pages, options) : null;
+}
+
+/** Resolve an explicit relay borrow before asking Puppeteer to materialize a Page. */
+export async function selectRelayTargetId(relayJson: string, matcher: string, signal?: AbortSignal): Promise<string> {
+	throwIfAborted(signal);
+	const selected = await selectRelayPage(relayJson, { matcher, signal }, true);
+	if (selected === undefined) {
+		// A deferred target is deliberately absent from the passive registry. Do not silently pick a
+		// different live page when its title or URL also matches the requested borrow.
+		throw new ToolError("The browser relay did not list its pages (GET /json failed). Retry the borrow.");
+	}
+	if (!selected || typeof selected.id !== "string" || !selected.id) {
+		throw new ToolError("The relay did not return an id for the selected page");
+	}
+	return selected.id;
+}
+
 /** Select relay pages from /json metadata before probing pages; enumerate targets when metadata offers no selection. */
 export async function pickElectronTarget(browser: Browser, options: PickTargetOptions = {}): Promise<Page> {
 	throwIfAborted(options.signal);
 	if (options.relayJson) {
-		let entries = await fetchRelayEntries(options.relayJson, options.signal);
-		const matcher = options.matcher;
-		const settleDeadline = Date.now() + RELAY_MATCH_SETTLE_MS;
-		// Without page metadata, target enumeration below decides at once, as before.
-		while (
-			matcher &&
-			entries?.some(e => e.type === "page") &&
-			!entries.some(e => e.type === "page" && relayEntryMatches(e, matcher)) &&
-			Date.now() < settleDeadline
-		) {
-			await abortable(options.signal, () => Bun.sleep(Math.min(RELAY_MATCH_POLL_MS, settleDeadline - Date.now())));
-			const polled = await fetchRelayEntries(
-				options.relayJson,
-				options.signal,
-				Math.max(1, settleDeadline - Date.now()),
-			);
-			throwIfAborted(options.signal);
-			entries = polled ?? entries;
-		}
-		if (entries) {
-			const pageEntries = entries.filter(e => e.type === "page");
-			const selected = pageEntries.length > 0 ? selectRelayEntry(pageEntries, options) : null;
+		const selected = await selectRelayPage(options.relayJson, options);
+		if (selected) {
 			const targets = browser.targets();
-			if (selected) {
-				const isSelected = (t: Target) => (t as Target & { _targetId?: string })._targetId === selected.id;
-				const attachDeadline = Date.now() + PAGE_ATTACH_TIMEOUT_MS;
-				let target = targets.find(isSelected);
-				if (!target) {
-					// Puppeteer learns of a tab from the relay's targetCreated event, which can trail /json.
-					try {
-						target = await abortable(options.signal, () =>
-							browser.waitForTarget(isSelected, { timeout: PAGE_ATTACH_TIMEOUT_MS, signal: options.signal }),
+			const isSelected = (t: Target) => (t as Target & { _targetId?: string })._targetId === selected.id;
+			const attachDeadline = Date.now() + PAGE_ATTACH_TIMEOUT_MS;
+			let target = targets.find(isSelected);
+			if (!target) {
+				// Puppeteer learns of a tab from the relay's targetCreated event, which can trail /json.
+				try {
+					target = await abortable(options.signal, () =>
+						browser.waitForTarget(isSelected, { timeout: PAGE_ATTACH_TIMEOUT_MS, signal: options.signal }),
+					);
+				} catch (error) {
+					throwIfAborted(options.signal);
+					if (isPuppeteerTimeout(error)) {
+						throw new ToolError(
+							"Selected tab did not become available before omp could attach; retry, or reopen it if it closed",
 						);
-					} catch (error) {
-						throwIfAborted(options.signal);
-						if (isPuppeteerTimeout(error)) {
-							throw new ToolError(
-								"Selected tab did not become available before omp could attach; retry, or reopen it if it closed",
-							);
-						}
-						throw error;
 					}
+					throw error;
 				}
-				const page = await attachPageWithTimeout(target, attachDeadline - Date.now(), options.signal);
-				if (!page || !(await waitForMainFrame(page, FRAME_READY_TIMEOUT_MS, options.signal)))
-					throw new ToolError("Selected tab is not ready; retry after it loads");
-				return page;
 			}
+			const page = await attachPageWithTimeout(target, attachDeadline - Date.now(), options.signal);
+			if (!page || !(await waitForMainFrame(page, FRAME_READY_TIMEOUT_MS, options.signal)))
+				throw new ToolError("Selected tab is not ready; retry after it loads");
+			return page;
 		}
 	}
 

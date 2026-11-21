@@ -22,7 +22,7 @@ import { expandPath } from "../path-utils";
 import { CELL_BUDGET_SLACK_MS } from "../run-scope";
 import { ToolAbortError, toWorkerErrorPayload } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { gracefulKillTreeOnce, isChromiumBrowserExecutable, pickElectronTarget } from "./attach";
+import { gracefulKillTreeOnce, isChromiumBrowserExecutable, pickElectronTarget, selectRelayTargetId } from "./attach";
 import type * as Cmux from "./cmux/cmux-tab";
 import { CmuxUnavailableError, mapWaitUntil } from "./cmux/rpc";
 import { browserConnection, DEFAULT_VIEWPORT, privateTargetId } from "./launch";
@@ -2486,12 +2486,14 @@ async function buildInitPayload(
 		page = { kind: "create" };
 	} else {
 		// A spawned app (Electron) without a target adopts its first window; an explicit target is borrowed.
-		const picked = await pickElectronTarget(browser.browser, {
-			matcher: opts.target,
-			relayJson: browser.kind.kind === "relay" ? browser.kind.cdpUrl : undefined,
-			signal: opts.signal,
-		});
-		const targetId = await targetIdForPage(picked);
+		// The worker claims the exact page at connect time. After a background detach, the passive
+		// registry will deliberately have no Puppeteer Page to pick in advance.
+		const targetId =
+			browser.kind.kind === "relay" && opts.target
+				? await selectRelayTargetId(browser.kind.cdpUrl, opts.target, opts.signal)
+				: await targetIdForPage(
+						await pickElectronTarget(browser.browser, { matcher: opts.target, signal: opts.signal }),
+					);
 		// A relay target must be exclusively borrowed; an implicit app window
 		// must not silently alias a page under a different name either.
 		if (!opts.target || browser.kind.kind === "relay") assertTargetUnbound(browser, targetId);

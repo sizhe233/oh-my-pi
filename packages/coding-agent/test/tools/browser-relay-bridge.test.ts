@@ -3080,6 +3080,127 @@ describe("RelayBridge auto-attach gating", () => {
 		return id;
 	}
 
+	async function detachedBorrow() {
+		const bridge = new RelayBridge();
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1, active: false }), tab({ tabId: 2, active: true })]);
+		const worker = new FakeCdpSocket();
+		const workerId = bridge.cdpConnected(worker, pageId(1));
+		const sessionId = await attachPage(bridge, ext, worker, workerId, 1);
+		bridge.cdpMessage(workerId, JSON.stringify({ id: ++msgSeq, sessionId, method: "OMP.claimTarget" }));
+		await flush();
+		const registry = new FakeCdpSocket();
+		const registryId = bridge.cdpConnected(registry);
+		bridge.cdpMessage(registryId, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets" }));
+		bootAutoAttach(bridge, registryId);
+		ack(bridge, ext, "attach");
+		await flush();
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "target_closed" }));
+		await flush();
+		return { bridge, ext, registry, worker, workerId };
+	}
+
+	it("leaves a spontaneously detached background borrowed tab alone until its next exact claim", async () => {
+		const { bridge, ext, worker, workerId } = await detachedBorrow();
+		expect(worker.messages.some(message => message.method === "OMP.debuggerDetached")).toBeTrue();
+		expect(ext.pending("attach")).toEqual([]);
+		expect(bridge.listTargets().map(target => target.id)).toContain(pageId(1));
+
+		bridge.cdpClosed(workerId);
+		const bystander = new FakeCdpSocket();
+		const bystanderId = bridge.cdpConnected(bystander);
+		bridge.cdpMessage(bystanderId, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets" }));
+		const passiveBoot = bootAutoAttach(bridge, bystanderId);
+		const passiveAttach = ++msgSeq;
+		bridge.cdpMessage(
+			bystanderId,
+			JSON.stringify({ id: passiveAttach, method: "Target.attachToTarget", params: { targetId: pageId(1) } }),
+		);
+		await flush();
+		expect(bystander.messages.find(message => message.id === passiveBoot)?.result).toEqual({});
+		expect(bystander.sessionFor(passiveAttach)).toBeUndefined();
+		expect(
+			bystander.messages.some(
+				message => message.method === "Target.targetCreated" && JSON.stringify(message).includes(pageId(1)),
+			),
+		).toBeFalse();
+		expect(ext.pending("attach")).toEqual([]);
+
+		const nextWorker = new FakeCdpSocket();
+		const nextId = bridge.cdpConnected(nextWorker, pageId(1));
+		bridge.cdpMessage(nextId, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets" }));
+		const demandBoot = bootAutoAttach(bridge, nextId);
+		await flush();
+		expect(ext.pending("attach").map(rpc => [rpc.tabId, rpc.clearForeignFrames])).toEqual([[1, false]]);
+		ack(bridge, ext, "attach");
+		await flush();
+		const created = nextWorker.messages.findIndex(
+			message => message.method === "Target.targetCreated" && JSON.stringify(message).includes(pageId(1)),
+		);
+		const attachEvent = nextWorker.messages.findIndex(
+			message =>
+				message.method === "Target.attachedToTarget" && JSON.stringify(message).includes("TAB" + ANON + ".1"),
+		);
+		const reply = nextWorker.messages.findIndex(message => message.id === demandBoot);
+		expect(created).toBeGreaterThanOrEqual(0);
+		expect(attachEvent).toBeGreaterThan(created);
+		expect(reply).toBeGreaterThan(attachEvent);
+		expect(ext.rpcs("activateTab")).toEqual([]);
+	});
+
+	it("does not publish a deferred raw attachment whose exclusive claimant leaves before its ACK", async () => {
+		const { bridge, ext, registry, workerId } = await detachedBorrow();
+		bridge.cdpClosed(workerId);
+		const transient = new FakeCdpSocket();
+		const transientId = bridge.cdpConnected(transient, pageId(1));
+		const attach = ++msgSeq;
+		bridge.cdpMessage(
+			transientId,
+			JSON.stringify({ id: attach, method: "Target.attachToTarget", params: { targetId: pageId(1) } }),
+		);
+		await flush();
+		expect(ext.pending("attach").map(rpc => [rpc.tabId, rpc.clearForeignFrames])).toEqual([[1, false]]);
+		expect(() => bridge.cdpConnected(new FakeCdpSocket(), pageId(1))).toThrow("already driven");
+		bridge.cdpClosed(transientId);
+		const next = new FakeCdpSocket();
+		const nextId = bridge.cdpConnected(next, pageId(1));
+		const nextBoot = bootAutoAttach(bridge, nextId);
+		await flush();
+		expect(ext.pending("attach").map(rpc => rpc.tabId)).toEqual([1]);
+		expect(next.messages.some(message => message.id === nextBoot)).toBeFalse();
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(ext.pending("detach").map(rpc => rpc.tabId)).toEqual([1]);
+		expect(transient.sessionFor(attach)).toBeUndefined();
+		expect(attachedIds(registry).filter(id => id === "TAB" + ANON + ".1")).toHaveLength(1);
+
+		ack(bridge, ext, "detach");
+		await flush();
+		expect(ext.pending("attach").map(rpc => [rpc.tabId, rpc.clearForeignFrames])).toEqual([[1, false]]);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(next.messages.find(message => message.id === nextBoot)?.result).toEqual({});
+		expect(attachedIds(registry).filter(id => id === "TAB" + ANON + ".1")).toHaveLength(2);
+	});
+
+	it("does not publish a previously deferred tab that navigates to an ineligible URL before its ACK", async () => {
+		const { bridge, ext, registry, workerId } = await detachedBorrow();
+		bridge.cdpClosed(workerId);
+		const next = new FakeCdpSocket();
+		const nextId = bridge.cdpConnected(next, pageId(1));
+		bootAutoAttach(bridge, nextId);
+		await flush();
+		expect(ext.pending("attach").map(rpc => rpc.tabId)).toEqual([1]);
+		bridge.extMessage(ext, JSON.stringify({ t: "tabUpdated", tab: tab({ tabId: 1, url: "chrome://extensions/" }) }));
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(bridge.listTargets().map(target => target.id)).not.toContain(pageId(1));
+		expect(attachedIds(next)).not.toContain("TAB" + ANON + ".1");
+		expect(attachedIds(registry).filter(id => id === "TAB" + ANON + ".1")).toHaveLength(1);
+		expect(ext.pending("detach").map(rpc => rpc.tabId)).toEqual([1]);
+		ack(bridge, ext, "detach");
+	});
+
 	async function nativeRefusedFixture(count = 1) {
 		const bridge = new RelayBridge();
 		const ext = new FakeExtSocket();

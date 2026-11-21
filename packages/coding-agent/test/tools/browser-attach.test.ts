@@ -23,6 +23,7 @@ import {
 	probeCdpStatus,
 	resolveAttachTarget,
 	resolveSpawnArgs,
+	selectRelayTargetId,
 	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
@@ -1112,6 +1113,39 @@ describe("pickElectronTarget relay path", () => {
 	afterEach(async () => {
 		await relay.stop(true);
 		vi.restoreAllMocks();
+	});
+
+	it("resolves a relay borrow before Puppeteer has a Page and never substitutes a matching URL for its exact id", async () => {
+		relayEntries = [
+			{
+				id: "PAGE_FIRST",
+				title: "Shipped cart",
+				url: "https://example.com/PAGE_SECOND",
+				type: "page",
+				active: "true",
+				discarded: "false",
+			},
+			{
+				id: "PAGE_SECOND",
+				title: "Borrowed cart",
+				url: "https://example.com/cart",
+				type: "page",
+				active: "false",
+				discarded: "false",
+			},
+		];
+		await expect(selectRelayTargetId(relayJson, "borrowed CART")).resolves.toBe("PAGE_SECOND");
+		await expect(selectRelayTargetId(relayJson, "PAGE_SECOND")).resolves.toBe("PAGE_SECOND");
+		relayEntries[1] = { ...relayEntries[1]!, discarded: "true" };
+		await expect(selectRelayTargetId(relayJson, "PAGE_SECOND")).rejects.toThrow("was discarded by Chrome");
+	});
+
+	it("rejects a relay borrow when /json is unavailable or cannot identify its pages", async () => {
+		available = false;
+		await expect(selectRelayTargetId(relayJson, "cart")).rejects.toThrow("GET /json failed");
+		available = true;
+		relayEntries = [{ ...RELAY_ENTRIES[0]!, id: "" }];
+		await expect(selectRelayTargetId(relayJson, "cart")).rejects.toThrow("GET /json failed");
 	});
 
 	it("adopts the active tab from /json metadata without attaching any other target", async () => {
