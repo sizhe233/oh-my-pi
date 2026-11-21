@@ -1,4 +1,4 @@
-name: OMP v19.0.1 Linux chunk 88 diagnostic only
+name: OMP v19.0.1 full Linux sequence diagnostic only
 on:
   push:
     branches: ['diagnostics/omp-v19.0.1-chunk88-native-trace']
@@ -8,11 +8,11 @@ jobs:
   chunk88-diagnostic:
     if: github.repository == 'sizhe233/oh-my-pi'
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       OMP_TEST_TIMEOUT: "120"
       PINNED_BASE: 5b48d435a42b581a87c7e9d8d7b8c75d3329b805
-      PREVIOUS_DIAGNOSTIC: 2f38a8f936c421bb86702064b374929616c575d0
+      PREVIOUS_DIAGNOSTIC: a144f82ebaeabcb9b19336e389cf4d1b35d168fe
       TEST_SOURCE: packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
       ORIGINAL_BLOB: 0b94a0edd6a3b9df39fd5e17f68f99e3d5c6fcfb
       DIAGNOSTIC_BLOB: 8b7b02aa6eab341fe14d3d787c56db35ece74918
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
       - name: Prove exact pinned candidate and diagnostic-only diff
         shell: bash
@@ -28,7 +28,8 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git show -s --format=%P HEAD)" = "$PREVIOUS_DIAGNOSTIC"
-          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
+          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = 2f38a8f936c421bb86702064b374929616c575d0
+          test "$(git show -s --format=%P 2f38a8f936c421bb86702064b374929616c575d0)" = a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
           test "$(git show -s --format=%P a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5)" = "$PINNED_BASE"
           test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = .github/workflows/fork-v1901-chunk88-diagnostic.yml
           test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
@@ -45,6 +46,34 @@ jobs:
           set -euo pipefail
           bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
           bun install --frozen-lockfile
+      - name: Restore the original test blob for the prelude
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show "$PINNED_BASE:$TEST_SOURCE" > "$TEST_SOURCE"
+          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
+          git diff --exit-code "$PINNED_BASE" -- packages scripts
+      - name: Build extension and check committed embedded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build Linux test and Windows baseline native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
+          test ! -e packages/natives/native/pi_natives.win32-x64-baseline.node
+          bun scripts/bazel-natives.ts linux-x64-baseline win32-x64-baseline --dest packages/natives/native -- --jobs=2
+          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
+          test -s packages/natives/native/pi_natives.win32-x64-baseline.node
+      - name: Typecheck CLI and extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun --cwd=packages/coding-agent run check:types
+          bun --cwd=packages/browser-relay run check:types
       - name: Install Puppeteer's pinned Chrome for Testing for Linux tests
         id: linux-chrome
         shell: bash
@@ -71,15 +100,60 @@ jobs:
             console.log(JSON.stringify({ revision, executablePath: result.executablePath }));
             await appendFile(GITHUB_OUTPUT, "executable=" + result.executablePath + "\nrevision=" + revision + "\n");
           '
-      - name: Preflight the exact Chrome version and CI test plan
+      - name: Run complete browser regression suite and image/clipboard contracts on Linux
         env:
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
-          PINNED_CHROME_REVISION: ${{ steps.linux-chrome.outputs.revision }}
+        working-directory: packages/coding-agent
         shell: bash
         run: |
           set -euo pipefail
-          test "$(bun --version)" = 1.4.5
-          test -x "${PUPPETEER_EXECUTABLE_PATH:?}"
+          test -f "${PUPPETEER_EXECUTABLE_PATH:?Missing pinned Chrome executable}"
+          test -x "$PUPPETEER_EXECUTABLE_PATH"
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
+            test/tools/browser-*.test.ts \
+            test/utils/image-resize.test.ts \
+            test/utils/clipboard.test.ts
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
+            test/task/restore-regressions.test.ts \
+            test/task/restore.test.ts \
+            test/task/restore-revive.test.ts \
+            test/agent-session-restore.test.ts \
+            test/async-job-manager.test.ts \
+            test/registry/agent-lifecycle.test.ts \
+            test/session/yield-queue.test.ts \
+            test/session-exit-diagnostics.test.ts \
+            test/tools/yield.test.ts \
+            test/settings-stream-fn.test.ts \
+            ../agent/test/tokenizer.test.ts \
+            ../catalog/test/build.test.ts \
+            ../catalog/test/generated-policies.test.ts \
+            ../catalog/test/model-thinking.test.ts \
+            ../catalog/test/compat-cascade.test.ts \
+            ../catalog/test/published-effort-ladders.test.ts
+      - name: Run the full TypeScript sequence with passive trace only
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${PUPPETEER_EXECUTABLE_PATH:?Missing pinned Chrome executable}"
+          test -x "$PUPPETEER_EXECUTABLE_PATH"
+          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
+          bun run gen:export-viewer --check
+          git show "HEAD:$TEST_SOURCE" > "$TEST_SOURCE"
+          test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
+          # One runner invocation captures the same cold-plan prefix and all actual tests.
+          test -z "${OMP_TEST_SHARD:-}"
+          export OMP_TEST_RELAY_MENU_JOINED_TRACE=1
+          bun run ci:test:ts
+      - name: Record pinned Linux browser version after both test suites
+        if: ${{ always() && steps.linux-chrome.outcome == 'success' }}
+        shell: bash
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
+          PINNED_CHROME_REVISION: ${{ steps.linux-chrome.outputs.revision }}
+        run: |
+          set -euo pipefail
           bun --eval '
             import { execFileSync } from "node:child_process";
             const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -89,72 +163,3 @@ jobs:
             console.log(JSON.stringify({ revision, executablePath, version }));
             if (version.split(/\s+/).at(-1) !== revision) throw new Error("Chrome revision mismatch");
           '
-          check_plan() {
-            local plan
-            plan="$(OMP_TEST_SHARD="$1/245" bun scripts/ci-test-ts.ts all --dry-run)"
-            test "$(grep -c '^\$ ' <<< "$plan")" -eq 1
-            test "$(grep '^\$ ' <<< "$plan" | sha256sum | cut -d' ' -f1)" = "$2"
-            printf '%s\n' "$plan"
-          }
-          check_plan 215 771d1064b9fc692a7d7b9998da45088e380c8ae6df5a4d9122edc9f6685f63f8
-          check_plan 216 85b6388440e81e6da1723e85c053050c78a6c75a4b287da96af1d4f9840f2bf1
-      - name: Build extension and check committed embedded assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          bun run --cwd packages/browser-relay build
-          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
-      - name: Build Linux x64 native test addon
-        shell: bash
-        run: |
-          set -euo pipefail
-          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
-          bun scripts/bazel-natives.ts linux-x64-baseline --dest packages/natives/native -- --jobs=2
-          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
-      - name: Run exact chunk 88 baseline and passive native diagnostic
-        env:
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -x "${PUPPETEER_EXECUTABLE_PATH:?}"
-          # The runner writes weighted timing data at process exit. Each
-          # diagnostic shard must start with the original cold plan, not the
-          # preceding shard's new timing data.
-          timing=node_modules/.cache/omp-test-timings.json
-          mkdir -p "$(dirname "$timing")"
-          run_exact_shard() {
-            local trace="$1" shard="$2" expected="$3" plan actual status=0 log
-            test ! -L "$timing" || return 1
-            printf '%s\n' '{"files":{},"commands":{}}' > "$timing" || return 1
-            plan="$(OMP_TEST_SHARD="$shard/245" bun scripts/ci-test-ts.ts all --dry-run)" || return 1
-            test "$(grep -c '^\$ bun test ' <<< "$plan")" -eq 1 || return 1
-            test "$(grep '^\$ bun test ' <<< "$plan" | sha256sum | cut -d' ' -f1)" = "$expected" || return 1
-            log="$(mktemp "${RUNNER_TEMP:?}/omp-shard-$shard.XXXXXXXX")" || return 1
-            OMP_TEST_RELAY_MENU_JOINED_TRACE="$trace" OMP_TEST_SHARD="$shard/245" bun scripts/ci-test-ts.ts all 2>&1 | tee "$log" || status=$?
-            actual="$(grep '^\$ bun test ' "$log" | sha256sum | cut -d' ' -f1)"
-            if test "$actual" != "$expected"; then
-              printf 'Executed shard %s command mismatch: expected %s, got %s\n' "$shard" "$expected" "$actual" >&2
-              return 1
-            fi
-            printf 'Verified executed shard %s argv %s, exit %s\n' "$shard" "$actual" "$status"
-            return "$status"
-          }
-          run_pair() {
-            run_exact_shard 0 215 771d1064b9fc692a7d7b9998da45088e380c8ae6df5a4d9122edc9f6685f63f8 || return $?
-            run_exact_shard "$1" 216 85b6388440e81e6da1723e85c053050c78a6c75a4b287da96af1d4f9840f2bf1
-          }
-          unset OMP_TEST_RELAY_MENU_JOINED_TRACE
-          git show "$PINNED_BASE:$TEST_SOURCE" > "$TEST_SOURCE"
-          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
-          git diff --exit-code "$PINNED_BASE" -- packages
-          a0=0
-          printf '%s\n' 'A0 unmodified candidate test, exact chunk order.'
-          run_pair 0 || a0=$?
-          git show "HEAD:$TEST_SOURCE" > "$TEST_SOURCE"
-          test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
-          a1=0
-          printf '%s\n' 'A1 passive diagnostic test, exact chunk order.'
-          run_pair 1 || a1=$?
-          printf 'Diagnostic only; no release acceptance. A0=%s A1=%s\n' "$a0" "$a1"
-          test "$a0" -eq 0 && test "$a1" -eq 0
