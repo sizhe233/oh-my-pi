@@ -12,6 +12,7 @@ import {
 import { acquireBrowser, type BrowserHandle, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { unpackedExtensionId } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
+import { FOREIGN_FRAME_REFUSAL } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 import type {
 	WorkerInbound,
@@ -27,7 +28,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { WorkerCore } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
-import { getPuppeteerDir } from "@oh-my-pi/pi-utils";
+import { getPuppeteerDir, withTimeout } from "@oh-my-pi/pi-utils";
 import puppeteer, { type Browser, type CDPSession, type Page, type Protocol } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
@@ -69,6 +70,38 @@ function startWorker(payload: WorkerInitPayload): TestWorker {
 	};
 }
 
+/** Order real Chrome detach and one explicit synthetic notice only for the disposable recovery fixture. */
+function recoveryFixtureDebuggerHook(origin: string): string {
+	return `
+let testMenuRecoveryDetachedId;
+const testMenuRecoveryUrl = ${JSON.stringify(origin + "/login?who=driven")};
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+	if (message.op !== "testParkMenuRecoveryDebugger" && message.op !== "testReportMenuRecoveryDetach") return;
+	if (sender.id !== chrome.runtime.id || !Number.isSafeInteger(message.tabId)) {
+		respond({ error: "Not the disposable recovery fixture" });
+		return;
+	}
+	(async () => {
+		const tab = await chrome.tabs.get(message.tabId);
+		if (tab.url !== testMenuRecoveryUrl || tab.active) throw new Error("Not the exact hidden recovery fixture tab");
+		if (message.op === "testParkMenuRecoveryDebugger") {
+			if (testMenuRecoveryDetachedId !== undefined) throw new Error("Already parked for fixture");
+			await chrome.debugger.detach({ tabId: message.tabId });
+			testMenuRecoveryDetachedId = message.tabId;
+		} else {
+			if (testMenuRecoveryDetachedId !== message.tabId) throw new Error("No verified detach to report for fixture");
+			testMenuRecoveryDetachedId = undefined;
+			// Programmatic detach does not fire onDetach. Only time the test notification;
+			// real Chrome, via the unchanged callback, remains the authority on reattach.
+			globalThis.testDebuggerDetach({ tabId: message.tabId }, "target_closed");
+		}
+		return {};
+	})().then(respond, error => respond({ error: String(error) }));
+	return true;
+});
+`;
+}
+
 interface RelayBrowser {
 	browser: Browser;
 	/** Chromium's observed id for each disposable extension fixture. */
@@ -98,6 +131,7 @@ interface RelayFixture extends RelayBrowser {
 async function launchRelayFixture(
 	log?: (message: string, data?: Record<string, unknown>) => void,
 	extensions: string[] = [],
+	controlledMenuRecovery = false,
 ): Promise<RelayFixture> {
 	const port = await findFreeCdpPort();
 	const server = startRelayServer({ port, group: false, log });
@@ -251,7 +285,7 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
 		return true;
 	}
 });
-${background.replace(defaultPort, `var DEFAULT_PORT = ${port};`)}`,
+${controlledMenuRecovery ? recoveryFixtureDebuggerHook(`http://127.0.0.1:${pages.port}`) : ""}${background.replace(defaultPort, `var DEFAULT_PORT = ${port};`)}`,
 		);
 		const { browser, extensionIds, inExtension } = await launchBrowser();
 		const cdpUrl = `http://127.0.0.1:${port}`;
@@ -469,6 +503,124 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 		}
 		throw new Error(`Fixture menu document did not answer (${phase}; ${diagnostics()})`);
 	});
+}
+
+const standInMenuScript = `const menuUrl = chrome.runtime.getURL("menu.html");
+const menuOrigin = "chrome-extension://" + chrome.runtime.id;
+let menu;
+let host;
+let challenge;
+function probeMenu() {
+	if (!challenge || !menu?.isConnected) return;
+	menu.contentWindow?.postMessage({ type: "omp-fixture-menu-probe", challenge }, menuOrigin);
+}
+window.addEventListener("message", event => {
+	const reply = event.data;
+	if (!challenge || !menu?.isConnected || event.source !== menu.contentWindow || event.origin !== menuOrigin) return;
+	if (reply?.type !== "omp-fixture-menu-reply" || reply.challenge !== challenge ||
+		reply.url !== menuUrl || typeof reply.documentId !== "string" || !reply.documentId) return;
+	host.setAttribute("data-omp-fixture-menu-reply", challenge + ":" + reply.documentId);
+});
+document.addEventListener("omp-fixture-probe-menu", event => {
+	if (!host || typeof event.detail !== "string") return;
+	if (challenge !== event.detail) {
+		challenge = event.detail;
+		host.removeAttribute("data-omp-fixture-menu-reply");
+	}
+	probeMenu();
+});
+document.addEventListener("omp-fixture-show-menu", () => {
+	if (host) return;
+	host = document.createElement("vault-menu");
+	menu = document.createElement("iframe");
+	let loads = 0;
+	menu.addEventListener("load", () => {
+		host.setAttribute("data-omp-fixture-menu-loads", String(++loads));
+		probeMenu();
+	});
+	// Set src while detached so insertion does not schedule an about:blank load first.
+	menu.src = menuUrl;
+	host.attachShadow({ mode: "closed" }).append(menu);
+	document.body.append(host);
+	host.setAttribute("data-omp-fixture-menu-mount", "src-assigned");
+});
+document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`;
+
+async function showStandInMenu(page: Page, menu: string, phase: string): Promise<FixtureMenuObservation> {
+	try {
+		await page.waitForFunction("document.documentElement.hasAttribute('data-omp-fixture-menu-ready')", {
+			polling: 25,
+			timeout: 5_000,
+		});
+	} catch (cause) {
+		throw new Error(`Fixture menu content script did not become ready (${phase})`, { cause });
+	}
+	const mounted = await page.evaluate(`(() => {
+	document.dispatchEvent(new Event("omp-fixture-show-menu"));
+	return !!document.querySelector("vault-menu");
+})()`);
+	if (!mounted) throw new Error(`Fixture menu trigger did not mount its host (${phase})`);
+	return await observeFixtureMenu(page, menu, phase);
+}
+
+const standInMenuDismissal = `
+document.addEventListener("omp-fixture-show-menu", () => {
+	if (document.getElementById("omp-fixture-dismiss-menu")) return;
+	const button = document.createElement("button");
+	button.id = "omp-fixture-dismiss-menu";
+	button.type = "button";
+	button.textContent = "Dismiss fixture menu";
+	button.addEventListener("click", () => {
+		host.remove();
+		menu = undefined;
+		host = undefined;
+		button.remove();
+	}, { once: true });
+	document.body.append(button);
+});`;
+
+async function markRecoveryFixtureDocument(page: Page): Promise<string> {
+	const id = crypto.randomUUID();
+	await page.evaluate(`document.documentElement.setAttribute("data-omp-fixture-document-id", ${JSON.stringify(id)})`);
+	return id;
+}
+
+async function nativeRecoveryDocument(page: Page): Promise<unknown> {
+	return await page.evaluate('document.documentElement.getAttribute("data-omp-fixture-document-id")');
+}
+
+async function readRecoveryFixtureDocument(name: string): Promise<unknown> {
+	const result = await runInTab(name, {
+		code: `return {
+	title: await tab.title(),
+	url: await tab.url(),
+	documentId: await tab.evaluate(() => document.documentElement.getAttribute("data-omp-fixture-document-id")),
+};`,
+		timeoutMs: 10_000,
+		session,
+	});
+	return result.returnValue;
+}
+
+async function dismissRecoveryFixtureMenu(page: Page, frameId: Protocol.Page.FrameId): Promise<void> {
+	const client = page.mainFrame().client;
+	const removed = Promise.withResolvers<void>();
+	const observe = (event: Protocol.Page.FrameDetachedEvent) => {
+		if (event.frameId === frameId && event.reason === "remove") removed.resolve();
+	};
+	client.on("Page.frameDetached", observe);
+	try {
+		const dismissed = await page.evaluate(`(() => {
+			const button = document.getElementById("omp-fixture-dismiss-menu");
+			if (!button || button.tagName !== "BUTTON") return false;
+			button.click();
+			return !document.querySelector("vault-menu") && !button.isConnected;
+		})()`);
+		expect(dismissed).toBeTrue();
+		await withTimeout(removed.promise, 5_000, "Native Chrome did not report removal of the exact fixture menu frame");
+	} finally {
+		client.off("Page.frameDetached", observe);
+	}
 }
 
 /** Chrome itself can refuse an attach; neither a refusal nor a success may report a mutation. */
@@ -762,48 +914,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 	}, 60_000);
 
 	it("does not change either fixture extension menu when the relay borrows a tab", async () => {
-		const vaultDir = await writeStandInVault(
-			`const menuUrl = chrome.runtime.getURL("menu.html");
-const menuOrigin = "chrome-extension://" + chrome.runtime.id;
-let menu;
-let host;
-let challenge;
-function probeMenu() {
-	if (!challenge || !menu?.isConnected) return;
-	menu.contentWindow?.postMessage({ type: "omp-fixture-menu-probe", challenge }, menuOrigin);
-}
-window.addEventListener("message", event => {
-	const reply = event.data;
-	if (!challenge || !menu?.isConnected || event.source !== menu.contentWindow || event.origin !== menuOrigin) return;
-	if (reply?.type !== "omp-fixture-menu-reply" || reply.challenge !== challenge ||
-		reply.url !== menuUrl || typeof reply.documentId !== "string" || !reply.documentId) return;
-	host.setAttribute("data-omp-fixture-menu-reply", challenge + ":" + reply.documentId);
-});
-document.addEventListener("omp-fixture-probe-menu", event => {
-	if (!host || typeof event.detail !== "string") return;
-	if (challenge !== event.detail) {
-		challenge = event.detail;
-		host.removeAttribute("data-omp-fixture-menu-reply");
-	}
-	probeMenu();
-});
-document.addEventListener("omp-fixture-show-menu", () => {
-	if (host) return;
-	host = document.createElement("vault-menu");
-	menu = document.createElement("iframe");
-	let loads = 0;
-	menu.addEventListener("load", () => {
-		host.setAttribute("data-omp-fixture-menu-loads", String(++loads));
-		probeMenu();
-	});
-	// Set src while detached so insertion does not schedule an about:blank load first.
-	menu.src = menuUrl;
-	host.attachShadow({ mode: "closed" }).append(menu);
-	document.body.append(host);
-	host.setAttribute("data-omp-fixture-menu-mount", "src-assigned");
-});
-document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
-		);
+		const vaultDir = await writeStandInVault(standInMenuScript);
 		let fixture: RelayFixture | undefined;
 		let relay: BrowserHandle | undefined;
 		const name = `relay-vault-${process.pid}`;
@@ -812,22 +923,6 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			const vaultId = fixture.extensionIds.get(vaultDir);
 			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
 			const menu = `chrome-extension://${vaultId}/menu.html`;
-			const showMenu = async (page: Page, phase: string): Promise<FixtureMenuObservation> => {
-				try {
-					await page.waitForFunction("document.documentElement.hasAttribute('data-omp-fixture-menu-ready')", {
-						polling: 25,
-						timeout: 5_000,
-					});
-				} catch (cause) {
-					throw new Error(`Fixture menu content script did not become ready (${phase})`, { cause });
-				}
-				const mounted = await page.evaluate(`(() => {
-	document.dispatchEvent(new Event("omp-fixture-show-menu"));
-	return !!document.querySelector("vault-menu");
-})()`);
-				if (!mounted) throw new Error(`Fixture menu trigger did not mount its host (${phase})`);
-				return await observeFixtureMenu(page, menu, phase);
-			};
 			const driven = await fixture.browser.newPage();
 			await driven.goto(`${fixture.origin}/login?who=driven`);
 			const user = await fixture.browser.newPage();
@@ -835,7 +930,7 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			await user.goto(userUrl);
 			// The user's menu is already open when omp first connects. Never activate the driven tab.
 			await user.bringToFront();
-			const userMenu = await showMenu(user, "user tab before registry connection");
+			const userMenu = await showStandInMenu(user, menu, "user tab before registry connection");
 			relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
 			expect(await observeFixtureMenu(user, menu, "user tab after registry connection")).toEqual(userMenu);
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
@@ -846,7 +941,7 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
 			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
 			// Trigger the real fixture UI only after borrow, through the independent Chrome connection.
-			const drivenMenu = await showMenu(driven, "driven tab after borrow");
+			const drivenMenu = await showStandInMenu(driven, menu, "driven tab after borrow");
 			expect(drivenMenu.documentId).not.toBe(userMenu.documentId);
 			await checkTitleWithoutHidingFrame(name, "Login driven");
 			expect(await observeFixtureMenu(driven, menu, "driven tab after relay read")).toEqual(drivenMenu);
@@ -858,6 +953,168 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			await releaseTab(name);
 			expect(driven.isClosed()).toBeFalse();
 			expect(user.isClosed()).toBeFalse();
+		} finally {
+			try {
+				if (relay) {
+					await releaseTab(name).catch(() => undefined);
+					await releaseBrowser(relay, { kill: false });
+				}
+			} finally {
+				try {
+					await fixture?.close();
+				} finally {
+					await fs.rm(vaultDir, { recursive: true, force: true });
+				}
+			}
+		}
+	}, 60_000);
+
+	it("reads the ordinary same borrowed target without reload or focus when Chrome never refused it", async () => {
+		const fixture = await launchRelayFixture();
+		let relay: BrowserHandle | undefined;
+		const name = `relay-menu-recovery-control-${process.pid}`;
+		try {
+			const driven = await fixture.browser.newPage();
+			await driven.goto(`${fixture.origin}/login?who=driven`);
+			const user = await fixture.browser.newPage();
+			await user.goto(`${fixture.origin}/login?who=user`);
+			await user.bringToFront();
+			const documentId = await markRecoveryFixtureDocument(driven);
+			const userDocumentId = await markRecoveryFixtureDocument(user);
+			const userUrl = user.url();
+			const url = driven.url();
+
+			relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
+			if (tab.backend !== "worker") throw new Error("Expected a real relay tab worker");
+			expect(tab.ownsPage).toBeFalse();
+			const targetId = tab.targetId;
+			expect(await readRecoveryFixtureDocument(name)).toEqual({ title: "Login driven", url, documentId });
+			expect(await readRecoveryFixtureDocument(name)).toEqual({ title: "Login driven", url, documentId });
+			expect(getTabsMapForTest().get(name)).toBe(tab);
+			expect(tab.targetId).toBe(targetId);
+			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
+			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
+			expect(await nativeRecoveryDocument(user)).toBe(userDocumentId);
+			expect(user.url()).toBe(userUrl);
+			await releaseTab(name);
+			expect(driven.isClosed()).toBeFalse();
+			expect(user.isClosed()).toBeFalse();
+		} finally {
+			try {
+				if (relay) {
+					await releaseTab(name).catch(() => undefined);
+					await releaseBrowser(relay, { kill: false });
+				}
+			} finally {
+				await fixture.close();
+			}
+		}
+	}, 60_000);
+
+	it("recovers the same borrowed tab after a synthetic detach notice, stock Chrome refusal, and native fixture menu dismissal", async () => {
+		const vaultDir = await writeStandInVault(standInMenuScript + standInMenuDismissal);
+		const name = `relay-menu-recovery-${process.pid}`;
+		const failedAttach = Promise.withResolvers<string>();
+		let expectedTabId: number | undefined;
+		let fixture: RelayFixture | undefined;
+		let relay: BrowserHandle | undefined;
+		try {
+			fixture = await launchRelayFixture(
+				(message, data) => {
+					if (
+						expectedTabId !== undefined &&
+						message === "attach failed" &&
+						typeof data?.tabKey === "string" &&
+						data.tabKey.endsWith(`:${expectedTabId}`) &&
+						typeof data.error === "string" &&
+						FOREIGN_FRAME_REFUSAL.test(data.error)
+					) {
+						failedAttach.resolve(data.error);
+					}
+				},
+				[vaultDir],
+				true,
+			);
+			const vaultId = fixture.extensionIds.get(vaultDir);
+			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
+			const menu = `chrome-extension://${vaultId}/menu.html`;
+			const driven = await fixture.browser.newPage();
+			await driven.goto(`${fixture.origin}/login?who=driven`);
+			const user = await fixture.browser.newPage();
+			await user.goto(`${fixture.origin}/login?who=user`);
+			await user.bringToFront();
+			const documentId = await markRecoveryFixtureDocument(driven);
+			const userDocumentId = await markRecoveryFixtureDocument(user);
+			const userUrl = user.url();
+			const url = driven.url();
+			const expected = { title: "Login driven", url, documentId };
+
+			relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
+			if (tab.backend !== "worker") throw new Error("Expected a real relay tab worker");
+			expect(tab.ownsPage).toBeFalse();
+			const targetId = tab.targetId;
+			expectedTabId = chromeTabId(targetId);
+			expect(await readRecoveryFixtureDocument(name)).toEqual(expected);
+			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
+
+			// Order the natural browser guard deterministically: genuinely detach Chrome, then let
+			// the independent fixture mount and verify its real extension document before notifying
+			// omp. The subsequent attach result comes only from stock Chrome, not from this fixture.
+			expect(
+				await fixture.inExtension(
+					`chrome.runtime.sendMessage({ op: "testParkMenuRecoveryDebugger", tabId: ${expectedTabId} })`,
+				),
+			).toEqual({});
+			const menuBefore = await showStandInMenu(driven, menu, "driven tab while its real debugger is detached");
+			expect(
+				await fixture.inExtension(
+					`chrome.runtime.sendMessage({ op: "testReportMenuRecoveryDetach", tabId: ${expectedTabId} })`,
+				),
+			).toEqual({});
+			await withTimeout(failedAttach.promise, 7_500, "Stock Chrome never refused the exact borrowed tab's reattach");
+			const denied = await rejectionOf(readRecoveryFixtureDocument(name));
+			expect(String(denied)).toMatch(/omp kept the tab open as it is/);
+			expect(getTabsMapForTest().get(name)).toBe(tab);
+			expect(tab.targetId).toBe(targetId);
+			expect(tab.heldOut).toBeTrue();
+			expect(await observeFixtureMenu(driven, menu, "driven menu after the real refusal")).toEqual(menuBefore);
+
+			// The exact test-owned UI on the independent native connection dismisses its own menu.
+			// Require the frame-removal event, not only the style/host change or a guessed delay.
+			await dismissRecoveryFixtureMenu(driven, menuBefore.frameId);
+			expect(await nativeRecoveryDocument(driven)).toBe(documentId);
+			expect(driven.url()).toBe(url);
+			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
+			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
+			expect(await nativeRecoveryDocument(user)).toBe(userDocumentId);
+			expect(user.url()).toBe(userUrl);
+
+			let failedRead: Error | undefined;
+			try {
+				// This is a normal, single same-name operation. No release/reopen, navigation,
+				// changed URL or force-attach; the previous denial is not a success here.
+				expect(await readRecoveryFixtureDocument(name)).toEqual(expected);
+			} catch (cause) {
+				failedRead = new Error("The fixture menu is gone, but the ordinary same-page relay read did not recover", {
+					cause,
+				});
+			} finally {
+				expect(getTabsMapForTest().get(name)).toBe(tab);
+				expect(tab.targetId).toBe(targetId);
+				expect(driven.url()).toBe(url);
+				expect(await nativeRecoveryDocument(driven)).toBe(documentId);
+				expect(await chromeTab(fixture, expectedTabId)).toEqual({ active: false });
+				expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
+				expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
+				expect(await nativeRecoveryDocument(user)).toBe(userDocumentId);
+				expect(user.url()).toBe(userUrl);
+			}
+			await releaseTab(name);
+			expect(driven.isClosed()).toBeFalse();
+			expect(user.isClosed()).toBeFalse();
+			if (failedRead) throw failedRead;
 		} finally {
 			try {
 				if (relay) {
