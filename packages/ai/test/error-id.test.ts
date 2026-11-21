@@ -155,6 +155,18 @@ describe("error-id classification", () => {
 		expect(AIError.isProviderRetryableError(new Error(errorMessage))).toBe(true);
 	});
 
+	it("retries a statusless gateway stream interruption but not a 400 rejection with the same wording", () => {
+		const errorMessage = "Provider error (Dots3 Note Preview (Kilo)): stream interrupted";
+		const id = AIError.classifyMessage(message({ errorMessage }));
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.retriable(id)).toBe(true);
+		expect(AIError.isProviderRetryableError(new Error(errorMessage))).toBe(true);
+
+		const denied = AIError.classifyMessage(message({ errorMessage, errorStatus: 400 }));
+		expect(AIError.retriable(denied)).toBe(false);
+		expect(AIError.isProviderRetryableError(new AIError.ProviderHttpError(errorMessage, 400))).toBe(false);
+	});
+
 	it("keeps a stream-drop phrase riding on a terminal 4xx terminal", () => {
 		const errorMessage = "stream closed before response.completed";
 		const id = AIError.classifyMessage(message({ errorStatus: 400, errorMessage }));
@@ -180,6 +192,23 @@ describe("error-id classification", () => {
 		expect(AIError.is(id, AIError.Flag.Timeout)).toBe(true);
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
 		expect(AIError.retriable(id)).toBe(true);
+	});
+
+	it.each([
+		"The service is temporarily unavailable, please try again later",
+		"Model temporarily_unavailable",
+		"Temporary unavailable: capacity",
+	])("classifies temporary-unavailability wording as transient + retryable: %s", errorMessage => {
+		const id = AIError.classifyMessage(message({ errorMessage }));
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.retriable(id)).toBe(true);
+	});
+
+	it("keeps temporary-unavailability wording on a terminal 4xx terminal", () => {
+		const id = AIError.classifyMessage(
+			message({ errorStatus: 403, errorMessage: "403 This model is temporarily unavailable on your plan" }),
+		);
+		expect(AIError.retriable(id)).toBe(false);
 	});
 
 	it("keeps authenticated connection rejections non-retryable", () => {
@@ -232,8 +261,8 @@ describe("error-id classification", () => {
 		expect(AIError.is(denialId, AIError.Flag.AccountPolicy)).toBe(true);
 		expect(AIError.is(denialId, AIError.Flag.ContentBlocked)).toBe(true);
 		expect(AIError.retriable(denialId)).toBe(false);
-		expect(AIError.codexChatGPTAccountPolicyModel(denial)).toBe("gpt-daybreak-blue-latest");
-		expect(AIError.isCodexChatGPTAccountPolicyError(denial, denial.provider, denial.model)).toBe(true);
+		expect(AIError.isModelEntitlementDenial(denial, denial.provider, denial.model)).toBe(true);
+		expect(AIError.isMismatchedModelEntitlementDenial(denial, denial.provider, denial.model)).toBe(false);
 
 		for (const mismatch of [
 			message({
@@ -253,7 +282,8 @@ describe("error-id classification", () => {
 		]) {
 			const mismatchId = AIError.classifyMessage(mismatch);
 			expect(AIError.is(mismatchId, AIError.Flag.AccountPolicy)).toBe(false);
-			expect(AIError.isCodexChatGPTAccountPolicyError(mismatch, mismatch.provider, mismatch.model)).toBe(false);
+			expect(AIError.isModelEntitlementDenial(mismatch, mismatch.provider, mismatch.model)).toBe(false);
+			expect(AIError.isMismatchedModelEntitlementDenial(mismatch, mismatch.provider, mismatch.model)).toBe(true);
 		}
 
 		const genericUnsupported = message({
@@ -265,7 +295,9 @@ describe("error-id classification", () => {
 		});
 		const genericId = AIError.classifyMessage(genericUnsupported);
 		expect(AIError.is(genericId, AIError.Flag.AccountPolicy)).toBe(false);
-		expect(AIError.codexChatGPTAccountPolicyModel(genericUnsupported)).toBeUndefined();
+		expect(
+			AIError.isMismatchedModelEntitlementDenial(genericUnsupported, genericUnsupported.provider, "other-model"),
+		).toBe(false);
 
 		const oversizedModel = "m".repeat(257);
 		const oversized = message({
@@ -275,7 +307,7 @@ describe("error-id classification", () => {
 			errorStatus: 400,
 			errorMessage: `The '${oversizedModel}' model is not supported when using Codex with a ChatGPT account.`,
 		});
-		expect(AIError.codexChatGPTAccountPolicyModel(oversized)).toBeUndefined();
+		expect(AIError.isMismatchedModelEntitlementDenial(oversized, oversized.provider, "other-model")).toBe(false);
 		expect(AIError.is(AIError.classifyMessage(oversized), AIError.Flag.AccountPolicy)).toBe(false);
 	});
 
@@ -393,6 +425,16 @@ describe("error-id classification", () => {
 			expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
 			expect(AIError.retriable(id)).toBe(true);
 		}
+	});
+
+	it("retries Go closed-connection transport errors forwarded by a gateway (#15385)", () => {
+		const errorMessage = "read tcp 127.0.0.1:9426->127.0.0.1:9050: use of closed network connection";
+		const id = AIError.classifyMessage(
+			message({ api: "openai-completions", provider: "custom-gateway", model: "mimo", errorId: 0, errorMessage }),
+		);
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.retriable(id)).toBe(true);
+		expect(AIError.isProviderRetryableError(new Error(errorMessage))).toBe(true);
 	});
 
 	it("retries remote Python HTTP/2 internal and refused stream resets", () => {

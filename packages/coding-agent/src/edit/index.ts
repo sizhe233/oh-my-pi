@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type {
@@ -25,14 +25,24 @@ import {
 	type EditWriteResponse,
 } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { extractUriScheme, InternalUrlRouter, type ResolveContext, sessionResolveContext } from "../internal-urls";
+import { type FileSnapshot, readSnapshot } from "../commit/selective/journal";
+import {
+	extractUriScheme,
+	InternalUrlRouter,
+	type ResolveContext,
+	sessionResolveContext,
+	sessionWriteContext,
+} from "../internal-urls";
+import { isRemoteTextWritable, remoteMirrorUrl, writeRemoteMirror } from "./remote-mirror";
 import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { type FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
-import { FileChangeType, notifyWorkspaceWatchedFiles } from "../lsp/client";
+import { notifyWorkspaceWatchedFiles } from "../lsp/client";
+import { FileChangeType } from "../lsp/types";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import type { ToolSession } from "../tools";
 import { routeWriteThroughBridge } from "../tools/acp-bridge";
+import { approvalTargetKey } from "../tools/approval-targets";
 import { strictestApproval, truncateForPrompt } from "../tools/approval";
 import {
 	deleteFileWithFallback,
@@ -40,13 +50,9 @@ import {
 	isPermissionDeniedError,
 	writeFileWithFallback,
 } from "../tools/file-write-fallback";
-import {
-	invalidateFsScanAfterDelete,
-	invalidateFsScanAfterRename,
-	invalidateFsScanAfterWrite,
-} from "../tools/fs-cache-invalidation";
-import { outputMeta } from "../tools/output-meta";
+import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
@@ -75,7 +81,13 @@ import {
 	cfgEditFuzzyMatch,
 	cfgEditFuzzyThreshold,
 } from "./settings";
-import { cfgLspDiagnosticsDeduplicate, cfgLspDiagnosticsOnEdit, cfgLspFormatOnWrite } from "../lsp/settings";
+import {
+	cfgLspDiagnosticsDeduplicate,
+	cfgLspDiagnosticsOnEdit,
+	cfgLspEnabled,
+	cfgLspFormatOnWrite,
+	cfgLspRequestTimeout,
+} from "../lsp/settings";
 
 export type {
 	EditRenderContext,
@@ -168,7 +180,7 @@ export function resolveEditToolDescription(
 
 /** Builds the LSP writethrough from the current `lsp.*` settings; called per write so changes apply immediately. */
 function createEditWritethrough(session: ToolSession): WritethroughCallback {
-	const enableLsp = session.enableLsp ?? true;
+	const enableLsp = (session.enableLsp ?? true) && cfgLspEnabled.get(session.settings);
 	const enableDiagnostics = enableLsp && cfgLspDiagnosticsOnEdit.get(session.settings);
 	const enableFormat = enableLsp && cfgLspFormatOnWrite.get(session.settings);
 	const deduplicate = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(session.settings);
@@ -179,12 +191,22 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 				transformDiagnostics: deduplicate
 					? (filePath, result) => getDiagnosticsLedger(session).reduce(filePath, result)
 					: undefined,
+				requestTimeoutSec: cfgLspRequestTimeout.get(session.settings),
 			})
 		: writethroughNoop;
 }
 
 function operationFromNative(op: string): Operation | undefined {
 	return op === "create" || op === "delete" || op === "update" ? op : undefined;
+}
+
+/**
+ * Narrowest per-line cap, in UTF-8 bytes, at which any tool may have cut a line it displayed: grep's
+ * fixed byte cap or read's `tools.outputMaxColumns` (UTF-16 units, which never exceed UTF-8 bytes).
+ */
+function displayMaxColumns(settings: ToolSession["settings"]): number {
+	const readMaxColumns = resolveOutputMaxColumns(settings);
+	return readMaxColumns > 0 ? Math.min(readMaxColumns, DEFAULT_MAX_COLUMN) : DEFAULT_MAX_COLUMN;
 }
 
 function parseDiagnostics(json: string | undefined): FileDiagnosticsResult | undefined {
@@ -294,9 +316,37 @@ function capPerFileSnapshots(entries: EditToolPerFileResult[]): EditToolPerFileR
 
 async function mkdirAllowingFallback(directory: string): Promise<void> {
 	try {
-		await mkdir(directory, { recursive: true });
+		await fs.mkdir(directory, { recursive: true });
 	} catch (error) {
 		if (!hasFileWriteFallback() || !isPermissionDeniedError(error)) throw error;
+	}
+}
+
+/**
+ * Permission bits a move carries to its destination, or undefined where they cannot be read:
+ * Windows has no POSIX mode, and a source the process may not stat is moved by the
+ * privileged fallback writer, which keeps the destination's own mode.
+ */
+async function movedFileMode(filePath: string): Promise<number | undefined> {
+	if (process.platform === "win32") return undefined;
+	try {
+		return (await fs.stat(filePath)).mode & 0o7777;
+	} catch (error) {
+		if (isPermissionDeniedError(error)) return undefined;
+		throw error;
+	}
+}
+
+/**
+ * Give a moved file its source's mode. The content is already at the destination, possibly
+ * written by a privileged fallback writer, so a destination that denies mode changes keeps
+ * its own mode instead of failing the move halfway with both files left behind.
+ */
+async function chmodMovedFile(filePath: string, mode: number): Promise<void> {
+	try {
+		await fs.chmod(filePath, mode);
+	} catch (error) {
+		if (!isPermissionDeniedError(error)) throw error;
 	}
 }
 
@@ -339,7 +389,10 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get mode(): EditMode {
-		return this.#editMode ?? resolveEditMode(this.session);
+		if (this.#editMode) return this.#editMode;
+		const mode = resolveEditMode(this.session);
+		// `edit.mode: none` unregisters this tool on the next built-in reconcile; until then keep a valid schema.
+		return mode === "none" ? "replace" : mode;
 	}
 
 	get description(): string {
@@ -398,6 +451,22 @@ export class EditTool implements AgentTool<TInput> {
 			}
 		}
 		return lines.length === 0 ? ["File: (unknown)"] : lines;
+	};
+
+	/**
+	 * `always-ask-cached` keys: every file the payload writes — section targets
+	 * plus move/rename destinations, mirroring {@link approval}.
+	 */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const { paths, fileOps } = this.#inspect(args);
+		const targets = [...paths];
+		for (const op of fileOps) if (op.kind === "move" && op.to !== undefined) targets.push(op.to);
+		const keys: string[] = [];
+		for (const target of targets) {
+			const key = approvalTargetKey(this.session.cwd, target);
+			if (key !== undefined) keys.push(key);
+		}
+		return keys.length > 0 ? keys : undefined;
 	};
 
 	matcherDigest(args: unknown): string | undefined {
@@ -504,7 +573,11 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		if (outcome.isError) {
-			return { content: [{ type: "text", text: outcome.text }], isError: true };
+			return {
+				content: [{ type: "text", text: outcome.text }],
+				details: { diff: "", errorKind: outcome.errorKind },
+				isError: true,
+			};
 		}
 
 		const details = aggregateDetails(outcome.files, this.mode);
@@ -602,6 +675,7 @@ export class EditTool implements AgentTool<TInput> {
 			allowFuzzy: cfgEditFuzzyMatch.get(this.session.settings),
 			fuzzyThreshold: cfgEditFuzzyThreshold.get(this.session.settings),
 			enforceSeenLines: cfgEditEnforceSeenLines.get(this.session.settings),
+			maxColumns: displayMaxColumns(this.session.settings),
 			blockAutoGenerated: cfgEditBlockAutoGenerated.get(this.session.settings),
 			planActive: this.session.getPlanModeState?.()?.enabled ?? false,
 			urlSchemes: [...specs.keys()],
@@ -626,6 +700,13 @@ export class EditTool implements AgentTool<TInput> {
 			const scheme = extractUriScheme(target);
 			const spec = scheme === undefined ? undefined : router.spec(scheme);
 			if (!spec) return { error: `Unknown internal URL: ${url}`, planWritable: false };
+			if (isRemoteTextWritable(spec)) {
+				// Patched through a local mirror of the live remote text; `#write` sends it back.
+				const resource = await router.resolve(target, context);
+				if (resource.isDirectory) return { error: `${url} is a directory`, planWritable: false };
+				if (typeof resource.content !== "string") return { error: `${url} is binary`, planWritable: false };
+				return { path: await writeRemoteMirror(target, resource.content), planWritable: false };
+			}
 			if (!router.fileWritable(target)) {
 				const reason = spec.write?.via === "handler" ? "is written through `write`, not edited" : "is read-only";
 				return { error: `${url} ${reason}`, planWritable: false };
@@ -637,9 +718,36 @@ export class EditTool implements AgentTool<TInput> {
 		}
 	}
 
+	/** Send a patched remote mirror back through its scheme's handler; the mirror tracks what was written. */
+	async #writeRemote(url: string, request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+		if (request.op !== "update" || request.content === undefined) {
+			throw new ToolError(`${url} can only be patched in place; use \`bash\` to delete or move it`, {
+				path: request.path,
+			});
+		}
+		await InternalUrlRouter.instance().write(url, request.content, sessionWriteContext(this.session, { signal }));
+		await Bun.write(request.path, request.content);
+		return { written: request.content };
+	}
+
 	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+		const remote = remoteMirrorUrl(request.path);
+		if (remote !== undefined) return this.#writeRemote(remote, request, signal);
+		const journaled = this.session.recordFileChange !== undefined;
+		const before = journaled ? await readSnapshot(request.path) : undefined;
+		const journal = (file: string, after: string | null, snapshot: FileSnapshot | undefined = before) => {
+			if (!snapshot) return;
+			this.session.recordFileChange?.({
+				path: file,
+				tool: "edit",
+				before: snapshot.text,
+				after,
+				beforeMtimeMs: snapshot.mtimeMs,
+			});
+		};
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
+			journal(request.path, null);
 			if (this.session.enableLsp ?? true) {
 				await notifyWorkspaceWatchedFiles(
 					this.session.cwd,
@@ -647,7 +755,6 @@ export class EditTool implements AgentTool<TInput> {
 					signal,
 				);
 			}
-			invalidateFsScanAfterDelete(request.path);
 			this.session.bumpFileMutationVersion?.(request.path);
 			const diagnostics =
 				request.flushLsp && request.lspBatchId
@@ -667,9 +774,14 @@ export class EditTool implements AgentTool<TInput> {
 			if (!request.moveTo) {
 				throw new ToolError("Native edit move request omitted destination", { path: request.path });
 			}
+			const mode = await movedFileMode(request.path);
+			const destination = journaled ? await readSnapshot(request.moveTo) : undefined;
 			await mkdirAllowingFallback(path.dirname(request.moveTo));
 			await writeFileWithFallback(request.moveTo, request.content);
+			if (mode !== undefined) await chmodMovedFile(request.moveTo, mode);
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
+			journal(request.path, null);
+			journal(request.moveTo, request.content, destination);
 			if (this.session.enableLsp ?? true) {
 				await notifyWorkspaceWatchedFiles(
 					this.session.cwd,
@@ -680,7 +792,6 @@ export class EditTool implements AgentTool<TInput> {
 					signal,
 				);
 			}
-			invalidateFsScanAfterRename(request.path, request.moveTo);
 			this.session.bumpFileMutationVersion?.(request.path);
 			this.session.bumpFileMutationVersion?.(request.moveTo);
 			const diagnostics =
@@ -700,7 +811,10 @@ export class EditTool implements AgentTool<TInput> {
 			request.content,
 			signal,
 		);
-		if (bridge) return { written: bridge.text };
+		if (bridge) {
+			journal(request.path, bridge.text);
+			return { written: bridge.text };
+		}
 
 		// The pre-image is the only way to tell "the write never landed" from
 		// "something else rewrote the file"; a stat cannot (coarse mtimes).
@@ -754,8 +868,8 @@ export class EditTool implements AgentTool<TInput> {
 			}
 		}
 
-		invalidateFsScanAfterWrite(request.path);
 		if (!began) this.session.bumpFileMutationVersion?.(request.path);
+		journal(request.path, diagnostics.finalContent);
 		return {
 			written: diagnostics.finalContent,
 			diagnosticsJson: diagnostics.diagnostics ? JSON.stringify(diagnostics.diagnostics) : undefined,
