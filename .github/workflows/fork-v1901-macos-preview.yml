@@ -1,0 +1,165 @@
+name: OMP v19.0.1 macOS arm64 preview
+on:
+  push:
+    branches: ['previews/omp-v19.0.1-macos-demand-recovery']
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    name: Build and smoke macOS arm64 CLI and relay extension
+    # Hosted macos-15 is Apple Silicon; the first step also asserts uname -m.
+    if: github.repository == 'sizhe233/oh-my-pi'
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      OMP_TEST_TIMEOUT: "120"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Verify trusted source and Apple Silicon host
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git show -s --format=%P HEAD)" = cc9e3062e5708a8f666876a7bae81984f6ab0954
+          test "$(git diff --name-only HEAD^ HEAD)" = "$(printf '%s\n' .github/workflows/fork-v1901-macos-preview.yml packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts)"
+          test "$(uname -m)" = arm64
+          test "$(git hash-object packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts)" = 31d142d693d5084d003ccbbef98e8989db52f8dc
+          xcodebuild -version
+          bazelisk --version
+          df -h .
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.5
+      - name: Install frozen workspace dependencies
+        run: |
+          set -euo pipefail
+          bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
+          bun install --frozen-lockfile
+      - name: Build extension and check committed embedded assets
+        run: |
+          set -euo pipefail
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build native addon from this checkout
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.darwin-arm64.node
+          bun scripts/bazel-natives.ts darwin-arm64 --dest packages/natives/native -- --jobs=2
+          test -s packages/natives/native/pi_natives.darwin-arm64.node
+      - name: Verify the native addon does not link Swift or FoundationModels directly
+        run: |
+          set -euo pipefail
+          if otool -L packages/natives/native/pi_natives.darwin-arm64.node | grep -E 'libswift|FoundationModels'; then
+            echo "::error::Native addon must load the optional Apple FM bridge dynamically for older macOS"
+            exit 1
+          fi
+      - name: Check CLI and extension types
+        run: |
+          set -euo pipefail
+          bun --cwd=packages/coding-agent run check:types
+          bun --cwd=packages/browser-relay run check:types
+      - name: Run complete browser regression suite and image/clipboard contracts
+        working-directory: packages/coding-agent
+        run: |
+          set -euo pipefail
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
+            test/tools/browser-*.test.ts \
+            test/utils/image-resize.test.ts \
+            test/utils/clipboard.test.ts 2>&1 | tee "$RUNNER_TEMP/omp-macos-preview-browser.log"
+          grep -F '(pass) relay tab ownership > does not change either fixture extension menu when the relay borrows a tab' "$RUNNER_TEMP/omp-macos-preview-browser.log"
+          grep -F '(pass) relay tab ownership > recovers the same borrowed tab after a synthetic detach notice, stock Chrome refusal, and native fixture menu dismissal' "$RUNNER_TEMP/omp-macos-preview-browser.log"
+          bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
+            test/task/restore-regressions.test.ts \
+            test/task/restore.test.ts \
+            test/task/restore-revive.test.ts \
+            test/agent-session-restore.test.ts \
+            test/async-job-manager.test.ts \
+            test/registry/agent-lifecycle.test.ts \
+            test/session/yield-queue.test.ts \
+            test/session-exit-diagnostics.test.ts \
+            test/tools/yield.test.ts \
+            test/settings-stream-fn.test.ts \
+            ../agent/test/tokenizer.test.ts \
+            ../catalog/test/build.test.ts \
+            ../catalog/test/generated-policies.test.ts \
+            ../catalog/test/model-thinking.test.ts \
+            ../catalog/test/compat-cascade.test.ts \
+            ../catalog/test/published-effort-ladders.test.ts
+      - name: Compile one release CLI from the same SHA
+        run: bun scripts/ci-release-build-binaries.ts --targets darwin-arm64
+      - name: Smoke compiled workers and caller directory handling
+        shell: bash
+        env:
+          # Enables model selection for the offline RPC pwd probe; no provider request is made.
+          OPENAI_API_KEY: offline-test-key
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/packages/coding-agent/binaries/omp-darwin-arm64"
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          mkdir -p "$scratch/home" "$scratch/xdg" "$scratch/project" "$scratch/override"
+          export HOME="$scratch/home" XDG_DATA_HOME="$scratch/xdg"
+          codesign --verify --strict "$binary"
+          (cd "$scratch/project" && "$binary" --version && "$binary" --smoke-test)
+          python3 - "$binary" "$scratch" <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          binary, root = sys.argv[1:]
+          root = pathlib.Path(root)
+          for args, expected in [((), root / "project"), (("--cwd=" + str(root / "override"),), root / "override")]:
+              completed = subprocess.run(
+                  [binary, "--mode", "rpc", "--no-ui", "--no-session", *args],
+                  cwd=root / "project", input=json.dumps({"id": "pwd", "type": "bash", "command": "pwd"}) + "\n",
+                  text=True, capture_output=True, timeout=90,
+              )
+              responses = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")]
+              reply = next((frame for frame in responses if frame.get("type") == "response" and frame.get("id") == "pwd"), None)
+              assert completed.returncode == 0 and reply and reply["success"], (completed.returncode, completed.stderr[-500:])
+              assert os.path.realpath(reply["data"]["workingDir"]) == os.path.realpath(expected)
+              assert os.path.realpath(reply["data"]["output"].strip()) == os.path.realpath(expected)
+          PY
+      - name: Verify CLI-embedded extension matches the packaged extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="packages/coding-agent/binaries/omp-darwin-arm64"
+          "$binary" browser-relay install --dir "$RUNNER_TEMP/embedded-extension"
+          for file in background.js manifest.json options.html options.js; do
+            cmp "$RUNNER_TEMP/embedded-extension/$file" "packages/browser-relay/dist/extension/$file"
+          done
+          unzip -p packages/browser-relay/dist/omp-browser-relay-extension.zip background.js | cmp - packages/browser-relay/dist/extension/background.js
+      - name: Record provenance and checksums
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          bun scripts/ci-release-checksums.ts packages/coding-agent/binaries/SHA256SUMS.txt \
+            packages/coding-agent/binaries/omp-darwin-arm64 \
+            packages/browser-relay/dist/omp-browser-relay-extension.zip
+          bun -e 'await Bun.write("packages/coding-agent/binaries/build.json", JSON.stringify({sourceSha:Bun.env.SOURCE_SHA,runId:Bun.env.RUN_ID,platform:process.platform,arch:process.arch,bun:Bun.version,checksums:await Bun.file("packages/coding-agent/binaries/SHA256SUMS.txt").text(),result:"passed"}, null, 2) + "\n")'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omp-preview-darwin-arm64-${{ github.sha }}
+          path: |
+            packages/coding-agent/binaries/omp-darwin-arm64
+            packages/coding-agent/binaries/SHA256SUMS.txt
+            packages/coding-agent/binaries/build.json
+            packages/browser-relay/dist/omp-browser-relay-extension.zip
+          if-no-files-found: error
+          retention-days: 14
+
