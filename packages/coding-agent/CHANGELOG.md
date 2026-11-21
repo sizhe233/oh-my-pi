@@ -10,7 +10,6 @@
 
 - Fixed restored subagent trees losing work at background-job limits, dropping nested results, or replaying completed yields.
 
-## [18.10.3] - 2026-10-12
 ## [19.0.1] - 2026-11-19
 
 ### Added
@@ -1279,3 +1278,5 @@
 - Fixed GitHub `/review` diff links keeping the snapshot that built the request after the cached diff refreshes in the background, instead of opening whatever file now sits at the same index ([#16310](https://github.com/can1357/oh-my-pi/pull/16310) by [@tkossak](https://github.com/tkossak))
 
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@529c1841b699](https://github.com/can1357/oh-my-pi/blob/529c1841b6990b8c014aa79bac60ac2d54fbaf83/packages/coding-agent/CHANGELOG.md).
+
+[Previous fork changelog, including the v18.10.3 notes](https://github.com/sizhe233/oh-my-pi/blob/bdb117f27f7c9644950293f976a8cba04a569b0a/packages/coding-agent/CHANGELOG.md#L11-L35).

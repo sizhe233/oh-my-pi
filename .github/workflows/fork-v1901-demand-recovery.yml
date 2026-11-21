@@ -19,18 +19,19 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
       - name: Prove exact pinned base, reviewed payload and unchanged real menu regression
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git show -s --format=%P HEAD)" = cc9e3062e5708a8f666876a7bae81984f6ab0954
-          test "$(git show -s --format=%P HEAD^)" = "$PINNED_BASE"
+          test "$(git show -s --format=%P HEAD)" = f93f4e475b3b0511326d632872bc14325882ecbe
+          test "$(git show -s --format=%P HEAD^)" = cc9e3062e5708a8f666876a7bae81984f6ab0954
+          test "$(git show -s --format=%P HEAD^^)" = "$PINNED_BASE"
           test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
           test "$(git hash-object "$TEST_SOURCE")" = 31d142d693d5084d003ccbbef98e8989db52f8dc
-          test "$(git diff --name-only HEAD^ HEAD)" = "$(printf '%s\n' .github/workflows/fork-v1901-demand-recovery.yml "$TEST_SOURCE")"
+          test "$(git diff --name-only HEAD^ HEAD)" = "$(printf '%s\n' .github/workflows/fork-v1901-demand-recovery.yml packages/coding-agent/CHANGELOG.md)"
           test "$(uname -m)" = x86_64
           cat > "$RUNNER_TEMP/expected-diff" <<'FILES'
           .github/workflows/fork-v1901-demand-recovery.yml
@@ -43,7 +44,7 @@ jobs:
           packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
           FILES
           git diff --name-only "$PINNED_BASE" HEAD | diff - "$RUNNER_TEMP/expected-diff"
-          test "$(git hash-object packages/coding-agent/CHANGELOG.md)" = 708dbeaf42f39c579705fe47fc7a61b97b5e72b5
+          test "$(git hash-object packages/coding-agent/CHANGELOG.md)" = 3eba416b019ea19fcd00c619d90b23d45d34cae5
           test "$(git hash-object packages/coding-agent/src/tools/browser/attach.ts)" = d914b361428ca260b0bd3d59d7cd73215470f42f
           test "$(git hash-object packages/coding-agent/src/tools/browser/relay/bridge.ts)" = 504e2fbbcb573b1abb7aacf6530787e9f5dfccf9
           test "$(git hash-object packages/coding-agent/src/tools/browser/tab-supervisor.ts)" = 7b3673b913988eba0f9cfa0b937a00c6dce82130
@@ -80,6 +81,13 @@ jobs:
           set -euo pipefail
           bun --cwd=packages/coding-agent run check:types
           bun --cwd=packages/browser-relay run check:types
+      - name: Verify unchanged changelog startup regression before full tests
+        working-directory: packages/coding-agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun test test/utils/changelog.test.ts --test-name-pattern 'reads current source release data and filters versions newer than the previous release' --timeout=120000 2>&1 | tee "$RUNNER_TEMP/omp-changelog.log"
+          grep -F '(pass) parseChangelog > reads current source release data and filters versions newer than the previous release' "$RUNNER_TEMP/omp-changelog.log"
       - name: Install Puppeteer's pinned Chrome for Testing for Linux tests
         id: linux-chrome
         shell: bash
