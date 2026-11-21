@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { acquireBrowser, type BrowserHandle, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { unpackedExtensionId } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
+import type { RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 import type {
@@ -98,6 +99,7 @@ interface RelayFixture extends RelayBrowser {
 async function launchRelayFixture(
 	log?: (message: string, data?: Record<string, unknown>) => void,
 	extensions: string[] = [],
+	menuWireTrace?: FixtureMenuWireTrace,
 ): Promise<RelayFixture> {
 	const port = await findFreeCdpPort();
 	const server = startRelayServer({ port, group: false, log });
@@ -253,6 +255,10 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
 });
 ${background.replace(defaultPort, `var DEFAULT_PORT = ${port};`)}`,
 		);
+		if (menuWireTrace) {
+			const expectedRelayId = await unpackedExtensionId(extensionDir).catch(() => null);
+			if (expectedRelayId) fixtureTraceOnly(() => menuWireTrace.install(server.bridge, expectedRelayId));
+		}
 		const { browser, extensionIds, inExtension } = await launchBrowser();
 		const cdpUrl = `http://127.0.0.1:${port}`;
 		// Finish the extension hello before the native CDP client attaches to the sentinel.
@@ -469,6 +475,335 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 		}
 		throw new Error(`Fixture menu document did not answer (${phase}; ${diagnostics()})`);
 	});
+}
+
+type FixtureWireKind = "attach" | "auto-attach" | "resume" | "child-attached" | "child-detached";
+type FixtureWireResult = "accepted" | "foreign-refusal" | "not-allowed" | "unknown-session" | "other-error";
+
+interface FixtureWireNote {
+	epoch: number;
+	tab: number;
+	atMs: number;
+	kind: FixtureWireKind;
+	id?: number;
+	session?: string;
+	frame?: string;
+	wait?: boolean;
+	armed?: boolean;
+	result?: FixtureWireResult;
+	resultAtMs?: number;
+}
+
+const FIXTURE_WIRE_MAX_NOTES = 96;
+const FIXTURE_WIRE_MAX_CHARS = 4_096;
+const FIXTURE_WIRE_SUMMARY_MAX = 24;
+const FIXTURE_NATIVE_MAX_NOTES = 16;
+const FIXTURE_WIRE_MAX_EPOCHS = 4;
+
+function fixtureWireRecord(value: unknown): Record<string, unknown> | undefined {
+	if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
+	return undefined;
+}
+
+function fixtureWireMessage(raw: string): Record<string, unknown> | undefined {
+	if (raw.length > FIXTURE_WIRE_MAX_CHARS) return undefined;
+	try {
+		const message: unknown = JSON.parse(raw);
+		return fixtureWireRecord(message);
+	} catch {
+		return undefined;
+	}
+}
+
+function fixtureWireId(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+// Chrome's 128-bit tokens are hex; an unexpected wire shape yields only inconclusive telemetry.
+function fixtureFrameToken(value: unknown): string | undefined {
+	return typeof value === "string" && /^[0-9a-f]{32}$/i.test(value) ? value : undefined;
+}
+
+function fixtureWireResult(ok: boolean, error: unknown): FixtureWireResult {
+	if (ok) return "accepted";
+	if (typeof error === "string" && error.length <= 512) {
+		if (/another extension.s frame|Cannot access a chrome-extension:\/\//i.test(error)) return "foreign-refusal";
+		if (/not allowed/i.test(error)) return "not-allowed";
+		if (/unknown session|session (?:id )?(?:not found|with given id not found)/i.test(error))
+			return "unknown-session";
+	}
+	return "other-error";
+}
+
+/** Diagnostics are never allowed to change a socket result or replace the actual test failure. */
+function fixtureTraceOnly(work: () => void): void {
+	try {
+		work();
+	} catch {
+		// Nothing recorded is necessary for forwarding or acceptance.
+	}
+}
+
+class FixtureMenuWireTrace {
+	#start = performance.now();
+	#notes: FixtureWireNote[] = [];
+	#dropped = false;
+	#tab: number | undefined;
+	#borrowAtMs: number | undefined;
+
+	age(): number {
+		return Math.round(performance.now() - this.#start);
+	}
+
+	drive(tab: number): void {
+		this.#tab = fixtureWireId(tab);
+		if (this.#tab !== undefined) this.#borrowAtMs = this.age();
+	}
+
+	#record(note: FixtureWireNote): void {
+		if (this.#tab !== undefined && note.tab !== this.#tab) return;
+		if (this.#notes.length === FIXTURE_WIRE_MAX_NOTES) {
+			this.#dropped = true;
+			return;
+		}
+		this.#notes.push(note);
+	}
+
+	#outbound(epoch: number, raw: string): void {
+		// Only the three already occurring Chrome operations relevant to this hypothesis.
+		if (
+			raw.length > FIXTURE_WIRE_MAX_CHARS ||
+			!raw.includes('"t":"rpc"') ||
+			!/("op":"attach"|Target.setAutoAttach|Runtime.runIfWaitingForDebugger)/.test(raw)
+		)
+			return;
+		const message = fixtureWireMessage(raw);
+		if (message?.t !== "rpc") return;
+		const tab = fixtureWireId(message.tabId);
+		const id = fixtureWireId(message.id);
+		if (tab === undefined || id === undefined) return;
+		const basis = { epoch, tab, id, atMs: this.age() };
+		if (message.op === "attach") {
+			this.#record({ ...basis, kind: "attach" });
+		} else if (
+			message.op === "send" &&
+			message.method === "Target.setAutoAttach" &&
+			message.sessionId === undefined
+		) {
+			const params = fixtureWireRecord(message.params);
+			if (typeof params?.autoAttach !== "boolean" || typeof params.waitForDebuggerOnStart !== "boolean") return;
+			this.#record({ ...basis, kind: "auto-attach", armed: params.autoAttach, wait: params.waitForDebuggerOnStart });
+		} else if (message.op === "send" && message.method === "Runtime.runIfWaitingForDebugger" && tab === this.#tab) {
+			const session = fixtureFrameToken(message.sessionId);
+			if (session) this.#record({ ...basis, kind: "resume", session });
+		}
+	}
+
+	#inbound(epoch: number, raw: string): void {
+		if (raw.length > FIXTURE_WIRE_MAX_CHARS) return;
+		if (
+			!raw.includes('"t":"rpcResult"') &&
+			(!raw.includes('"t":"cdpEvent"') ||
+				(!raw.includes('"method":"Target.attachedToTarget"') &&
+					!raw.includes('"method":"Target.detachedFromTarget"')))
+		)
+			return;
+		const message = fixtureWireMessage(raw);
+		if (message?.t === "rpcResult") {
+			const id = fixtureWireId(message.id);
+			if (id === undefined || typeof message.ok !== "boolean") return;
+			const note = this.#notes.find(note => note.epoch === epoch && note.id === id);
+			if (note && !note.result) {
+				note.result = fixtureWireResult(message.ok, message.error);
+				note.resultAtMs = this.age();
+			}
+			return;
+		}
+		if (message?.t !== "cdpEvent") return;
+		const tab = fixtureWireId(message.tabId);
+		if (tab === undefined || tab !== this.#tab) return;
+		const params = fixtureWireRecord(message.params);
+		const session = fixtureFrameToken(params?.sessionId);
+		if (!session) return;
+		const basis = { epoch, tab, session, atMs: this.age() };
+		if (message.method === "Target.attachedToTarget") {
+			const info = fixtureWireRecord(params?.targetInfo);
+			const frame = fixtureFrameToken(info?.targetId);
+			if (info?.type === "iframe" && frame && typeof params?.waitingForDebugger === "boolean") {
+				this.#record({ ...basis, kind: "child-attached", frame, wait: params.waitingForDebugger });
+			}
+		} else if (message.method === "Target.detachedFromTarget") {
+			// Child detaches may omit targetId. Only remember a detach for an already observed iframe.
+			if (
+				this.#notes.some(
+					note =>
+						note.epoch === epoch &&
+						note.tab === tab &&
+						note.session === session &&
+						note.kind === "child-attached",
+				)
+			) {
+				this.#record({ ...basis, kind: "child-detached" });
+			}
+		}
+	}
+
+	install(bridge: RelayServer["bridge"], extensionId: string): void {
+		const originalOpen = bridge.extConnected.bind(bridge);
+		const originalMessage = bridge.extMessage.bind(bridge);
+		const originalClose = bridge.extClosed.bind(bridge);
+		const sockets = new WeakMap<RelaySocket, { socket: RelaySocket; epoch: number }>();
+		let epochs = 0;
+		bridge.extConnected = (socket, presentedId) => {
+			if (presentedId === extensionId && !sockets.has(socket) && epochs === FIXTURE_WIRE_MAX_EPOCHS) {
+				this.#dropped = true;
+			}
+			if (presentedId === extensionId && !sockets.has(socket) && epochs < FIXTURE_WIRE_MAX_EPOCHS) {
+				const epoch = ++epochs;
+				sockets.set(socket, {
+					epoch,
+					socket: {
+						send: raw => {
+							fixtureTraceOnly(() => this.#outbound(epoch, raw));
+							socket.send(raw);
+						},
+						close: () => socket.close(),
+					},
+				});
+			}
+			originalOpen(sockets.get(socket)?.socket ?? socket, presentedId);
+		};
+		bridge.extMessage = (socket, raw) => {
+			const mapped = sockets.get(socket);
+			if (mapped) fixtureTraceOnly(() => this.#inbound(mapped.epoch, raw));
+			originalMessage(mapped?.socket ?? socket, raw);
+		};
+		// Internal bridge calls already have the facade; they pass through unchanged.
+		bridge.extClosed = socket => originalClose(sockets.get(socket)?.socket ?? socket);
+		// The bridge exists only for this fixture. Keep normalization through asynchronous socket teardown.
+	}
+
+	summarize(frame: string | undefined) {
+		const notes = this.#tab === undefined ? [] : this.#notes.filter(note => note.tab === this.#tab);
+		const owners = notes.filter(note => frame !== undefined && note.frame === frame);
+		const childAlias = (note: FixtureWireNote) =>
+			owners.findIndex(owner => owner.epoch === note.epoch && owner.session === note.session) + 1;
+		// Project into a new object. No source IDs, paths, URLs, error text, or protocol bodies can escape.
+		const projected = notes.flatMap(note => {
+			const child = childAlias(note);
+			if (note.kind !== "attach" && note.kind !== "auto-attach" && !child) return [];
+			const { epoch, atMs, kind, wait, armed, result, resultAtMs } = note;
+			return [{ epoch, atMs, kind, wait, armed, result, resultAtMs, child: child || undefined }];
+		});
+		const clipped = projected.length > FIXTURE_WIRE_SUMMARY_MAX;
+		// Preserve early registry attach plus the late menu phase when the bounded summary fills.
+		const wire = clipped ? [...projected.slice(0, 6), ...projected.slice(6 - FIXTURE_WIRE_SUMMARY_MAX)] : projected;
+		return {
+			driven: this.#tab === undefined ? "unobserved" : "verified-borrow",
+			borrowAtMs: this.#borrowAtMs,
+			capped: this.#dropped || clipped,
+			wire,
+		};
+	}
+}
+
+interface FixtureNativeMenuTrace {
+	pick(): { frame?: string; label: string; capped: boolean; native: Array<{ atMs: number; stage: string }> };
+	stop(): void;
+}
+
+/** Only the page's existing native listener; no child attachment or extra debugging command. */
+function watchFixtureMenuNavigation(page: Page, url: string, wire: FixtureMenuWireTrace): FixtureNativeMenuTrace {
+	const candidates = new Set<string>();
+	const events: Array<{ frame: string; atMs: number; stage: string }> = [];
+	let ambiguous = false;
+	let capped = false;
+	const record = (frame: string, stage: string, expected = false) => {
+		if (!fixtureFrameToken(frame)) return;
+		if (expected && !candidates.has(frame)) {
+			if (candidates.size >= 2) ambiguous = true;
+			else candidates.add(frame);
+		}
+		if (!candidates.has(frame)) return;
+		if (events.length === FIXTURE_NATIVE_MAX_NOTES) {
+			capped = true;
+			return;
+		}
+		events.push({ frame, atMs: wire.age(), stage });
+	};
+	const start = (event: Protocol.Page.FrameStartedNavigatingEvent) => {
+		if (event.url === url) record(event.frameId, "expected-navigation-start", true);
+	};
+	const commit = ({ frame }: Protocol.Page.FrameNavigatedEvent) => {
+		const expected = frame.url === url && !frame.unreachableUrl;
+		record(
+			frame.id,
+			expected ? "expected-commit" : frame.unreachableUrl ? "error-document" : "other-commit",
+			expected,
+		);
+	};
+	const swap = (event: Protocol.Page.FrameDetachedEvent) =>
+		record(event.frameId, event.reason === "swap" ? "frame-swap" : "frame-detach");
+	const loadStart = (event: Protocol.Page.FrameStartedLoadingEvent) => record(event.frameId, "load-start");
+	const loadStop = (event: Protocol.Page.FrameStoppedLoadingEvent) => record(event.frameId, "load-stop");
+	const client = page.mainFrame().client;
+	const stop = () => {
+		client.off("Page.frameStartedNavigating", start);
+		client.off("Page.frameNavigated", commit);
+		client.off("Page.frameDetached", swap);
+		client.off("Page.frameStartedLoading", loadStart);
+		client.off("Page.frameStoppedLoading", loadStop);
+	};
+	try {
+		client.on("Page.frameStartedNavigating", start);
+		client.on("Page.frameNavigated", commit);
+		client.on("Page.frameDetached", swap);
+		client.on("Page.frameStartedLoading", loadStart);
+		client.on("Page.frameStoppedLoading", loadStop);
+	} catch (error) {
+		fixtureTraceOnly(stop);
+		throw error;
+	}
+	return {
+		pick() {
+			const frame = !ambiguous && candidates.size === 1 ? candidates.values().next().value : undefined;
+			return {
+				frame,
+				label: frame ? "unique-native-menu-navigation" : candidates.size ? "ambiguous" : "unobserved",
+				capped,
+				native: events.filter(event => event.frame === frame).map(({ atMs, stage }) => ({ atMs, stage })),
+			};
+		},
+		stop,
+	};
+}
+
+async function showMenuWithPassiveTrace(
+	page: Page,
+	url: string,
+	wire: FixtureMenuWireTrace,
+	showMenu: () => Promise<FixtureMenuObservation>,
+): Promise<FixtureMenuObservation> {
+	let native: FixtureNativeMenuTrace | undefined;
+	fixtureTraceOnly(() => {
+		native = watchFixtureMenuNavigation(page, url, wire);
+	});
+	try {
+		return await showMenu();
+	} catch (cause) {
+		let suffix = "unavailable";
+		fixtureTraceOnly(() => {
+			const { frame, ...owner } = native?.pick() ?? { label: "unobserved" };
+			suffix = JSON.stringify({ owner, ...wire.summarize(frame) });
+		});
+		// GitHub's Mac job may omit test stdout; the original assertion still fails, with a redacted summary.
+		throw new Error(
+			`${cause instanceof Error ? cause.message : "Fixture menu observation failed"}; passive fixture trace=${suffix}`,
+			{ cause },
+		);
+	} finally {
+		fixtureTraceOnly(() => native?.stop());
+	}
 }
 
 /** Chrome itself can refuse an attach; neither a refusal nor a success may report a mutation. */
@@ -806,9 +1141,10 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 		);
 		let fixture: RelayFixture | undefined;
 		let relay: BrowserHandle | undefined;
+		const trace = new FixtureMenuWireTrace();
 		const name = `relay-vault-${process.pid}`;
 		try {
-			fixture = await launchRelayFixture(undefined, [vaultDir]);
+			fixture = await launchRelayFixture(undefined, [vaultDir], trace);
 			const vaultId = fixture.extensionIds.get(vaultDir);
 			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
 			const menu = `chrome-extension://${vaultId}/menu.html`;
@@ -842,11 +1178,14 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
 			if (tab.backend !== "worker") throw new Error("Expected a real relay tab worker");
 			expect(tab.ownsPage).toBeFalse();
+			trace.drive(chromeTabId(tab.targetId));
 			expect(await chromeTab(fixture, chromeTabId(tab.targetId))).toEqual({ active: false });
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
 			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
 			// Trigger the real fixture UI only after borrow, through the independent Chrome connection.
-			const drivenMenu = await showMenu(driven, "driven tab after borrow");
+			const drivenMenu = await showMenuWithPassiveTrace(driven, menu, trace, () =>
+				showMenu(driven, "driven tab after borrow"),
+			);
 			expect(drivenMenu.documentId).not.toBe(userMenu.documentId);
 			await checkTitleWithoutHidingFrame(name, "Login driven");
 			expect(await observeFixtureMenu(driven, menu, "driven tab after relay read")).toEqual(drivenMenu);
