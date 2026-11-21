@@ -23,7 +23,7 @@ import {
 	unpackedExtensionId,
 	writeRelayExtension,
 } from "./extension-files";
-import { isOlderOmpVersion } from "./protocol";
+import { isOlderOmpVersion, RELAY_RETRY_FOREIGN_FRAME_QUERY } from "./protocol";
 
 /** Options for {@link startRelayServer}. */
 export interface RelayServerOptions {
@@ -93,6 +93,7 @@ interface SocketData {
 	extensionId?: string;
 	/** The target a connecting omp tab worker drives (`/cdp?claim=`). */
 	claim?: string;
+	retryForeignFrame?: boolean;
 }
 
 type RelayWebSocket = Bun.ServerWebSocket<SocketData>;
@@ -144,7 +145,11 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 				// Browsers set Origin on websocket upgrades; native CDP clients
 				// don't. Reject any Origin so a web page can't drive the relay.
 				if (req.headers.get("origin")) return new Response("Forbidden", { status: 403 });
-				const data: SocketData = { role: "cdp", claim: url.searchParams.get("claim") ?? undefined };
+				const data: SocketData = {
+					role: "cdp",
+					claim: url.searchParams.get("claim") ?? undefined,
+					retryForeignFrame: url.searchParams.get(RELAY_RETRY_FOREIGN_FRAME_QUERY) === "1",
+				};
 				if (srv.upgrade(req, { data })) return undefined;
 				return new Response("websocket upgrade required", { status: 426 });
 			}
@@ -192,7 +197,7 @@ export function startRelayServer(opts: RelayServerOptions): RelayServer {
 					bridge.extConnected(ws, ws.data.extensionId);
 				} else {
 					try {
-						ws.data.connId = bridge.cdpConnected(ws, ws.data.claim);
+						ws.data.connId = bridge.cdpConnected(ws, ws.data.claim, ws.data.retryForeignFrame);
 					} catch (error) {
 						if (!(error instanceof RelayClaimRejectedError)) throw error;
 						// The bridge already removed and closed the rejected socket. A live-owner denial is not a

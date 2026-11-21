@@ -13,6 +13,7 @@ import { closeRelayOwnedTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/r
 import { BROWSER_PAGE_PROTOCOL_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { closeRelayTarget } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import { type FrontApp, RelayBridge, type RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
+import { RELAY_RETRY_FOREIGN_FRAME_QUERY } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import type {
 	RelayRpcRequest,
 	RelayToExtMessage,
@@ -3069,6 +3070,211 @@ describe("RelayBridge auto-attach gating", () => {
 		ack(bridge, ext, "attach");
 		await flush();
 		expect(bridge.listTargets().map(t => t.id)).toEqual([`PAGE${ANON}.2`]);
+	});
+
+	const nativeForeignRefusal = "Cannot access a chrome-extension:// URL of different extension";
+
+	function bootAutoAttach(bridge: RelayBridge, conn: number): number {
+		const id = ++msgSeq;
+		bridge.cdpMessage(conn, JSON.stringify({ id, method: "Target.setAutoAttach", params: { autoAttach: true } }));
+		return id;
+	}
+
+	async function nativeRefusedFixture(count = 1) {
+		const bridge = new RelayBridge();
+		const ext = new FakeExtSocket();
+		connect(
+			bridge,
+			ext,
+			Array.from({ length: count }, (_, i) => tab({ tabId: i + 1 })),
+		);
+		const registry = new FakeCdpSocket();
+		const registryId = bridge.cdpConnected(registry);
+		bootAutoAttach(bridge, registryId);
+		nack(bridge, ext, "attach", nativeForeignRefusal);
+		await flush();
+		return { bridge, ext, registry, registryId };
+	}
+
+	it("rechecks only the claimed borrowed target once per explicit client after native refusal", async () => {
+		const { bridge, ext } = await nativeRefusedFixture(2);
+		const older = bridge.cdpConnected(new FakeCdpSocket(), pageId(1));
+		bootAutoAttach(bridge, older);
+		await flush();
+		expect(ext.pending("attach")).toHaveLength(0);
+		expect(() => bridge.cdpConnected(new FakeCdpSocket(), pageId(1), true)).toThrow("already driven");
+		bridge.cdpClosed(older);
+
+		const firstClient = bridge.cdpConnected(new FakeCdpSocket(), pageId(1), true);
+		bootAutoAttach(bridge, firstClient);
+		bootAutoAttach(bridge, firstClient);
+		expect(ext.pending("attach").map(r => [r.tabId, r.clearForeignFrames])).toEqual([[1, false]]);
+		expect(bridge.listTargets()).toEqual([]);
+		nack(bridge, ext, "attach", nativeForeignRefusal);
+		await flush();
+		bootAutoAttach(bridge, firstClient);
+		expect(ext.pending("attach")).toHaveLength(0);
+		expect(bridge.listTargets()).toEqual([]);
+		bridge.cdpClosed(firstClient);
+
+		const next = new FakeCdpSocket();
+		bootAutoAttach(bridge, bridge.cdpConnected(next, pageId(1), true));
+		expect(ext.pending("attach").map(r => [r.tabId, r.clearForeignFrames])).toEqual([[1, false]]);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(bridge.listTargets().map(t => t.id)).toEqual([pageId(1)]);
+		expect(attachedIds(next)).toContain(`TAB${ANON}.1`);
+		expect(ext.rpcs("activateTab")).toHaveLength(0);
+		expect(ext.rpcs("removeTab")).toHaveLength(0);
+	});
+
+	it.each([false, true])(
+		"releases an acknowledged retry if its client closes during unrelated startup (other holder=%s)",
+		async holder => {
+			const { bridge, ext, registry, registryId } = await nativeRefusedFixture();
+			if (!holder) bridge.cdpClosed(registryId);
+			const bystander = bridge.cdpConnected(new FakeCdpSocket());
+			bridge.extMessage(ext, JSON.stringify({ t: "tabCreated", tab: tab({ tabId: 2 }) }));
+			// The independent tab's pending native attach outlasts the retry's receipt.
+			bridge.cdpMessage(
+				bystander,
+				JSON.stringify({ id: ++msgSeq, method: "Target.attachToTarget", params: { targetId: pageId(2) } }),
+			);
+			const client = new FakeCdpSocket();
+			const conn = bridge.cdpConnected(client, pageId(1), true);
+			const startup = bootAutoAttach(bridge, conn);
+			const accepted = ext.pending("attach").find(rpc => rpc.tabId === 1)!;
+			expect(accepted.clearForeignFrames).toBeFalse();
+			ext.markAcked(accepted.id);
+			bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: accepted.id, ok: true, result: {} }));
+			await flush();
+			expect(ext.pending("attach").map(rpc => rpc.tabId)).toEqual([2]);
+			expect(client.messages.some(m => m.id === startup)).toBeFalse();
+			bridge.cdpClosed(conn);
+			await flush();
+			expect(ext.pending("detach").map(rpc => rpc.tabId)).toEqual(holder ? [] : [1]);
+			if (holder) expect(attachedIds(registry)).toContain(`TAB${ANON}.1`);
+			ack(bridge, ext, "detach");
+			ack(bridge, ext, "attach");
+			await flush();
+			expect(ext.rpcs("detach").map(rpc => rpc.tabId)).toEqual(holder ? [] : [1]);
+		},
+	);
+
+	it("does not queue an explicit retry behind an earlier detach", async () => {
+		const { bridge, ext } = await nativeRefusedFixture();
+		const closed = bridge.cdpConnected(new FakeCdpSocket(), pageId(1), true);
+		bootAutoAttach(bridge, closed);
+		expect(ext.pending("attach")).toHaveLength(1);
+		bridge.cdpClosed(closed);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(ext.pending("detach").map(rpc => rpc.tabId)).toEqual([1]);
+		expect(bridge.listTargets()).toEqual([]);
+
+		const busy = new FakeCdpSocket();
+		const busyConn = bridge.cdpConnected(busy, pageId(1), true);
+		const busyStartup = bootAutoAttach(bridge, busyConn);
+		await flush();
+		expect(busy.messages.find(m => m.id === busyStartup)?.result).toEqual({});
+		ack(bridge, ext, "detach");
+		await flush();
+		expect(ext.pending("attach")).toEqual([]);
+		bridge.cdpClosed(busyConn);
+
+		const later = bridge.cdpConnected(new FakeCdpSocket(), pageId(1), true);
+		bootAutoAttach(bridge, later);
+		expect(ext.pending("attach").map(rpc => [rpc.tabId, rpc.clearForeignFrames])).toEqual([[1, false]]);
+		nack(bridge, ext, "attach", nativeForeignRefusal);
+		await flush();
+	});
+
+	it("does not spend a retry on an absent, browser, or tab rather than exact page claim", async () => {
+		const { bridge, ext } = await nativeRefusedFixture();
+		for (const claim of [undefined, "relay-browser", pageId(9), `TAB${ANON}.1`]) {
+			const conn = bridge.cdpConnected(new FakeCdpSocket(), claim, true);
+			bootAutoAttach(bridge, conn);
+			await flush();
+			bridge.cdpClosed(conn);
+		}
+		expect(ext.pending("attach")).toHaveLength(0);
+		expect(bridge.listTargets()).toEqual([]);
+	});
+
+	it("decodes only the exact retry selector on the relay CDP route", async () => {
+		const relay = startRelayServer({ port: await findFreeCdpPort(), group: false });
+		try {
+			const tied = new URL(`ws://127.0.0.1:${relay.port}/cdp`);
+			tied.searchParams.set("claim", pageId(1));
+			for (const [selector, expected] of [
+				[null, false],
+				["true", false],
+				["1", true],
+			] as const) {
+				if (selector !== null) tied.searchParams.set(RELAY_RETRY_FOREIGN_FRAME_QUERY, selector);
+				const connect = jest.spyOn(relay.bridge, "cdpConnected");
+				const ws = new WebSocket(tied);
+				const opened = Promise.withResolvers<void>();
+				ws.addEventListener("open", () => opened.resolve(), { once: true });
+				ws.addEventListener("error", () => opened.reject(new Error("Relay fixture socket did not open")), {
+					once: true,
+				});
+				try {
+					await opened.promise;
+					expect(connect).toHaveBeenCalledTimes(1);
+					expect(connect.mock.calls[0]?.slice(1)).toEqual([pageId(1), expected]);
+				} finally {
+					ws.close();
+					connect.mockRestore();
+				}
+			}
+		} finally {
+			relay.stop();
+		}
+	});
+
+	it("keeps a newer debugging cancellation when a prior explicit attach ACK arrives late", async () => {
+		const { bridge, ext } = await nativeRefusedFixture();
+		const conn = bridge.cdpConnected(new FakeCdpSocket(), pageId(1), true);
+		bootAutoAttach(bridge, conn);
+		expect(ext.pending("attach")).toHaveLength(1);
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 1, reason: "canceled_by_user" }));
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(bridge.listTargets()).toEqual([]);
+		bridge.cdpClosed(conn);
+		const later = new FakeCdpSocket();
+		const laterConn = bridge.cdpConnected(later, pageId(1), true);
+		bootAutoAttach(bridge, laterConn);
+		bridge.cdpMessage(
+			laterConn,
+			JSON.stringify({ id: 1, method: "Target.getTargetInfo", params: { targetId: pageId(1) } }),
+		);
+		await flush();
+		expect(later.messages.find(m => m.id === 1)?.result).toMatchObject({
+			targetInfo: { targetId: pageId(1), attached: false },
+			refusal: "the user cancelled Chrome's debugging bar",
+		});
+		expect(ext.pending("attach")).toHaveLength(0);
+	});
+
+	it("does not announce the replacement occupant when a removed target's retry ACK arrives", async () => {
+		const { bridge, ext } = await nativeRefusedFixture();
+		const cdp = new FakeCdpSocket();
+		const conn = bridge.cdpConnected(cdp, pageId(1), true);
+		bootAutoAttach(bridge, conn);
+		const retired = ext.pending("attach")[0]!;
+		bridge.extMessage(ext, JSON.stringify({ t: "tabRemoved", tabId: 1 }));
+		bridge.extMessage(ext, JSON.stringify({ t: "tabCreated", tab: tab({ tabId: 1, url: "about:blank" }) }));
+		const current = ext.pending("attach").find(rpc => rpc.id !== retired.id);
+		expect(current).toBeDefined();
+		ext.markAcked(retired.id);
+		bridge.extMessage(ext, JSON.stringify({ t: "rpcResult", id: retired.id, ok: true, result: {} }));
+		await flush();
+		expect(attachedIds(cdp)).not.toContain(`TAB${ANON}.1`);
+		ack(bridge, ext, "attach");
+		await flush();
+		expect(attachedIds(cdp)).toContain(`TAB${ANON}.1`);
 	});
 
 	it("does not reattach an initially discovered tab discarded during attach", async () => {

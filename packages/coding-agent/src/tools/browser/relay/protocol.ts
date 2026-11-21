@@ -63,6 +63,9 @@ export const DISCARDED_TABS_PROTOCOL_VERSION = 1;
 /** Hello capability of an extension that reloads itself on a relay `reload` message. */
 export const EXTENSION_RELOAD_PROTOCOL_VERSION = 1;
 
+/** Explicit operation on an already adopted target; not sent for automatic recovery. */
+export const RELAY_RETRY_FOREIGN_FRAME_QUERY = "retryForeignFrame";
+
 /** Chrome's refusal of a debugger request while another extension's frame (a password manager's menu) is in the tab. */
 export const FOREIGN_FRAME_REFUSAL = /chrome-extension:\/\/ URL of different extension/i;
 

@@ -781,10 +781,12 @@ describe("relay tabs Chrome detaches omp from", () => {
 			expect(failure).toContain("omp kept the tab open");
 			expect(getTab(name)).toBeDefined();
 			const refusedAttachAttempts = ext.attachAttempts;
-			// While Chrome's refusal is cached, retrying neither attaches nor changes the document.
+			// Each explicit borrowed-tab operation asks Chrome once, without changing the protected frame.
 			const refused = String(await invoke(readMark).catch((error: unknown) => error));
 			expect(refused).toContain("Chrome still keeps omp out of tab");
+			expect(refused).toContain("left the frame unchanged");
 			expect(getTab(name)).toBeDefined();
+			expect(ext.attachAttempts).toBe(refusedAttachAttempts + 1);
 			// An open of the same tab re-adopts it too, rather than reporting it reused with no worker driving it.
 			const reopened = String(
 				await invoke({ action: "open", app: "relay", target: "case=", timeout: 20 }).catch(
@@ -792,15 +794,12 @@ describe("relay tabs Chrome detaches omp from", () => {
 				),
 			);
 			expect(reopened).toContain("Chrome still keeps omp out of tab");
+			expect(reopened).toContain("left the frame unchanged");
 			expect(getTab(name)).toBeDefined();
-			// Chrome's refusal is cached until a URL update; removing the frame in the
-			// fixture alone must not silently unban the tab or reload its document.
+			expect(ext.attachAttempts).toBe(refusedAttachAttempts + 2);
+			// The background doesn't reattach or clear the cache just because Chrome would
+			// now permit it. Ordinary URL-change rediscovery continues to work.
 			ext.refuseAttach = undefined;
-			const stillRefused = String(await invoke(readMark).catch((error: unknown) => error));
-			expect(stillRefused).toContain("Chrome still keeps omp out of tab");
-			expect(stillRefused).toContain("left the frame unchanged");
-			expect(getTab(name)).toBeDefined();
-			expect(ext.attachAttempts).toBe(refusedAttachAttempts);
 			if (!page || !relay) throw new Error("Missing fixture page or relay");
 			const updated = new URL(pageUrl);
 			updated.searchParams.set("frame", "dismissed");

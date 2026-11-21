@@ -50,7 +50,7 @@ import {
 	type WebKitBrowserHandle,
 } from "./registry";
 import { isLoopbackRelayUrl } from "./relay/daemon";
-import { FOREIGN_FRAME_REFUSAL, type HiddenFrame } from "./relay/protocol";
+import { FOREIGN_FRAME_REFUSAL, type HiddenFrame, RELAY_RETRY_FOREIGN_FRAME_QUERY } from "./relay/protocol";
 import {
 	type AttachPage,
 	isMissingPageGlobal,
@@ -412,6 +412,20 @@ class TabHeldOutError extends ToolError {
 		);
 	}
 }
+class HeldOutReadoptTimeoutError extends ToolError {
+	constructor(name: string) {
+		super(`Timed out rechecking Chrome's access to tab ${JSON.stringify(name)}; omp kept the tab open`);
+	}
+}
+
+class HeldOutIsolatedWorkerUnavailableError extends ToolError {
+	constructor(name: string) {
+		super(
+			`Could not start an isolated worker to recheck Chrome's access to tab ${JSON.stringify(name)}; omp kept the tab open`,
+		);
+	}
+}
+
 /** Rethrow a {@link TabHeldOutError} with what the call was doing when the tab was lost, and any other error as is. */
 function heldOutWith(context: string): (error: unknown) => never {
 	return error => {
@@ -601,7 +615,7 @@ async function acquireTabImpl(
 				tempHold = true;
 				await releaseTab(name, { kill: false });
 			} else {
-				readoptHeldOutTab(name, opts.timeoutMs);
+				readoptHeldOutTab(name, opts.timeoutMs, opts.signal, startedAt + opts.timeoutMs);
 				const readopting = awaitWorkerRecovery(name, opts, "Browser tab open aborted");
 				if (readopting) await readopting;
 				// Reuse counts as use: refresh the idle clock and resume a
@@ -1290,7 +1304,7 @@ async function runInTabWithSnapshot(
 ): Promise<RunResultOk> {
 	// Chrome refused this tab's last re-adoption over another extension's frame: re-adopt it first, a reattach this
 	// call and any beside it wait for as for one after a worker exit.
-	readoptHeldOutTab(name, opts.timeoutMs);
+	readoptHeldOutTab(name, opts.timeoutMs, opts.signal);
 	// A worker that exited on its own is being replaced: wait for that within this call's budget, and run only on the
 	// same tab. A tab closed and reopened under this name meanwhile is not the one this call was meant for.
 	const waitStartedAt = performance.now();
@@ -1690,6 +1704,7 @@ async function recoverWorkerTab(
 		/** Kill reason when the recycle fails; defaults to a generic recovery failure. */
 		failedReason?: string;
 		signal?: AbortSignal;
+		retryForeignFrameUntil?: number;
 	} = {},
 ): Promise<boolean> {
 	// The kills go by name: a tab closed meanwhile may have been reopened under it, and that one is not ours to kill.
@@ -1702,10 +1717,17 @@ async function recoverWorkerTab(
 		const reattached = await recycleTimedOutWorkerTab(tab, timeoutMs + GRACE_MS, {
 			recover: opts.recover,
 			signal: opts.signal,
+			retryForeignFrameUntil: opts.retryForeignFrameUntil,
 		});
 		if (reattached) tab.heldOut = undefined;
 		return reattached;
 	} catch (recycleError) {
+		if (opts.retryForeignFrameUntil !== undefined && opts.signal?.aborted) throw new ToolAbortError();
+		if (
+			recycleError instanceof HeldOutReadoptTimeoutError ||
+			recycleError instanceof HeldOutIsolatedWorkerUnavailableError
+		)
+			throw recycleError;
 		const messages = [recycleError, recycleError instanceof Error ? recycleError.cause : undefined].map(error =>
 			error instanceof Error ? error.message : String(error),
 		);
@@ -1738,6 +1760,23 @@ async function recoverWorkerTab(
  * first release's outcome.
  */
 const releaseInflight = new WeakMap<TabSession, { promise: Promise<"released" | "kept">; opts: ReleaseTabOptions }>();
+
+interface PendingExplicitRelayRetry {
+	cancel: AbortController;
+	terminate(): Promise<void>;
+}
+
+// The published worker is still the old one until initialization succeeds. A
+// close also has to stop this isolated, opted-in launch from connecting.
+const pendingExplicitRelayRetries = new WeakMap<TabSession, PendingExplicitRelayRetry>();
+
+function cancelPendingExplicitRelayRetry(tab: TabSession): void {
+	const launch = pendingExplicitRelayRetries.get(tab);
+	if (!launch) return;
+	pendingExplicitRelayRetries.delete(tab);
+	launch.cancel.abort();
+	void launch.terminate();
+}
 
 export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Promise<boolean> {
 	const tab = tabs.get(name);
@@ -1816,6 +1855,7 @@ export function ensureSpawnedKilledForTest(browser: BrowserHandle): Promise<void
 async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOptions): Promise<"released" | "kept"> {
 	const wasAlive = tab.state === "alive";
 	tab.state = "dead";
+	cancelPendingExplicitRelayRetry(tab);
 	const closeError = postmortem.markExpectedCleanupError(new ToolError(`Tab ${JSON.stringify(name)} was closed`));
 	for (const [id, pending] of tab.pending) {
 		if (tab.backend === "worker") {
@@ -2492,10 +2532,18 @@ async function buildInitPayload(
  * `endpoint` of `browser` for a worker adopting `targetId`. Through the omp relay the worker claims the tab as it
  * connects, before puppeteer sends the tab anything. The fork never mutates another extension's frame to attach.
  */
-function adoptEndpoint(endpoint: string, browser: PuppeteerBrowserHandle, targetId: string): string {
+function adoptEndpoint(
+	endpoint: string,
+	browser: PuppeteerBrowserHandle,
+	targetId: string,
+	retryForeignFrame = false,
+): string {
 	if (browser.kind.kind !== "relay") return endpoint;
 	const url = new URL(endpoint);
 	url.searchParams.set("claim", targetId);
+	// Endpoints are reused by other workers. Only the operation opting in carries this one-shot flag.
+	url.searchParams.delete(RELAY_RETRY_FOREIGN_FRAME_QUERY);
+	if (retryForeignFrame) url.searchParams.set(RELAY_RETRY_FOREIGN_FRAME_QUERY, "1");
 	return url.toString();
 }
 
@@ -2617,14 +2665,25 @@ async function relayStillKeepsTabOut(tab: WorkerTabSession, timeoutMs: number): 
  * that started it and any beside it wait for it. A refusal again rejects them with {@link TabHeldOutError}, the tab
  * still kept; a re-adoption that works is reported by the next result.
  */
-function readoptHeldOutTab(name: string, timeoutMs: number): void {
+function readoptHeldOutTab(
+	name: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+	deadline = performance.now() + timeoutMs,
+): void {
 	const tab = tabs.get(name);
-	if (tab?.backend !== "worker" || !tab.heldOut || tab.workerRecovery) return;
+	if (tab?.backend !== "worker" || !tab.heldOut || tab.workerRecovery || signal?.aborted) return;
 	const readoption = (async (): Promise<boolean> => {
 		const startedAt = performance.now();
-		const stillRefused = await relayStillKeepsTabOut(tab, timeoutMs);
+		if (startedAt >= deadline) throw new HeldOutReadoptTimeoutError(name);
+		const stillRefused = await relayStillKeepsTabOut(tab, Math.ceil(deadline - startedAt));
 		if (tabs.get(name) !== tab || tab.state !== "alive") return false;
-		if (stillRefused) throw new TabHeldOutError();
+		if (signal?.aborted) throw new ToolAbortError();
+		if (performance.now() >= deadline) throw new HeldOutReadoptTimeoutError(name);
+		if (stillRefused && tab.ownsPage) throw new TabHeldOutError();
+		// The cached refusal can outlive the other extension's child at the same URL.
+		// A real next operation may ask Chrome again for this exact borrowed target.
+		const retryForeignFrame = stillRefused && !tab.ownsPage;
 		return await recoverWorkerTab(
 			tab,
 			tab.name,
@@ -2634,6 +2693,8 @@ function readoptHeldOutTab(name: string, timeoutMs: number): void {
 				// The page is as the user left it; stopping its loading would cancel a navigation they started.
 				recover: false,
 				failedReason: "omp could not reattach to the tab after Chrome had refused it, so the tab was released",
+				signal: retryForeignFrame ? signal : undefined,
+				retryForeignFrameUntil: retryForeignFrame ? deadline : undefined,
 			},
 		);
 	})()
@@ -2755,17 +2816,31 @@ function attachTabWorker(tab: WorkerTabSession, worker: WorkerHandle): void {
 async function recycleTimedOutWorkerTab(
 	tab: WorkerTabSession,
 	timeoutMs: number,
-	opts: { recover?: boolean; signal?: AbortSignal } = {},
+	opts: { recover?: boolean; signal?: AbortSignal; retryForeignFrameUntil?: number } = {},
 ): Promise<boolean> {
 	// Same deadline carry-over as acquireTabImpl: the inline-fallback retry
 	// must not restart the recycle's init budget.
 	const startedAt = performance.now();
 	const oldWorker = tab.worker;
+	const stillRetained = () => tabs.get(tab.name) === tab && tab.state === "alive" && !releaseInflight.has(tab);
+	const retryUntil = opts.retryForeignFrameUntil;
+	const retry = retryUntil !== undefined;
+	const retryTimeRemaining = (deadline: number): number => {
+		if (opts.signal?.aborted) throw new ToolAbortError();
+		const remaining = deadline - performance.now();
+		if (remaining <= 0) throw new HeldOutReadoptTimeoutError(tab.name);
+		return remaining;
+	};
+	if (retry) retryTimeRemaining(retryUntil);
 	await oldWorker.terminate().catch(() => undefined);
+	if (retry) {
+		if (!stillRetained()) return false;
+		retryTimeRemaining(retryUntil);
+	}
 	const browserWSEndpoint = tab.browser.wsEndpoint;
 	const payload: WorkerInitPayload = {
 		mode: "attach",
-		browserWSEndpoint: adoptEndpoint(browserWSEndpoint, tab.browser, tab.targetId),
+		browserWSEndpoint: adoptEndpoint(browserWSEndpoint, tab.browser, tab.targetId, retry),
 		safeDir: getPuppeteerDir(),
 		uploadDir: tab.uploadDir,
 		page: { kind: tab.ownsPage ? "owned" : "borrowed", targetId: tab.targetId },
@@ -2797,12 +2872,67 @@ async function recycleTimedOutWorkerTab(
 		attachTabWorker(tab, replacement);
 		return true;
 	};
-	let worker = await spawnTabWorker();
+	let worker: WorkerHandle;
 	try {
-		return await publish(worker, await initializeTabWorker(worker, payload, timeoutMs, startedAt, opts.signal));
+		// An inline core can be stopped while loading Puppeteer yet still reach connect.
+		worker = await spawnTabWorker(!retry);
 	} catch (error) {
-		await worker.terminate().catch(() => undefined);
+		if (!retry) throw error;
+		if (!stillRetained()) return false;
+		retryTimeRemaining(retryUntil);
+		throw new HeldOutIsolatedWorkerUnavailableError(tab.name);
+	}
+	let retryTimeout: AbortSignal | undefined;
+	let launch: PendingExplicitRelayRetry | undefined;
+	const clearLaunch = () => {
+		if (launch && pendingExplicitRelayRetries.get(tab) === launch) pendingExplicitRelayRetries.delete(tab);
+	};
+	try {
+		if (retry) {
+			// Releasing the logical tab leaves a borrowed Chrome page open. Never send
+			// the opted-in init for a binding that ended while the worker was starting.
+			if (!stillRetained()) {
+				await worker.terminate().catch(() => undefined);
+				return false;
+			}
+			// The normal worker setup grace must not extend the initiating operation's opt-in.
+			retryTimeout = AbortSignal.timeout(Math.ceil(retryTimeRemaining(retryUntil)));
+			const nascent = worker;
+			let stopping: Promise<void> | undefined;
+			launch = {
+				cancel: new AbortController(),
+				terminate: () => (stopping ??= nascent.terminate().catch(() => undefined)),
+			};
+			pendingExplicitRelayRetries.set(tab, launch);
+		}
+		const initSignal =
+			launch && retryTimeout
+				? AbortSignal.any([launch.cancel.signal, retryTimeout, ...(opts.signal ? [opts.signal] : [])])
+				: opts.signal;
+		const info = await initializeTabWorker(worker, payload, timeoutMs, startedAt, initSignal);
+		if (retry) {
+			if (launch?.cancel.signal.aborted || !stillRetained()) {
+				await launch?.terminate();
+				return false;
+			}
+			retryTimeRemaining(retryUntil);
+			// Transfer teardown ownership to the normal tab binding without yielding.
+			clearLaunch();
+		}
+		return await publish(worker, info);
+	} catch (error) {
+		const retryExpired = retryTimeout?.aborted;
+		if (launch) {
+			await launch.terminate();
+			if (launch.cancel.signal.aborted) return false;
+		} else {
+			await worker.terminate().catch(() => undefined);
+		}
+		// This operation has at most one permission check on an opted-in connection. A fallback
+		// connection would spend another, even if the first worker exited before reporting its result.
 		if (opts.signal?.aborted) throw error;
+		if (retryExpired) throw new HeldOutReadoptTimeoutError(tab.name);
+		if (retry) throw error;
 		// A foreign-frame refusal is cached until the URL changes. An inline worker cannot clear it and can
 		// collide with the failed worker's claim before the relay observes its socket close.
 		if (tab.kindTag === "relay" && isRelayForeignFrameRefusal(error)) throw error;
@@ -2825,6 +2955,8 @@ async function recycleTimedOutWorkerTab(
 			Object.defineProperty(finalError, "cause", { value: error, configurable: true });
 			throw finalError;
 		}
+	} finally {
+		clearLaunch();
 	}
 }
 
@@ -2842,6 +2974,7 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	}
 	killedTabs.set(name, reason);
 	tab.state = "dead";
+	cancelPendingExplicitRelayRetry(tab);
 	const error = postmortem.markExpectedCleanupError(new ToolError(reason));
 	for (const pending of tab.pending.values()) pending.reject(error);
 	tab.pending.clear();
@@ -3140,7 +3273,7 @@ async function raceWithTimeout<T>(
 	}
 }
 
-async function spawnTabWorker(): Promise<WorkerHandle> {
+async function spawnTabWorker(allowInline = true): Promise<WorkerHandle> {
 	try {
 		const hostEntry = workerHostEntry();
 		const worker = hostEntry
@@ -3148,6 +3281,7 @@ async function spawnTabWorker(): Promise<WorkerHandle> {
 			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
 		return wrapBunWorker(worker);
 	} catch (err) {
+		if (!allowInline) throw err;
 		logger.warn("Bun Worker spawn failed; using inline tab worker (no sync-loop guard)", {
 			error: err instanceof Error ? err.message : String(err),
 		});

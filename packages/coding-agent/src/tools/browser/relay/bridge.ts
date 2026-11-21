@@ -27,6 +27,7 @@ import { BROWSER_PAGE_PROTOCOL_TIMEOUT_MS } from "../launch";
 import {
 	DISCARDED_TABS_PROTOCOL_VERSION,
 	EXTENSION_RELOAD_PROTOCOL_VERSION,
+	FOREIGN_FRAME_REFUSAL,
 	isHiddenFrame,
 	isOlderOmpVersion,
 	isOmpVersion,
@@ -102,6 +103,8 @@ class CdpConnection {
 	readonly sessions = new Map<string, SessionRef>();
 	/** Tabs this connection claimed as drive targets (`/cdp?claim=` / `Target.createTarget`). */
 	readonly claims = new Set<string>();
+	/** One retry for the exact borrowed page this explicit operation successfully claimed. */
+	retryForeignFrame?: { tab: TabState; refusal: string };
 	/** Real child session id → the session it was announced on; its events and detach go there. */
 	readonly childParents = new Map<string, string>();
 	readonly explicitChildren = new Set<string>();
@@ -924,7 +927,7 @@ export class RelayBridge {
 	 * Register a downstream CDP websocket; returns the connection id. `claim` is the target the connecting omp tab
 	 * worker drives (`/cdp?claim=`), claimed before puppeteer sends anything to it.
 	 */
-	cdpConnected(socket: RelaySocket, claim?: string): number {
+	cdpConnected(socket: RelaySocket, claim?: string, retryForeignFrame = false): number {
 		const conn = new CdpConnection(++this.#connSeq, socket);
 		this.#conns.set(conn.id, conn);
 		this.#log("cdp client connected", { conn: conn.id });
@@ -933,6 +936,15 @@ export class RelayBridge {
 		if (tab) {
 			try {
 				this.#claimTab(conn, tab.tabKey, undefined, true);
+				if (
+					retryForeignFrame &&
+					claim === pageTargetIdFromKey(tab.tabKey) &&
+					!tab.ompCreated &&
+					tab.refusal &&
+					FOREIGN_FRAME_REFUSAL.test(tab.refusal)
+				) {
+					conn.retryForeignFrame = { tab, refusal: tab.refusal };
+				}
 			} catch (err) {
 				this.#conns.delete(conn.id);
 				socket.close();
@@ -1479,7 +1491,13 @@ export class RelayBridge {
 				// Discarded tabs can stall debugger calls. Retract targets already
 				// announced by Target.setDiscoverTargets so Puppeteer can connect().
 				const tabs = [...this.#tabs.values()].filter(tab => this.#eligible(tab) && !tab.discarded);
-				await Promise.all(tabs.map(tab => this.#ensureAttached(tab, { retryAfterDiscard: true })));
+				const retry = msg.params?.autoAttach === true ? conn.retryForeignFrame : undefined;
+				if (retry) conn.retryForeignFrame = undefined;
+				const pending = tabs.map(tab => this.#ensureAttached(tab, { retryAfterDiscard: true }));
+				if (retry && !tabs.includes(retry.tab)) {
+					pending.push(this.#ensureAttached(retry.tab, { foreignRetry: { conn, refusal: retry.refusal } }));
+				}
+				await Promise.all(pending);
 				for (const tab of tabs) {
 					if (!tab.attached || tab.discarded || !this.#eligible(tab)) {
 						// Failed or newly discarded tabs must not hold up connect().
@@ -2326,14 +2344,32 @@ export class RelayBridge {
 		});
 	}
 
-	async #ensureAttached(tab: TabState, opts: { retryAfterDiscard?: boolean } = {}): Promise<boolean> {
+	async #ensureAttached(
+		tab: TabState,
+		opts: { retryAfterDiscard?: boolean; foreignRetry?: { conn: CdpConnection; refusal: string } } = {},
+	): Promise<boolean> {
 		if (tab.discarded) return false;
+		const retry = opts.foreignRetry;
+		// An explicit check belongs to this operation, not a queue that can outlive it.
+		if (retry && tab.detaching) return false;
 		// The extension emits the detach echo before resolving the RPC. Awaiting
 		// prevents a replacement attach racing either operation.
 		while (tab.detaching) await tab.detaching;
 		if (tab.discarded) return false;
+		if (
+			retry &&
+			(tab.attached ||
+				tab.closing ||
+				tab.ompCreated ||
+				tab.refusal !== retry.refusal ||
+				this.#tabs.get(tab.tabKey) !== tab ||
+				this.#conns.get(retry.conn.id) !== retry.conn ||
+				!retry.conn.claims.has(tab.tabKey))
+		) {
+			return false;
+		}
 		if (tab.attached) return true;
-		if (!this.#eligible(tab)) return false;
+		if (!this.#eligible(tab, retry?.refusal)) return false;
 		const inst = this.#instances.get(tab.instanceId);
 		if (!inst?.socket) return false;
 		if (tab.attaching) {
@@ -2341,12 +2377,39 @@ export class RelayBridge {
 			return await tab.attaching;
 		}
 		const generation = tab.attachGeneration;
+		const socket = inst.socket;
 		const cancelled = Promise.withResolvers<boolean>();
 		const request = this.#rpc({ op: "attach", tabId: tab.tabId }, inst)
 			.then(() => {
+				if (retry) {
+					// A detach, hello, replacement, or removal can retire this exact attempt. Its
+					// receipt must not revive the tab or erase a newer decision from Chrome.
+					if (tab.attaching !== attempt || this.#tabs.get(tab.tabKey) !== tab || inst.socket !== socket)
+						return false;
+					if (
+						generation !== tab.attachGeneration ||
+						tab.closing ||
+						tab.ompCreated ||
+						(tab.refusal !== undefined && tab.refusal !== retry.refusal) ||
+						this.#conns.get(retry.conn.id) !== retry.conn ||
+						!retry.conn.claims.has(tab.tabKey)
+					) {
+						// Clean up only this known, still-current native attachment, not a reused tab.
+						tab.attached = true;
+						this.#detachIfUnheld(tab.tabKey);
+						return false;
+					}
+					tab.refusal = undefined;
+				}
 				tab.attached = true;
 				tab.reattachedAfterDetach = true;
 				if (tab.discarded) this.#detachIfUnheld(tab.tabKey);
+				if (retry) {
+					// Associate this exact receipt with its requester before unrelated startup RPCs
+					// settle. A close then drops the attachment only if no real session holds it.
+					this.#emitTabAttached(retry.conn, tab);
+					if (!tab.announced) this.#announceTab(tab);
+				}
 				return !tab.discarded;
 			})
 			.catch(err => {
@@ -2356,6 +2419,12 @@ export class RelayBridge {
 					!(err instanceof ExtensionReplacedError) &&
 					!(err instanceof RpcTimeoutError) &&
 					generation === tab.attachGeneration &&
+					(!retry ||
+						(tab.attaching === attempt &&
+							this.#tabs.get(tab.tabKey) === tab &&
+							inst.socket === socket &&
+							tab.refusal === retry.refusal &&
+							FOREIGN_FRAME_REFUSAL.test(error))) &&
 					!/busy|not ready|settling|temporar|rpc failed|reattach failed|^debugger unavailable$/i.test(error)
 				) {
 					tab.refusal = error || "Chrome refused the attach";
@@ -2381,8 +2450,8 @@ export class RelayBridge {
 		return await attempt;
 	}
 
-	#eligible(tab: TabState): boolean {
-		if (tab.refusal) return false;
+	#eligible(tab: TabState, retryRefusal?: string): boolean {
+		if (tab.refusal && tab.refusal !== retryRefusal) return false;
 		const instance = this.#instances.get(tab.instanceId);
 		if (!instance?.socket || instance.info?.discardedTabsProtocol !== DISCARDED_TABS_PROTOCOL_VERSION) return false;
 		if (!tab.url) return true;
