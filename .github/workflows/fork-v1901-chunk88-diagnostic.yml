@@ -12,6 +12,7 @@ jobs:
     env:
       OMP_TEST_TIMEOUT: "120"
       PINNED_BASE: 5b48d435a42b581a87c7e9d8d7b8c75d3329b805
+      PREVIOUS_DIAGNOSTIC: a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
       TEST_SOURCE: packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
       ORIGINAL_BLOB: 0b94a0edd6a3b9df39fd5e17f68f99e3d5c6fcfb
       DIAGNOSTIC_BLOB: 8b7b02aa6eab341fe14d3d787c56db35ece74918
@@ -19,14 +20,16 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
       - name: Prove exact pinned candidate and diagnostic-only diff
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git show -s --format=%P HEAD)" = "$PINNED_BASE"
+          test "$(git show -s --format=%P HEAD)" = "$PREVIOUS_DIAGNOSTIC"
+          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = "$PINNED_BASE"
+          test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = .github/workflows/fork-v1901-chunk88-diagnostic.yml
           test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
           test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
           test "$(git diff --name-only "$PINNED_BASE" HEAD)" = "$(printf '%s\n%s' .github/workflows/fork-v1901-chunk88-diagnostic.yml "$TEST_SOURCE")"
@@ -41,19 +44,6 @@ jobs:
           set -euo pipefail
           bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
           bun install --frozen-lockfile
-      - name: Build extension and check committed embedded assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          bun run --cwd packages/browser-relay build
-          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
-      - name: Build Linux x64 native test addon
-        shell: bash
-        run: |
-          set -euo pipefail
-          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
-          bun scripts/bazel-natives.ts linux-x64-baseline --dest packages/natives/native -- --jobs=2
-          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
       - name: Install Puppeteer's pinned Chrome for Testing for Linux tests
         id: linux-chrome
         shell: bash
@@ -80,7 +70,7 @@ jobs:
             console.log(JSON.stringify({ revision, executablePath: result.executablePath }));
             await appendFile(GITHUB_OUTPUT, "executable=" + result.executablePath + "\nrevision=" + revision + "\n");
           '
-      - name: Run exact chunk 88 baseline and passive native diagnostic
+      - name: Preflight the exact Chrome version and CI test plan
         env:
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
           PINNED_CHROME_REVISION: ${{ steps.linux-chrome.outputs.revision }}
@@ -89,9 +79,15 @@ jobs:
           set -euo pipefail
           test "$(bun --version)" = 1.4.5
           test -x "${PUPPETEER_EXECUTABLE_PATH:?}"
-          chrome_version="$("$PUPPETEER_EXECUTABLE_PATH" --version)"
-          printf 'Chrome: %s\n' "$chrome_version"
-          test "${chrome_version##* }" = "$PINNED_CHROME_REVISION"
+          bun --eval '
+            import { execFileSync } from "node:child_process";
+            const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+            const revision = process.env.PINNED_CHROME_REVISION;
+            if (!executablePath || !revision) throw new Error("Missing pinned Chrome installation outputs");
+            const version = execFileSync(executablePath, ["--version"], { encoding: "utf8" }).trim();
+            console.log(JSON.stringify({ revision, executablePath, version }));
+            if (version.split(/\s+/).at(-1) !== revision) throw new Error("Chrome revision mismatch");
+          '
           check_plan() {
             local plan
             plan="$(OMP_TEST_SHARD="$1/245" bun scripts/ci-test-ts.ts all --dry-run)"
@@ -101,6 +97,26 @@ jobs:
           }
           check_plan 215 771d1064b9fc692a7d7b9998da45088e380c8ae6df5a4d9122edc9f6685f63f8
           check_plan 216 85b6388440e81e6da1723e85c053050c78a6c75a4b287da96af1d4f9840f2bf1
+      - name: Build extension and check committed embedded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build Linux x64 native test addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
+          bun scripts/bazel-natives.ts linux-x64-baseline --dest packages/natives/native -- --jobs=2
+          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
+      - name: Run exact chunk 88 baseline and passive native diagnostic
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "${PUPPETEER_EXECUTABLE_PATH:?}"
           run_pair() {
             OMP_TEST_RELAY_MENU_JOINED_TRACE=0 OMP_TEST_SHARD=215/245 bun scripts/ci-test-ts.ts all || return $?
             OMP_TEST_RELAY_MENU_JOINED_TRACE="$1" OMP_TEST_SHARD=216/245 bun scripts/ci-test-ts.ts all
