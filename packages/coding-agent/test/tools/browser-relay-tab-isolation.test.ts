@@ -477,7 +477,15 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 	});
 }
 
-type FixtureWireKind = "attach" | "auto-attach" | "resume" | "child-attached" | "child-detached";
+type FixtureWireKind =
+	| "attach"
+	| "detach"
+	| "root-detached"
+	| "auto-attach"
+	| "resume"
+	| "child-attached"
+	| "child-detached";
+type FixtureRootDetachReason = "target-closed" | "user-canceled" | "other";
 type FixtureWireResult = "accepted" | "foreign-refusal" | "not-allowed" | "unknown-session" | "other-error";
 
 interface FixtureWireNote {
@@ -492,6 +500,8 @@ interface FixtureWireNote {
 	armed?: boolean;
 	result?: FixtureWireResult;
 	resultAtMs?: number;
+	reason?: FixtureRootDetachReason;
+	relayInitiated?: boolean;
 }
 
 const FIXTURE_WIRE_MAX_NOTES = 96;
@@ -570,11 +580,11 @@ class FixtureMenuWireTrace {
 	}
 
 	#outbound(epoch: number, raw: string): void {
-		// Only the three already occurring Chrome operations relevant to this hypothesis.
+		// Only already occurring attach/detach and debugger lifecycle operations relevant here.
 		if (
 			raw.length > FIXTURE_WIRE_MAX_CHARS ||
 			!raw.includes('"t":"rpc"') ||
-			!/("op":"attach"|Target.setAutoAttach|Runtime.runIfWaitingForDebugger)/.test(raw)
+			!/("op":"attach"|"op":"detach"|Target.setAutoAttach|Runtime.runIfWaitingForDebugger)/.test(raw)
 		)
 			return;
 		const message = fixtureWireMessage(raw);
@@ -583,8 +593,8 @@ class FixtureMenuWireTrace {
 		const id = fixtureWireId(message.id);
 		if (tab === undefined || id === undefined) return;
 		const basis = { epoch, tab, id, atMs: this.age() };
-		if (message.op === "attach") {
-			this.#record({ ...basis, kind: "attach" });
+		if (message.op === "attach" || message.op === "detach") {
+			this.#record({ ...basis, kind: message.op });
 		} else if (
 			message.op === "send" &&
 			message.method === "Target.setAutoAttach" &&
@@ -603,6 +613,7 @@ class FixtureMenuWireTrace {
 		if (raw.length > FIXTURE_WIRE_MAX_CHARS) return;
 		if (
 			!raw.includes('"t":"rpcResult"') &&
+			!raw.includes('"t":"detached"') &&
 			(!raw.includes('"t":"cdpEvent"') ||
 				(!raw.includes('"method":"Target.attachedToTarget"') &&
 					!raw.includes('"method":"Target.detachedFromTarget"')))
@@ -617,6 +628,19 @@ class FixtureMenuWireTrace {
 				note.result = fixtureWireResult(message.ok, message.error);
 				note.resultAtMs = this.age();
 			}
+			return;
+		}
+		if (message?.t === "detached") {
+			const tab = fixtureWireId(message.tabId);
+			if (tab === undefined || tab !== this.#tab) return;
+			const reason: FixtureRootDetachReason =
+				message.reason === "target_closed"
+					? "target-closed"
+					: message.reason === "canceled_by_user"
+						? "user-canceled"
+						: "other";
+			const relayInitiated = typeof message.relayInitiated === "boolean" ? message.relayInitiated : undefined;
+			this.#record({ epoch, tab, atMs: this.age(), kind: "root-detached", reason, relayInitiated });
 			return;
 		}
 		if (message?.t !== "cdpEvent") return;
@@ -691,9 +715,18 @@ class FixtureMenuWireTrace {
 		// Project into a new object. No source IDs, paths, URLs, error text, or protocol bodies can escape.
 		const projected = notes.flatMap(note => {
 			const child = childAlias(note);
-			if (note.kind !== "attach" && note.kind !== "auto-attach" && !child) return [];
-			const { epoch, atMs, kind, wait, armed, result, resultAtMs } = note;
-			return [{ epoch, atMs, kind, wait, armed, result, resultAtMs, child: child || undefined }];
+			if (
+				note.kind !== "attach" &&
+				note.kind !== "detach" &&
+				note.kind !== "root-detached" &&
+				note.kind !== "auto-attach" &&
+				!child
+			)
+				return [];
+			const { epoch, atMs, kind, wait, armed, result, resultAtMs, reason, relayInitiated } = note;
+			return [
+				{ epoch, atMs, kind, wait, armed, result, resultAtMs, reason, relayInitiated, child: child || undefined },
+			];
 		});
 		const clipped = projected.length > FIXTURE_WIRE_SUMMARY_MAX;
 		// Preserve early registry attach plus the late menu phase when the bounded summary fills.
