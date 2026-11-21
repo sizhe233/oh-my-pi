@@ -1,4 +1,4 @@
-name: OMP v19.0.1 full Linux sequence diagnostic only
+name: OMP v19.0.1 full Linux relay comparison only
 on:
   push:
     branches: ['diagnostics/omp-v19.0.1-chunk88-native-trace']
@@ -6,21 +6,27 @@ permissions:
   contents: read
 jobs:
   chunk88-diagnostic:
+    name: Full Linux diagnostic (reattach hold ${{ matrix.reattach_hold }})
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        reattach_hold: ['0', '1']
     if: github.repository == 'sizhe233/oh-my-pi'
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     env:
       OMP_TEST_TIMEOUT: "120"
       PINNED_BASE: 5b48d435a42b581a87c7e9d8d7b8c75d3329b805
-      PREVIOUS_DIAGNOSTIC: a144f82ebaeabcb9b19336e389cf4d1b35d168fe
+      PREVIOUS_DIAGNOSTIC: 0c129bb905ec3234d965cc85a51709fe144ef568
       TEST_SOURCE: packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
       ORIGINAL_BLOB: 0b94a0edd6a3b9df39fd5e17f68f99e3d5c6fcfb
-      DIAGNOSTIC_BLOB: 8b7b02aa6eab341fe14d3d787c56db35ece74918
+      DIAGNOSTIC_BLOB: d09f6e03e144286b4ee1a7175f2ac017f643d858
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 5
+          fetch-depth: 6
           persist-credentials: false
       - name: Prove exact pinned candidate and diagnostic-only diff
         shell: bash
@@ -28,10 +34,11 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git show -s --format=%P HEAD)" = "$PREVIOUS_DIAGNOSTIC"
-          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = 2f38a8f936c421bb86702064b374929616c575d0
+          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = a144f82ebaeabcb9b19336e389cf4d1b35d168fe
+          test "$(git show -s --format=%P a144f82ebaeabcb9b19336e389cf4d1b35d168fe)" = 2f38a8f936c421bb86702064b374929616c575d0
           test "$(git show -s --format=%P 2f38a8f936c421bb86702064b374929616c575d0)" = a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
           test "$(git show -s --format=%P a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5)" = "$PINNED_BASE"
-          test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = .github/workflows/fork-v1901-chunk88-diagnostic.yml
+          test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = "$(printf '%s\n%s' .github/workflows/fork-v1901-chunk88-diagnostic.yml "$TEST_SOURCE")"
           test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
           test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
           test "$(git diff --name-only "$PINNED_BASE" HEAD)" = "$(printf '%s\n%s' .github/workflows/fork-v1901-chunk88-diagnostic.yml "$TEST_SOURCE")"
@@ -130,8 +137,9 @@ jobs:
             ../catalog/test/model-thinking.test.ts \
             ../catalog/test/compat-cascade.test.ts \
             ../catalog/test/published-effort-ladders.test.ts
-      - name: Run the full TypeScript sequence with passive trace only
+      - name: Compare the original full TypeScript sequence
         env:
+          REATTACH_HOLD: ${{ matrix.reattach_hold }}
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
         shell: bash
         run: |
@@ -144,7 +152,13 @@ jobs:
           test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
           # One runner invocation captures the same cold-plan prefix and all actual tests.
           test -z "${OMP_TEST_SHARD:-}"
+          case "$REATTACH_HOLD" in
+            0|1) ;;
+            *) exit 2 ;;
+          esac
+          printf 'Diagnostic only; reattach hold = %s\n' "$REATTACH_HOLD"
           export OMP_TEST_RELAY_MENU_JOINED_TRACE=1
+          export OMP_TEST_RELAY_MENU_REATTACH_HOLD="$REATTACH_HOLD"
           bun run ci:test:ts
       - name: Record pinned Linux browser version after both test suites
         if: ${{ always() && steps.linux-chrome.outcome == 'success' }}
