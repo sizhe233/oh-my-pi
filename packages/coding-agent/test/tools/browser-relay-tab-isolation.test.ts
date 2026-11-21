@@ -1073,8 +1073,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 					`chrome.runtime.sendMessage({ op: "testReportMenuRecoveryDetach", tabId: ${expectedTabId} })`,
 				),
 			).toEqual({});
-			await withTimeout(failedAttach.promise, 7_500, "Stock Chrome never refused the exact borrowed tab's reattach");
-			const denied = await rejectionOf(readRecoveryFixtureDocument(name));
+			// Reattach is driven by a real read, not passive discovery. Require the actual Chrome refusal
+			// for this tab while the native menu is still present, as well as the public recovery error.
+			const [denied] = await Promise.all([
+				rejectionOf(readRecoveryFixtureDocument(name)),
+				withTimeout(failedAttach.promise, 7_500, "Stock Chrome never refused the exact borrowed tab's reattach"),
+			]);
 			expect(String(denied)).toMatch(/omp kept the tab open as it is/);
 			expect(getTabsMapForTest().get(name)).toBe(tab);
 			expect(tab.targetId).toBe(targetId);

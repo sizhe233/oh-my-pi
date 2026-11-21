@@ -19,15 +19,18 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
       - name: Prove exact pinned base, reviewed payload and unchanged real menu regression
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git show -s --format=%P HEAD)" = "$PINNED_BASE"
-          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
+          test "$(git show -s --format=%P HEAD)" = cc9e3062e5708a8f666876a7bae81984f6ab0954
+          test "$(git show -s --format=%P HEAD^)" = "$PINNED_BASE"
+          test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
+          test "$(git hash-object "$TEST_SOURCE")" = 31d142d693d5084d003ccbbef98e8989db52f8dc
+          test "$(git diff --name-only HEAD^ HEAD)" = "$(printf '%s\n' .github/workflows/fork-v1901-demand-recovery.yml "$TEST_SOURCE")"
           test "$(uname -m)" = x86_64
           cat > "$RUNNER_TEMP/expected-diff" <<'FILES'
           .github/workflows/fork-v1901-demand-recovery.yml
@@ -37,6 +40,7 @@ jobs:
           packages/coding-agent/src/tools/browser/tab-supervisor.ts
           packages/coding-agent/test/tools/browser-attach.test.ts
           packages/coding-agent/test/tools/browser-relay-bridge.test.ts
+          packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
           FILES
           git diff --name-only "$PINNED_BASE" HEAD | diff - "$RUNNER_TEMP/expected-diff"
           test "$(git hash-object packages/coding-agent/CHANGELOG.md)" = 708dbeaf42f39c579705fe47fc7a61b97b5e72b5
@@ -117,6 +121,7 @@ jobs:
             test/utils/clipboard.test.ts 2>&1 | tee "$RUNNER_TEMP/omp-focused-browser.log"
           grep -F '(pass) relay tab ownership > does not change either fixture extension menu when the relay borrows a tab' "$RUNNER_TEMP/omp-focused-browser.log"
           grep -F '(pass) relay tab ownership > reads the ordinary same borrowed target without reload or focus when Chrome never refused it' "$RUNNER_TEMP/omp-focused-browser.log"
+          grep -F '(pass) relay tab ownership > recovers the same borrowed tab after a synthetic detach notice, stock Chrome refusal, and native fixture menu dismissal' "$RUNNER_TEMP/omp-focused-browser.log"
           bun test --timeout="$((OMP_TEST_TIMEOUT * 1000))" \
             test/task/restore-regressions.test.ts \
             test/task/restore.test.ts \
