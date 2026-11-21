@@ -554,12 +554,181 @@ function fixtureTraceOnly(work: () => void): void {
 	}
 }
 
+interface FixtureRootDetached {
+	tab: number;
+	reason: FixtureRootDetachReason;
+	relayInitiated: boolean | undefined;
+}
+
+type FixtureHoldState = "not-triggered" | "held" | "released" | "expired" | "invalidated";
+const FIXTURE_REATTACH_HOLD_MAX_MS = 8_000; // Ordinary relay RPC timeout remains 20s.
+
+interface FixtureHeldAttach {
+	epoch: number;
+	heldAt: number;
+	timer: NodeJS.Timeout;
+	forward: () => void;
+	close: () => void;
+}
+
+/**
+ * Treatment in a disposable fixture only: defer at most one already-issued, ordinary attach RPC.
+ * Its provenance must be the synchronous dispatch of the exact spontaneous root detach while
+ * the fixture's unique expected child navigation is pending, after successful borrow.
+ */
+class FixtureReattachTreatment {
+	#status: FixtureHoldState = "not-triggered";
+	#epoch = 0;
+	#frame: string | undefined;
+	#pendingNavigation = false;
+	#ambiguous = false;
+	#dispatch: { epoch: number; tab: number } | undefined;
+	#held: FixtureHeldAttach | undefined;
+
+	navigation(frame: string, stage: string): void {
+		if (stage === "expected-navigation-start" || stage === "expected-commit") {
+			if (this.#frame !== undefined && frame !== this.#frame) {
+				this.#ambiguous = true;
+				this.#fallback("invalidated");
+			}
+			this.#frame ??= frame;
+			this.#pendingNavigation = !this.#ambiguous && stage === "expected-navigation-start";
+		} else if (
+			frame === this.#frame &&
+			["frame-swap", "frame-detach", "other-commit", "error-document"].includes(stage)
+		) {
+			this.#pendingNavigation = false;
+		}
+	}
+
+	// Only after the real bridge processed the fixture extension hello. Its own replacement
+	// close invalidates a held request; never forward the old socket's bytes on a new epoch.
+	helloProcessed(epoch: number): void {
+		if (epoch === this.#epoch) return;
+		if (this.#held) this.abandon();
+		this.#epoch = epoch;
+	}
+
+	socketClosed(epoch: number): void {
+		if (epoch !== this.#epoch) return;
+		if (this.#take()) this.#status = "invalidated";
+		this.#dispatch = undefined;
+		this.#epoch = 0;
+	}
+
+	rootDispatch(epoch: number, event: FixtureRootDetached): (() => void) | undefined {
+		if (epoch !== this.#epoch) return undefined;
+		if (this.#held) {
+			// A second root detach means the pending receipt may no longer describe a valid
+			// attachment, especially if the user dismissed the debugger. Let the real bridge
+			// handle that event first, then close the disposable socket; do not reattach.
+			return () => this.abandon();
+		}
+		if (
+			this.#status !== "not-triggered" ||
+			!this.#pendingNavigation ||
+			this.#ambiguous ||
+			event.reason !== "target-closed" ||
+			event.relayInitiated !== false
+		) {
+			return undefined;
+		}
+		const dispatch = { epoch, tab: event.tab };
+		this.#dispatch = dispatch;
+		return () => {
+			if (this.#dispatch === dispatch) this.#dispatch = undefined;
+		};
+	}
+
+	hold(epoch: number, raw: string, forward: () => void, close: () => void): boolean {
+		const dispatch = this.#dispatch;
+		if (this.#status !== "not-triggered" || !dispatch || dispatch.epoch !== epoch || epoch !== this.#epoch)
+			return false;
+		const message = fixtureWireMessage(raw);
+		if (
+			message?.t !== "rpc" ||
+			message.op !== "attach" ||
+			message.tabId !== dispatch.tab ||
+			fixtureWireId(message.id) === undefined ||
+			message.clearForeignFrames !== false ||
+			Object.keys(message).length !== 5
+		) {
+			return false;
+		}
+		const timer = setTimeout(() => this.#fallback("expired"), FIXTURE_REATTACH_HOLD_MAX_MS);
+		timer.unref();
+		this.#held = { epoch, heldAt: performance.now(), timer, forward, close };
+		this.#status = "held";
+		return true;
+	}
+
+	beforeExplicitRead(verifiedFrame: string): void {
+		const held = this.#held;
+		if (!held) return;
+		if (verifiedFrame !== this.#frame) {
+			this.#fallback("invalidated");
+			return;
+		}
+		if (performance.now() - held.heldAt >= FIXTURE_REATTACH_HOLD_MAX_MS) {
+			this.#fallback("expired");
+			return;
+		}
+		this.#fallback("released");
+	}
+
+	#take(): FixtureHeldAttach | undefined {
+		const held = this.#held;
+		this.#held = undefined;
+		if (held) clearTimeout(held.timer);
+		return held;
+	}
+
+	#fallback(status: "released" | "expired" | "invalidated"): void {
+		const held = this.#take();
+		if (!held) return;
+		this.#status = status;
+		if (held.epoch !== this.#epoch || performance.now() - held.heldAt >= FIXTURE_REATTACH_HOLD_MAX_MS * 2) {
+			// A stalled event loop may wake after the bridge's RPC deadline. Never send a stale attach.
+			this.#status = "invalidated";
+			fixtureTraceOnly(held.close);
+			return;
+		}
+		// Forward the untouched original once. For ordinary expiry/ambiguity this is a
+		// non-treatment fallback, so the live bridge is not left with an unmatched RPC.
+		try {
+			held.forward();
+		} catch {
+			this.#status = "invalidated";
+			fixtureTraceOnly(held.close);
+		}
+	}
+
+	abandon(): void {
+		this.#dispatch = undefined;
+		const held = this.#take();
+		if (!held) return;
+		this.#status = "invalidated";
+		// Never reattach after user cancel, epoch replacement or cleanup. The real
+		// socket close rejects its pending RPC without synthetic result.
+		fixtureTraceOnly(held.close);
+	}
+
+	status(): FixtureHoldState {
+		return this.#status;
+	}
+}
+
 class FixtureMenuWireTrace {
 	#start = performance.now();
 	#notes: FixtureWireNote[] = [];
 	#dropped = false;
 	#tab: number | undefined;
 	#borrowAtMs: number | undefined;
+	readonly treatment?: FixtureReattachTreatment;
+
+	constructor(withTreatment = false) {
+		if (withTreatment) this.treatment = new FixtureReattachTreatment();
+	}
 
 	age(): number {
 		return Math.round(performance.now() - this.#start);
@@ -609,7 +778,7 @@ class FixtureMenuWireTrace {
 		}
 	}
 
-	#inbound(epoch: number, raw: string): void {
+	#inbound(epoch: number, raw: string): FixtureRootDetached | undefined {
 		if (raw.length > FIXTURE_WIRE_MAX_CHARS) return;
 		if (
 			!raw.includes('"t":"rpcResult"') &&
@@ -641,7 +810,7 @@ class FixtureMenuWireTrace {
 						: "other";
 			const relayInitiated = typeof message.relayInitiated === "boolean" ? message.relayInitiated : undefined;
 			this.#record({ epoch, tab, atMs: this.age(), kind: "root-detached", reason, relayInitiated });
-			return;
+			return { tab, reason, relayInitiated };
 		}
 		if (message?.t !== "cdpEvent") return;
 		const tab = fixtureWireId(message.tabId);
@@ -688,10 +857,23 @@ class FixtureMenuWireTrace {
 					epoch,
 					socket: {
 						send: raw => {
-							fixtureTraceOnly(() => this.#outbound(epoch, raw));
-							socket.send(raw);
+							let held = false;
+							fixtureTraceOnly(() => {
+								this.#outbound(epoch, raw);
+								held =
+									this.treatment?.hold(
+										epoch,
+										raw,
+										() => socket.send(raw),
+										() => socket.close(),
+									) ?? false;
+							});
+							if (!held) socket.send(raw);
 						},
-						close: () => socket.close(),
+						close: () => {
+							this.treatment?.socketClosed(epoch);
+							socket.close();
+						},
 					},
 				});
 			}
@@ -699,11 +881,31 @@ class FixtureMenuWireTrace {
 		};
 		bridge.extMessage = (socket, raw) => {
 			const mapped = sockets.get(socket);
-			if (mapped) fixtureTraceOnly(() => this.#inbound(mapped.epoch, raw));
-			originalMessage(mapped?.socket ?? socket, raw);
+			let endDispatch: (() => void) | undefined;
+			let hello = false;
+			if (mapped)
+				fixtureTraceOnly(() => {
+					if (this.treatment && raw.length <= FIXTURE_WIRE_MAX_CHARS && raw.includes('"t":"hello"')) {
+						const message = fixtureWireMessage(raw);
+						hello =
+							message?.t === "hello" && Array.isArray(message.tabs) && Array.isArray(message.attachedTabIds);
+					}
+					const root = this.#inbound(mapped.epoch, raw);
+					if (root) endDispatch = this.treatment?.rootDispatch(mapped.epoch, root);
+				});
+			try {
+				originalMessage(mapped?.socket ?? socket, raw);
+				if (mapped && hello) this.treatment?.helloProcessed(mapped.epoch);
+			} finally {
+				endDispatch?.();
+			}
 		};
-		// Internal bridge calls already have the facade; they pass through unchanged.
-		bridge.extClosed = socket => originalClose(sockets.get(socket)?.socket ?? socket);
+		// Internal bridge calls already have the facade; normal server closes resolve the raw socket's epoch.
+		bridge.extClosed = socket => {
+			const mapped = sockets.get(socket);
+			if (mapped) this.treatment?.socketClosed(mapped.epoch);
+			originalClose(mapped?.socket ?? socket);
+		};
 		// The bridge exists only for this fixture. Keep normalization through asynchronous socket teardown.
 	}
 
@@ -734,6 +936,7 @@ class FixtureMenuWireTrace {
 		return {
 			driven: this.#tab === undefined ? "unobserved" : "verified-borrow",
 			borrowAtMs: this.#borrowAtMs,
+			treatment: this.treatment?.status(),
 			capped: this.#dropped || clipped,
 			wire,
 		};
@@ -757,6 +960,8 @@ function watchFixtureMenuNavigation(page: Page, url: string, wire: FixtureMenuWi
 			if (candidates.size >= 2) ambiguous = true;
 			else candidates.add(frame);
 		}
+		if (!candidates.has(frame) && !expected) return;
+		wire.treatment?.navigation(frame, stage);
 		if (!candidates.has(frame)) return;
 		if (events.length === FIXTURE_NATIVE_MAX_NOTES) {
 			capped = true;
@@ -1129,7 +1334,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 		}
 	}, 60_000);
 
-	it("does not change either fixture extension menu when the relay borrows a tab", async () => {
+	async function checkBothMenus(treatment: boolean): Promise<void> {
 		const vaultDir = await writeStandInVault(
 			`const menuUrl = chrome.runtime.getURL("menu.html");
 const menuOrigin = "chrome-extension://" + chrome.runtime.id;
@@ -1174,8 +1379,8 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 		);
 		let fixture: RelayFixture | undefined;
 		let relay: BrowserHandle | undefined;
-		const trace = new FixtureMenuWireTrace();
-		const name = `relay-vault-${process.pid}`;
+		const trace = new FixtureMenuWireTrace(treatment);
+		const name = `relay-vault-${process.pid}${treatment ? "-diagnostic" : ""}`;
 		try {
 			fixture = await launchRelayFixture(undefined, [vaultDir], trace);
 			const vaultId = fixture.extensionIds.get(vaultDir);
@@ -1220,6 +1425,7 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 				showMenu(driven, "driven tab after borrow"),
 			);
 			expect(drivenMenu.documentId).not.toBe(userMenu.documentId);
+			trace.treatment?.beforeExplicitRead(drivenMenu.frameId);
 			await checkTitleWithoutHidingFrame(name, "Login driven");
 			expect(await observeFixtureMenu(driven, menu, "driven tab after relay read")).toEqual(drivenMenu);
 			expect(await observeFixtureMenu(user, menu, "user tab after relay read")).toEqual(userMenu);
@@ -1230,7 +1436,17 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 			await releaseTab(name);
 			expect(driven.isClosed()).toBeFalse();
 			expect(user.isClosed()).toBeFalse();
+			if (trace.treatment && trace.treatment.status() !== "released") {
+				throw new Error(`Diagnostic A/B treatment not administered: ${trace.treatment.status()}`);
+			}
+		} catch (cause) {
+			if (!trace.treatment) throw cause;
+			throw new Error(
+				`A/B treatment state=${trace.treatment.status()}: ${cause instanceof Error ? cause.message : "fixture failed"}`,
+				{ cause },
+			);
 		} finally {
+			trace.treatment?.abandon();
 			try {
 				if (relay) {
 					await releaseTab(name).catch(() => undefined);
@@ -1244,7 +1460,19 @@ document.documentElement.setAttribute("data-omp-fixture-menu-ready", "");`,
 				}
 			}
 		}
-	}, 60_000);
+	}
+
+	it(
+		"does not change either fixture extension menu when the relay borrows a tab",
+		() => checkBothMenus(false),
+		60_000,
+	);
+
+	it(
+		"does not change either fixture extension menu when the relay borrows a tab (diagnostic A/B treatment)",
+		() => checkBothMenus(true),
+		60_000,
+	);
 
 	it("leaves an extension save card and its neighboring page frames unchanged", async () => {
 		const vaultDir = await writeStandInVault(
