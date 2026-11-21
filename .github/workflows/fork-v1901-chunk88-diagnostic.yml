@@ -12,7 +12,7 @@ jobs:
     env:
       OMP_TEST_TIMEOUT: "120"
       PINNED_BASE: 5b48d435a42b581a87c7e9d8d7b8c75d3329b805
-      PREVIOUS_DIAGNOSTIC: a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
+      PREVIOUS_DIAGNOSTIC: 2f38a8f936c421bb86702064b374929616c575d0
       TEST_SOURCE: packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
       ORIGINAL_BLOB: 0b94a0edd6a3b9df39fd5e17f68f99e3d5c6fcfb
       DIAGNOSTIC_BLOB: 8b7b02aa6eab341fe14d3d787c56db35ece74918
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
       - name: Prove exact pinned candidate and diagnostic-only diff
         shell: bash
@@ -28,7 +28,8 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git show -s --format=%P HEAD)" = "$PREVIOUS_DIAGNOSTIC"
-          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = "$PINNED_BASE"
+          test "$(git show -s --format=%P "$PREVIOUS_DIAGNOSTIC")" = a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5
+          test "$(git show -s --format=%P a726b094b37e1ddcc7ab70e09c4ad4c99a96b5f5)" = "$PINNED_BASE"
           test "$(git diff --name-only "$PREVIOUS_DIAGNOSTIC" HEAD)" = .github/workflows/fork-v1901-chunk88-diagnostic.yml
           test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
           test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
@@ -117,9 +118,31 @@ jobs:
         run: |
           set -euo pipefail
           test -x "${PUPPETEER_EXECUTABLE_PATH:?}"
+          # The runner writes weighted timing data at process exit. Each
+          # diagnostic shard must start with the original cold plan, not the
+          # preceding shard's new timing data.
+          timing=node_modules/.cache/omp-test-timings.json
+          mkdir -p "$(dirname "$timing")"
+          run_exact_shard() {
+            local trace="$1" shard="$2" expected="$3" plan actual status=0 log
+            test ! -L "$timing" || return 1
+            printf '%s\n' '{"files":{},"commands":{}}' > "$timing" || return 1
+            plan="$(OMP_TEST_SHARD="$shard/245" bun scripts/ci-test-ts.ts all --dry-run)" || return 1
+            test "$(grep -c '^\$ bun test ' <<< "$plan")" -eq 1 || return 1
+            test "$(grep '^\$ bun test ' <<< "$plan" | sha256sum | cut -d' ' -f1)" = "$expected" || return 1
+            log="$(mktemp "${RUNNER_TEMP:?}/omp-shard-$shard.XXXXXXXX")" || return 1
+            OMP_TEST_RELAY_MENU_JOINED_TRACE="$trace" OMP_TEST_SHARD="$shard/245" bun scripts/ci-test-ts.ts all 2>&1 | tee "$log" || status=$?
+            actual="$(grep '^\$ bun test ' "$log" | sha256sum | cut -d' ' -f1)"
+            if test "$actual" != "$expected"; then
+              printf 'Executed shard %s command mismatch: expected %s, got %s\n' "$shard" "$expected" "$actual" >&2
+              return 1
+            fi
+            printf 'Verified executed shard %s argv %s, exit %s\n' "$shard" "$actual" "$status"
+            return "$status"
+          }
           run_pair() {
-            OMP_TEST_RELAY_MENU_JOINED_TRACE=0 OMP_TEST_SHARD=215/245 bun scripts/ci-test-ts.ts all || return $?
-            OMP_TEST_RELAY_MENU_JOINED_TRACE="$1" OMP_TEST_SHARD=216/245 bun scripts/ci-test-ts.ts all
+            run_exact_shard 0 215 771d1064b9fc692a7d7b9998da45088e380c8ae6df5a4d9122edc9f6685f63f8 || return $?
+            run_exact_shard "$1" 216 85b6388440e81e6da1723e85c053050c78a6c75a4b287da96af1d4f9840f2bf1
           }
           unset OMP_TEST_RELAY_MENU_JOINED_TRACE
           git show "$PINNED_BASE:$TEST_SOURCE" > "$TEST_SOURCE"
