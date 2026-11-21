@@ -1,0 +1,121 @@
+name: OMP v19.0.1 Linux chunk 88 diagnostic only
+on:
+  push:
+    branches: ['diagnostics/omp-v19.0.1-chunk88-native-trace']
+permissions:
+  contents: read
+jobs:
+  chunk88-diagnostic:
+    if: github.repository == 'sizhe233/oh-my-pi'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      OMP_TEST_TIMEOUT: "120"
+      PINNED_BASE: 5b48d435a42b581a87c7e9d8d7b8c75d3329b805
+      TEST_SOURCE: packages/coding-agent/test/tools/browser-relay-tab-isolation.test.ts
+      ORIGINAL_BLOB: 0b94a0edd6a3b9df39fd5e17f68f99e3d5c6fcfb
+      DIAGNOSTIC_BLOB: 8b7b02aa6eab341fe14d3d787c56db35ece74918
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Prove exact pinned candidate and diagnostic-only diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$PINNED_BASE"
+          test "$(git rev-parse "$PINNED_BASE:$TEST_SOURCE")" = "$ORIGINAL_BLOB"
+          test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
+          test "$(git diff --name-only "$PINNED_BASE" HEAD)" = "$(printf '%s\n%s' .github/workflows/fork-v1901-chunk88-diagnostic.yml "$TEST_SOURCE")"
+          printf 'Diagnostic source %s; pinned candidate %s\n' "$GITHUB_SHA" "$PINNED_BASE"
+          test "$(uname -m)" = x86_64
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.5
+      - name: Install frozen dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun -e 'const [major, minor] = Bun.version.split(".").map(Number); if (major < 1 || (major === 1 && minor < 4)) throw new Error(`Bun >=1.4 required, got ${Bun.version}`)'
+          bun install --frozen-lockfile
+      - name: Build extension and check committed embedded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run --cwd packages/browser-relay build
+          git diff --exit-code -- packages/coding-agent/src/tools/browser/relay/extension-assets
+      - name: Build Linux x64 native test addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e packages/natives/native/pi_natives.linux-x64-baseline.node
+          bun scripts/bazel-natives.ts linux-x64-baseline --dest packages/natives/native -- --jobs=2
+          test -s packages/natives/native/pi_natives.linux-x64-baseline.node
+      - name: Install Puppeteer's pinned Chrome for Testing for Linux tests
+        id: linux-chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun --eval '
+            import { Browser, install } from "@puppeteer/browsers";
+            import { PUPPETEER_REVISIONS } from "puppeteer-core";
+            import { appendFile } from "node:fs/promises";
+            import { isAbsolute, join } from "node:path";
+            const revision = PUPPETEER_REVISIONS.chrome;
+            if (revision !== "150.0.7871.24") throw new Error("Unexpected locked Puppeteer Chrome version: " + revision);
+            const { RUNNER_TEMP, GITHUB_OUTPUT } = process.env;
+            if (!RUNNER_TEMP || !GITHUB_OUTPUT) throw new Error("Missing GitHub runner paths");
+            const result = await install({
+              browser: Browser.CHROME,
+              buildId: revision,
+              cacheDir: join(RUNNER_TEMP, "omp-linux-test-browser"),
+              baseUrl: "https://storage.googleapis.com/chrome-for-testing-public",
+            });
+            if (!isAbsolute(result.executablePath) || /[\r\n]/.test(result.executablePath)) {
+              throw new Error("Invalid installed Chrome executable path");
+            }
+            console.log(JSON.stringify({ revision, executablePath: result.executablePath }));
+            await appendFile(GITHUB_OUTPUT, "executable=" + result.executablePath + "\nrevision=" + revision + "\n");
+          '
+      - name: Run exact chunk 88 baseline and passive native diagnostic
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.linux-chrome.outputs.executable }}
+          PINNED_CHROME_REVISION: ${{ steps.linux-chrome.outputs.revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(bun --version)" = 1.4.5
+          test -x "${PUPPETEER_EXECUTABLE_PATH:?}"
+          chrome_version="$("$PUPPETEER_EXECUTABLE_PATH" --version)"
+          printf 'Chrome: %s\n' "$chrome_version"
+          test "${chrome_version##* }" = "$PINNED_CHROME_REVISION"
+          check_plan() {
+            local plan
+            plan="$(OMP_TEST_SHARD="$1/245" bun scripts/ci-test-ts.ts all --dry-run)"
+            test "$(grep -c '^\$ ' <<< "$plan")" -eq 1
+            test "$(grep '^\$ ' <<< "$plan" | sha256sum | cut -d' ' -f1)" = "$2"
+            printf '%s\n' "$plan"
+          }
+          check_plan 215 771d1064b9fc692a7d7b9998da45088e380c8ae6df5a4d9122edc9f6685f63f8
+          check_plan 216 85b6388440e81e6da1723e85c053050c78a6c75a4b287da96af1d4f9840f2bf1
+          run_pair() {
+            OMP_TEST_RELAY_MENU_JOINED_TRACE=0 OMP_TEST_SHARD=215/245 bun scripts/ci-test-ts.ts all || return $?
+            OMP_TEST_RELAY_MENU_JOINED_TRACE="$1" OMP_TEST_SHARD=216/245 bun scripts/ci-test-ts.ts all
+          }
+          unset OMP_TEST_RELAY_MENU_JOINED_TRACE
+          git show "$PINNED_BASE:$TEST_SOURCE" > "$TEST_SOURCE"
+          test "$(git hash-object "$TEST_SOURCE")" = "$ORIGINAL_BLOB"
+          git diff --exit-code "$PINNED_BASE" -- packages
+          a0=0
+          printf '%s\n' 'A0 unmodified candidate test, exact chunk order.'
+          run_pair 0 || a0=$?
+          git show "HEAD:$TEST_SOURCE" > "$TEST_SOURCE"
+          test "$(git hash-object "$TEST_SOURCE")" = "$DIAGNOSTIC_BLOB"
+          a1=0
+          printf '%s\n' 'A1 passive diagnostic test, exact chunk order.'
+          run_pair 1 || a1=$?
+          printf 'Diagnostic only; no release acceptance. A0=%s A1=%s\n' "$a0" "$a1"
+          test "$a0" -eq 0 && test "$a1" -eq 0

@@ -13,6 +13,7 @@ import { acquireBrowser, type BrowserHandle, releaseBrowser } from "@oh-my-pi/pi
 import { unpackedExtensionId } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
 import { FOREIGN_FRAME_REFUSAL } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
+import type { RelaySocket } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/bridge";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 import type {
 	WorkerInbound,
@@ -29,7 +30,14 @@ import {
 import { WorkerCore } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { getPuppeteerDir, withTimeout } from "@oh-my-pi/pi-utils";
-import puppeteer, { type Browser, type CDPSession, type Page, type Protocol } from "puppeteer-core";
+import puppeteer, {
+	type Browser,
+	type CDPSession,
+	CDPSessionEvent,
+	Connection,
+	type Page,
+	type Protocol,
+} from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
@@ -132,6 +140,7 @@ async function launchRelayFixture(
 	log?: (message: string, data?: Record<string, unknown>) => void,
 	extensions: string[] = [],
 	controlledMenuRecovery = false,
+	diagnostic?: FixtureMenuWireTrace,
 ): Promise<RelayFixture> {
 	const port = await findFreeCdpPort();
 	const server = startRelayServer({ port, group: false, log });
@@ -287,6 +296,11 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
 });
 ${controlledMenuRecovery ? recoveryFixtureDebuggerHook(`http://127.0.0.1:${pages.port}`) : ""}${background.replace(defaultPort, `var DEFAULT_PORT = ${port};`)}`,
 		);
+		if (diagnostic) {
+			const relayId = await unpackedExtensionId(extensionDir);
+			if (!relayId) throw new Error("Missing diagnostic fixture relay ID");
+			diagnostic.install(server.bridge, relayId);
+		}
 		const { browser, extensionIds, inExtension } = await launchBrowser();
 		const cdpUrl = `http://127.0.0.1:${port}`;
 		// Finish the extension hello before the native CDP client attaches to the sentinel.
@@ -503,6 +517,550 @@ async function observeFixtureMenu(page: Page, url: string, phase: string): Promi
 		}
 		throw new Error(`Fixture menu document did not answer (${phase}; ${diagnostics()})`);
 	});
+}
+
+type FixtureWireKind =
+	| "attach"
+	| "detach"
+	| "root-detached"
+	| "auto-attach"
+	| "resume"
+	| "child-attached"
+	| "child-detached";
+type FixtureRootDetachReason = "target-closed" | "user-canceled" | "other";
+type FixtureWireResult = "accepted" | "foreign-refusal" | "not-allowed" | "unknown-session" | "other-error";
+
+interface FixtureWireNote {
+	epoch: number;
+	tab: number;
+	atMs: number;
+	kind: FixtureWireKind;
+	id?: number;
+	session?: string;
+	frame?: string;
+	wait?: boolean;
+	armed?: boolean;
+	result?: FixtureWireResult;
+	resultAtMs?: number;
+	reason?: FixtureRootDetachReason;
+	relayInitiated?: boolean;
+}
+
+const FIXTURE_WIRE_MAX_NOTES = 96;
+const FIXTURE_WIRE_MAX_CHARS = 4_096;
+const FIXTURE_WIRE_SUMMARY_MAX = 24;
+const FIXTURE_WIRE_MAX_EPOCHS = 4;
+
+function fixtureWireRecord(value: unknown): Record<string, unknown> | undefined {
+	if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
+	return undefined;
+}
+
+function fixtureWireMessage(raw: string): Record<string, unknown> | undefined {
+	if (raw.length > FIXTURE_WIRE_MAX_CHARS) return undefined;
+	try {
+		const message: unknown = JSON.parse(raw);
+		return fixtureWireRecord(message);
+	} catch {
+		return undefined;
+	}
+}
+
+function fixtureWireId(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+// Chrome's 128-bit tokens are hex; an unexpected wire shape yields only inconclusive telemetry.
+function fixtureFrameToken(value: unknown): string | undefined {
+	return typeof value === "string" && /^[0-9a-f]{32}$/i.test(value) ? value : undefined;
+}
+
+function fixtureWireResult(ok: boolean, error: unknown): FixtureWireResult {
+	if (ok) return "accepted";
+	if (typeof error === "string" && error.length <= 512) {
+		if (/another extension.s frame|Cannot access a chrome-extension:\/\//i.test(error)) return "foreign-refusal";
+		if (/not allowed/i.test(error)) return "not-allowed";
+		if (/unknown session|session (?:id )?(?:not found|with given id not found)/i.test(error))
+			return "unknown-session";
+	}
+	return "other-error";
+}
+
+/** Diagnostics are never allowed to change a socket result or replace the actual test failure. */
+function fixtureTraceOnly(work: () => void): void {
+	try {
+		work();
+	} catch {
+		// Nothing recorded is necessary for forwarding or acceptance.
+	}
+}
+
+class FixtureMenuWireTrace {
+	#start = performance.now();
+	#notes: FixtureWireNote[] = [];
+	#dropped = false;
+	#tab: number | undefined;
+	#borrowAtMs: number | undefined;
+
+	age(): number {
+		return Math.round(performance.now() - this.#start);
+	}
+
+	drive(tab: number): void {
+		this.#tab = fixtureWireId(tab);
+		if (this.#tab !== undefined) this.#borrowAtMs = this.age();
+	}
+
+	#record(note: FixtureWireNote): void {
+		if (this.#tab !== undefined && note.tab !== this.#tab) return;
+		if (this.#notes.length === FIXTURE_WIRE_MAX_NOTES) {
+			this.#dropped = true;
+			return;
+		}
+		this.#notes.push(note);
+	}
+
+	#outbound(epoch: number, raw: string): void {
+		if (raw.length > FIXTURE_WIRE_MAX_CHARS) {
+			this.#dropped = true;
+			return;
+		}
+		// Only already occurring attach/detach and debugger lifecycle operations relevant here.
+		if (
+			!raw.includes('"t":"rpc"') ||
+			!/("op":"attach"|"op":"detach"|Target.setAutoAttach|Runtime.runIfWaitingForDebugger)/.test(raw)
+		)
+			return;
+		const message = fixtureWireMessage(raw);
+		if (!message) {
+			this.#dropped = true;
+			return;
+		}
+		if (message?.t !== "rpc") return;
+		const tab = fixtureWireId(message.tabId);
+		const id = fixtureWireId(message.id);
+		if (tab === undefined || id === undefined) return;
+		const basis = { epoch, tab, id, atMs: this.age() };
+		if (message.op === "attach" || message.op === "detach") {
+			this.#record({ ...basis, kind: message.op });
+		} else if (
+			message.op === "send" &&
+			message.method === "Target.setAutoAttach" &&
+			message.sessionId === undefined
+		) {
+			const params = fixtureWireRecord(message.params);
+			if (typeof params?.autoAttach !== "boolean" || typeof params.waitForDebuggerOnStart !== "boolean") return;
+			this.#record({ ...basis, kind: "auto-attach", armed: params.autoAttach, wait: params.waitForDebuggerOnStart });
+		} else if (message.op === "send" && message.method === "Runtime.runIfWaitingForDebugger" && tab === this.#tab) {
+			const session = fixtureFrameToken(message.sessionId);
+			if (session) this.#record({ ...basis, kind: "resume", session });
+		}
+	}
+
+	#inbound(epoch: number, raw: string): void {
+		if (raw.length > FIXTURE_WIRE_MAX_CHARS) {
+			this.#dropped = true;
+			return;
+		}
+		if (
+			!raw.includes('"t":"rpcResult"') &&
+			!raw.includes('"t":"detached"') &&
+			(!raw.includes('"t":"cdpEvent"') ||
+				(!raw.includes('"method":"Target.attachedToTarget"') &&
+					!raw.includes('"method":"Target.detachedFromTarget"')))
+		)
+			return;
+		const message = fixtureWireMessage(raw);
+		if (!message) {
+			this.#dropped = true;
+			return;
+		}
+		if (message?.t === "rpcResult") {
+			const id = fixtureWireId(message.id);
+			if (id === undefined || typeof message.ok !== "boolean") return;
+			const note = this.#notes.find(note => note.epoch === epoch && note.id === id);
+			if (note && !note.result) {
+				note.result = fixtureWireResult(message.ok, message.error);
+				note.resultAtMs = this.age();
+			}
+			return;
+		}
+		if (message?.t === "detached") {
+			const tab = fixtureWireId(message.tabId);
+			if (tab === undefined || tab !== this.#tab) return;
+			const reason: FixtureRootDetachReason =
+				message.reason === "target_closed"
+					? "target-closed"
+					: message.reason === "canceled_by_user"
+						? "user-canceled"
+						: "other";
+			const relayInitiated = typeof message.relayInitiated === "boolean" ? message.relayInitiated : undefined;
+			this.#record({ epoch, tab, atMs: this.age(), kind: "root-detached", reason, relayInitiated });
+			return;
+		}
+		if (message?.t !== "cdpEvent") return;
+		const tab = fixtureWireId(message.tabId);
+		if (tab === undefined || tab !== this.#tab) return;
+		const params = fixtureWireRecord(message.params);
+		const session = fixtureFrameToken(params?.sessionId);
+		if (!session) return;
+		const basis = { epoch, tab, session, atMs: this.age() };
+		if (message.method === "Target.attachedToTarget") {
+			const info = fixtureWireRecord(params?.targetInfo);
+			const frame = fixtureFrameToken(info?.targetId);
+			if (info?.type === "iframe" && frame && typeof params?.waitingForDebugger === "boolean") {
+				this.#record({ ...basis, kind: "child-attached", frame, wait: params.waitingForDebugger });
+			}
+		} else if (message.method === "Target.detachedFromTarget") {
+			// Child detaches may omit targetId. Only remember a detach for an already observed iframe.
+			if (
+				this.#notes.some(
+					note =>
+						note.epoch === epoch &&
+						note.tab === tab &&
+						note.session === session &&
+						note.kind === "child-attached",
+				)
+			) {
+				this.#record({ ...basis, kind: "child-detached" });
+			}
+		}
+	}
+
+	install(bridge: RelayServer["bridge"], extensionId: string): void {
+		const originalOpen = bridge.extConnected.bind(bridge);
+		const originalMessage = bridge.extMessage.bind(bridge);
+		const originalClose = bridge.extClosed.bind(bridge);
+		const sockets = new WeakMap<RelaySocket, { socket: RelaySocket; epoch: number }>();
+		let epochs = 0;
+		bridge.extConnected = (socket, presentedId) => {
+			if (presentedId === extensionId && !sockets.has(socket) && epochs === FIXTURE_WIRE_MAX_EPOCHS) {
+				this.#dropped = true;
+			}
+			if (presentedId === extensionId && !sockets.has(socket) && epochs < FIXTURE_WIRE_MAX_EPOCHS) {
+				const epoch = ++epochs;
+				sockets.set(socket, {
+					epoch,
+					socket: {
+						send: raw => {
+							fixtureTraceOnly(() => this.#outbound(epoch, raw));
+							socket.send(raw);
+						},
+						close: () => socket.close(),
+					},
+				});
+			}
+			originalOpen(sockets.get(socket)?.socket ?? socket, presentedId);
+		};
+		bridge.extMessage = (socket, raw) => {
+			const mapped = sockets.get(socket);
+			if (mapped) fixtureTraceOnly(() => this.#inbound(mapped.epoch, raw));
+			originalMessage(mapped?.socket ?? socket, raw);
+		};
+		// Internal bridge calls already have the facade; they pass through unchanged.
+		bridge.extClosed = socket => originalClose(sockets.get(socket)?.socket ?? socket);
+		// The bridge exists only for this fixture. Keep normalization through asynchronous socket teardown.
+	}
+
+	summarize(frame: string | undefined) {
+		const notes = this.#tab === undefined ? [] : this.#notes.filter(note => note.tab === this.#tab);
+		const owners = notes.filter(note => frame !== undefined && note.frame === frame);
+		const childAlias = (note: FixtureWireNote) =>
+			owners.findIndex(owner => owner.epoch === note.epoch && owner.session === note.session) + 1;
+		// Project into a new object. No source IDs, paths, URLs, error text, or protocol bodies can escape.
+		const projected = notes.flatMap(note => {
+			const child = childAlias(note);
+			if (
+				note.kind !== "attach" &&
+				note.kind !== "detach" &&
+				note.kind !== "root-detached" &&
+				note.kind !== "auto-attach" &&
+				!child
+			)
+				return [];
+			const { epoch, atMs, kind, wait, armed, result, resultAtMs, reason, relayInitiated } = note;
+			return [
+				{ epoch, atMs, kind, wait, armed, result, resultAtMs, reason, relayInitiated, child: child || undefined },
+			];
+		});
+		const clipped = projected.length > FIXTURE_WIRE_SUMMARY_MAX;
+		// Preserve early registry attach plus the late menu phase when the bounded summary fills.
+		const wire = clipped ? [...projected.slice(0, 6), ...projected.slice(6 - FIXTURE_WIRE_SUMMARY_MAX)] : projected;
+		return {
+			driven: this.#tab === undefined ? "unobserved" : "verified-borrow",
+			borrowAtMs: this.#borrowAtMs,
+			capped: this.#dropped || clipped,
+			wire,
+		};
+	}
+}
+
+type NativeFixtureStage =
+	| "expected-navigation-start"
+	| "expected-commit"
+	| "error-document"
+	| "other-commit"
+	| "frame-swap"
+	| "frame-detach"
+	| "load-start"
+	| "load-stop"
+	| "extension-context"
+	| "target-attached"
+	| "target-detached"
+	| "auto-attach"
+	| "resume";
+
+interface NativeFixtureNote {
+	atMs: number;
+	stage: NativeFixtureStage;
+	frame?: string;
+	session?: string;
+	wait?: boolean;
+	armed?: boolean;
+	result?: FixtureWireResult;
+	resultAtMs?: number;
+}
+
+interface FixtureNativeMenuTrace {
+	pick(verifiedFrame?: string): {
+		frame?: string;
+		label: string;
+		capped: boolean;
+		native: Array<Omit<NativeFixtureNote, "frame" | "session"> & { child?: number }>;
+	};
+	stop(): void;
+}
+
+/** Passively observe the existing native Puppeteer owner; only the real Puppeteer stack can send its commands. */
+function watchFixtureMenuNavigation(page: Page, url: string, wire: FixtureMenuWireTrace): FixtureNativeMenuTrace {
+	const candidates = new Set<string>();
+	const notes: NativeFixtureNote[] = [];
+	const stopped = new Map<string, () => void>();
+	const native = page.mainFrame().client;
+	const connection = Connection.fromSession(native);
+	if (!connection) throw new Error("Fixture native connection unavailable");
+	// Puppeteer 25.3.0 declaration files intentionally omit this internal send seam.
+	// On any other shape the trace is unavailable; never substitute another transport.
+	const sender = connection as unknown as { _rawSend?: (...args: unknown[]) => Promise<unknown> };
+	const original = sender._rawSend;
+	if (typeof original !== "function") throw new Error("Fixture native send seam unavailable");
+	const extensionOrigin = url.slice(0, url.lastIndexOf("/"));
+	const childFrames = new Map<string, string>();
+	let capped = false;
+	let recording = true;
+	const record = (stage: NativeFixtureStage, fields: Omit<NativeFixtureNote, "atMs" | "stage">) => {
+		if (!recording) return;
+		if (notes.length === 80) {
+			capped = true;
+			return;
+		}
+		const note = { atMs: wire.age(), stage, ...fields };
+		notes.push(note);
+		return note;
+	};
+	const candidate = (id: string) => {
+		if (candidates.size >= 3 && !candidates.has(id)) capped = true;
+		else candidates.add(id);
+	};
+	const observe = (session: CDPSession) => {
+		const id = session.id();
+		if (stopped.has(id)) return;
+		if (stopped.size >= 12) {
+			capped = true;
+			return;
+		}
+		const attached = (event: Protocol.Target.AttachedToTargetEvent) => {
+			fixtureTraceOnly(() => {
+				const frame = fixtureFrameToken(event.targetInfo.targetId);
+				const child = fixtureFrameToken(event.sessionId);
+				if (!frame || !child || event.targetInfo.type !== "iframe") return;
+				const previousFrame = childFrames.get(child);
+				if ((!previousFrame && childFrames.size >= 24) || (previousFrame && previousFrame !== frame)) {
+					// Historical reattachments and late responses cannot safely be joined after saturation/ID reuse.
+					// Retain existing mappings rather than evicting a possibly outstanding native resume.
+					capped = true;
+					return;
+				}
+				childFrames.set(child, frame);
+				if (event.targetInfo.url === url) candidate(frame);
+				record("target-attached", { frame, session: child, wait: event.waitingForDebugger });
+			});
+		};
+		const detached = (event: Protocol.Target.DetachedFromTargetEvent) => {
+			fixtureTraceOnly(() => {
+				const child = fixtureFrameToken(event.sessionId);
+				const frame = child && childFrames.get(child);
+				if (frame) record("target-detached", { frame, session: child });
+			});
+		};
+		const changed = (event: Protocol.Target.TargetInfoChangedEvent) => {
+			fixtureTraceOnly(() => {
+				const frame = fixtureFrameToken(event.targetInfo.targetId);
+				if (frame && event.targetInfo.type === "iframe" && event.targetInfo.url === url) candidate(frame);
+			});
+		};
+		const stage = (frame: string, event: NativeFixtureStage, expected = false) => {
+			fixtureTraceOnly(() => {
+				if (!fixtureFrameToken(frame)) return;
+				if (expected) candidate(frame);
+				if (candidates.has(frame) || childFrames.get(id) === frame) record(event, { frame, session: id });
+			});
+		};
+		const start = (event: Protocol.Page.FrameStartedNavigatingEvent) => {
+			if (event.url === url) stage(event.frameId, "expected-navigation-start", true);
+		};
+		const commit = ({ frame }: Protocol.Page.FrameNavigatedEvent) => {
+			const expected = frame.url === url && !frame.unreachableUrl;
+			stage(
+				frame.id,
+				expected ? "expected-commit" : frame.unreachableUrl ? "error-document" : "other-commit",
+				expected,
+			);
+		};
+		const swap = (event: Protocol.Page.FrameDetachedEvent) =>
+			stage(event.frameId, event.reason === "swap" ? "frame-swap" : "frame-detach");
+		const loadStart = (event: Protocol.Page.FrameStartedLoadingEvent) => stage(event.frameId, "load-start");
+		const loadStop = (event: Protocol.Page.FrameStoppedLoadingEvent) => stage(event.frameId, "load-stop");
+		const context = ({ context }: Protocol.Runtime.ExecutionContextCreatedEvent) => {
+			const frameId = context.auxData?.frameId as unknown;
+			if (context.origin === extensionOrigin && typeof frameId === "string") stage(frameId, "extension-context");
+		};
+		const attachChild = (child: CDPSession) => fixtureTraceOnly(() => observe(child));
+		stopped.set(id, () => {
+			session.off(CDPSessionEvent.SessionAttached, attachChild);
+			session.off("Target.attachedToTarget", attached);
+			session.off("Target.detachedFromTarget", detached);
+			session.off("Target.targetInfoChanged", changed);
+			session.off("Page.frameStartedNavigating", start);
+			session.off("Page.frameNavigated", commit);
+			session.off("Page.frameDetached", swap);
+			session.off("Page.frameStartedLoading", loadStart);
+			session.off("Page.frameStoppedLoading", loadStop);
+			session.off("Runtime.executionContextCreated", context);
+		});
+		session.on(CDPSessionEvent.SessionAttached, attachChild);
+		session.on("Target.attachedToTarget", attached);
+		session.on("Target.detachedFromTarget", detached);
+		session.on("Target.targetInfoChanged", changed);
+		session.on("Page.frameStartedNavigating", start);
+		session.on("Page.frameNavigated", commit);
+		session.on("Page.frameDetached", swap);
+		session.on("Page.frameStartedLoading", loadStart);
+		session.on("Page.frameStoppedLoading", loadStop);
+		session.on("Runtime.executionContextCreated", context);
+	};
+	const proxy = new Proxy(original, {
+		apply(target, receiver, input) {
+			const args: unknown[] = input;
+			const result = Reflect.apply(target, receiver, args);
+			fixtureTraceOnly(() => {
+				const [, method, rawParams, rawSession] = args;
+				const id = fixtureFrameToken(rawSession);
+				if (!id || !stopped.has(id)) return;
+				let note: NativeFixtureNote | undefined;
+				if (method === "Runtime.runIfWaitingForDebugger") note = record("resume", { session: id });
+				if (method === "Target.setAutoAttach") {
+					const params = fixtureWireRecord(rawParams);
+					const armed = params?.autoAttach;
+					const wait = params?.waitForDebuggerOnStart;
+					if (typeof armed === "boolean" && typeof wait === "boolean") {
+						note = record("auto-attach", { session: id, armed, wait });
+					}
+				}
+				if (!note) return;
+				const reply = (outcome: FixtureWireResult) => {
+					if (!recording) return;
+					note.result = outcome;
+					note.resultAtMs = wire.age();
+				};
+				void result.then(
+					() => fixtureTraceOnly(() => reply("accepted")),
+					error =>
+						fixtureTraceOnly(() =>
+							reply(fixtureWireResult(false, error instanceof Error ? error.message : undefined)),
+						),
+				);
+			});
+			return result;
+		},
+	});
+	const stop = () => {
+		recording = false;
+		if (sender._rawSend === proxy) sender._rawSend = original;
+		for (const remove of stopped.values()) fixtureTraceOnly(remove);
+		stopped.clear();
+	};
+	try {
+		observe(native);
+		sender._rawSend = proxy;
+	} catch (error) {
+		fixtureTraceOnly(stop);
+		throw error;
+	}
+	return {
+		pick(verifiedFrame) {
+			const frame = !capped && candidates.size === 1 ? candidates.values().next().value : undefined;
+			const matched = frame && (!verifiedFrame || verifiedFrame === frame) ? frame : undefined;
+			const aliases = new Map<string, number>();
+			return {
+				frame: matched,
+				label: matched
+					? verifiedFrame
+						? "genuine-DOM-owner"
+						: "unique-native-menu-navigation"
+					: candidates.size
+						? "ambiguous-or-incomplete"
+						: "unobserved",
+				capped,
+				native: notes.flatMap(({ frame, session, ...note }) => {
+					const sessionFrame = session && childFrames.get(session);
+					if (
+						!matched ||
+						(frame !== matched &&
+							sessionFrame !== matched &&
+							!(session === native.id() && note.stage === "auto-attach"))
+					) {
+						return [];
+					}
+					let child: number | undefined;
+					if (session && sessionFrame === matched) {
+						child = aliases.get(session) ?? aliases.size + 1;
+						aliases.set(session, child);
+					}
+					return [{ ...note, child }];
+				}),
+			};
+		},
+		stop,
+	};
+}
+
+/** Opt-in hosted diagnostics only; report the genuine assertion, not the diagnostic, as the test outcome. */
+async function showMenuWithJoinedTrace(page: Page, url: string, wire: FixtureMenuWireTrace) {
+	let native: FixtureNativeMenuTrace | undefined;
+	fixtureTraceOnly(() => {
+		native = watchFixtureMenuNavigation(page, url, wire);
+	});
+	const summarize = (verifiedFrame?: string) => {
+		let output = "unavailable";
+		fixtureTraceOnly(() => {
+			const { frame, ...owner } = native?.pick(verifiedFrame) ?? { label: "unobserved" };
+			output = JSON.stringify({ owner, ...wire.summarize(frame) });
+		});
+		return output;
+	};
+	try {
+		const menu = await showStandInMenu(page, url, "driven tab after borrow");
+		fixtureTraceOnly(() => console.error(`[fixture-joined-diagnostic] ready; ${summarize(menu.frameId)}`));
+		return menu;
+	} catch (cause) {
+		throw new Error(
+			`${cause instanceof Error ? cause.message : "Fixture menu observation failed"}; fixture-joined-diagnostic=${summarize()}`,
+			{ cause },
+		);
+	} finally {
+		fixtureTraceOnly(() => native?.stop());
+	}
 }
 
 const standInMenuScript = `const menuUrl = chrome.runtime.getURL("menu.html");
@@ -918,8 +1476,9 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 		let fixture: RelayFixture | undefined;
 		let relay: BrowserHandle | undefined;
 		const name = `relay-vault-${process.pid}`;
+		const diagnostic = process.env.OMP_TEST_RELAY_MENU_JOINED_TRACE === "1" ? new FixtureMenuWireTrace() : undefined;
 		try {
-			fixture = await launchRelayFixture(undefined, [vaultDir]);
+			fixture = await launchRelayFixture(undefined, [vaultDir], false, diagnostic);
 			const vaultId = fixture.extensionIds.get(vaultDir);
 			if (!vaultId) throw new Error("Chromium did not report the stand-in vault installation");
 			const menu = `chrome-extension://${vaultId}/menu.html`;
@@ -937,11 +1496,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab ownership", () => {
 			const { tab } = await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
 			if (tab.backend !== "worker") throw new Error("Expected a real relay tab worker");
 			expect(tab.ownsPage).toBeFalse();
+			diagnostic?.drive(chromeTabId(tab.targetId));
 			expect(await chromeTab(fixture, chromeTabId(tab.targetId))).toEqual({ active: false });
 			expect(await activeChromeTabUrl(fixture)).toBe(userUrl);
 			expect(await driven.evaluate(() => document.visibilityState)).toBe("hidden");
 			// Trigger the real fixture UI only after borrow, through the independent Chrome connection.
-			const drivenMenu = await showStandInMenu(driven, menu, "driven tab after borrow");
+			const drivenMenu = diagnostic
+				? await showMenuWithJoinedTrace(driven, menu, diagnostic)
+				: await showStandInMenu(driven, menu, "driven tab after borrow");
 			expect(drivenMenu.documentId).not.toBe(userMenu.documentId);
 			await checkTitleWithoutHidingFrame(name, "Login driven");
 			expect(await observeFixtureMenu(driven, menu, "driven tab after relay read")).toEqual(drivenMenu);
