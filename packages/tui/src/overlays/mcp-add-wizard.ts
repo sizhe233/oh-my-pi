@@ -995,6 +995,11 @@ export class MCPAddWizard extends OverlayPanel {
 		);
 	}
 
+	/** Route enhanced clipboard text into the active wizard field, never the hidden chat editor. */
+	pasteText(text: string): void {
+		if (this.#stepKind === "input") this.#inputField?.pasteText(text);
+	}
+
 	handleInput(keyData: string): void {
 		if (this.#cancelled) return;
 		// While an OAuth callback is being awaited, Esc/Ctrl+C aborts the flow

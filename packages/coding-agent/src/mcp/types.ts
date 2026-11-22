@@ -1,4 +1,11 @@
-import type { MCPContent, MCPImageContent, MCPResourceContent, MCPTextContent } from "@oh-my-pi/pi-tui/tools/mcp";
+import type {
+	MCPAudioContent,
+	MCPContent,
+	MCPImageContent,
+	MCPProgress,
+	MCPResourceContent,
+	MCPTextContent,
+} from "@oh-my-pi/pi-tui/tools/mcp";
 /**
  * MCP (Model Context Protocol) type definitions.
  *
@@ -153,7 +160,7 @@ export interface MCPConfigFile {
 	mcpServers?: Record<string, MCPServerConfig>;
 	/** Names to hide regardless of any source `enabled` flag. Highest precedence. */
 	disabledServers?: string[];
-	/** Names to force-enable when a non-writable source reports `enabled: false`. */
+	/** Names to force-enable when a non-writable source reports `enabled: false` or a built-in transform would drop them. */
 	enabledServers?: string[];
 }
 
@@ -293,6 +300,11 @@ export interface MCPToolCallResult {
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
+	/**
+	 * Adds `_meta.progressToken` to the request and receives only this request's
+	 * `notifications/progress` while pending; each one restarts a default tool-call deadline (never a configured one).
+	 */
+	onProgress?: (progress: MCPProgress) => void;
 }
 
 /** Transport interface - abstracts stdio/http */
@@ -456,13 +468,6 @@ export interface MCPPromptsListResult {
 	nextCursor?: string;
 }
 
-/** Audio content in prompt messages */
-export interface MCPAudioContent {
-	type: "audio";
-	data: string;
-	mimeType: string;
-}
-
 /** Content type union for prompt messages */
 export type MCPPromptContent = MCPTextContent | MCPImageContent | MCPAudioContent | MCPResourceContent;
 
@@ -490,6 +495,7 @@ export interface MCPGetPromptResult {
 
 /** MCP server notification method names */
 export const MCPNotificationMethods = {
+	PROGRESS: "notifications/progress",
 	TOOLS_LIST_CHANGED: "notifications/tools/list_changed",
 	RESOURCES_LIST_CHANGED: "notifications/resources/list_changed",
 	RESOURCES_UPDATED: "notifications/resources/updated",
