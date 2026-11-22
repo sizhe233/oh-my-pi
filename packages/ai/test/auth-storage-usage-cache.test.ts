@@ -11,11 +11,13 @@
  *      the failure backoff window — a repeat poll within the window is served
  *      from cache (no refetch); the entry expires and the next poll retries.
  */
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	AuthStorage,
+	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import { usageCacheIdentity } from "@oh-my-pi/pi-ai/auth/usage-cache";
@@ -174,6 +176,11 @@ function makeTieredReport(account: string): UsageReport {
 			endpoint: "https://api.anthropic.com/api/oauth/usage",
 		},
 	};
+}
+
+/** Expected shape of a stored-row report after collection: tagged with the probing row's id. */
+function withCredentialId(report: UsageReport, credentialId = 1): UsageReport {
+	return { ...report, metadata: { ...report.metadata, credentialId } };
 }
 
 function usageHeaders(fiveHour: string, sevenDay: string, sevenDayModelScoped?: string): Record<string, string> {
@@ -477,7 +484,7 @@ describe("AuthStorage usage cache: Claude rate limits", () => {
 		let usageRequests = 0;
 		const usageFetch = (async (input: string | URL | Request) => {
 			const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-			if (url.search === "") usageRequests += 1;
+			if (url.pathname.endsWith("/usage") && url.search === "") usageRequests += 1;
 			if (usageRequests === 1) {
 				return Response.json(
 					{ error: { type: "rate_limit_error", message: "Rate limited. Please try again later." } },
@@ -543,7 +550,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			expect(calls).toBe(1);
 
 			expireCachePayloads(store);
-			expect(await storage.usage.reports()).toEqual([recovered]);
+			expect(await storage.usage.reports()).toEqual([withCredentialId(recovered)]);
 			expect(calls).toBe(2);
 		} finally {
 			storage.close();
@@ -629,10 +636,11 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			const peer = storage.usage.reports();
 			release.resolve(stale);
 
-			expect(await Promise.all([initial, refreshed, peer])).toEqual([[fresh], [fresh], [fresh]]);
+			const taggedFresh = withCredentialId(fresh);
+			expect(await Promise.all([initial, refreshed, peer])).toEqual([[taggedFresh], [taggedFresh], [taggedFresh]]);
 			expect(calls).toBe(2);
 			expect(peak).toBe(1);
-			expect(await storage.usage.reports()).toEqual([fresh]);
+			expect(await storage.usage.reports()).toEqual([withCredentialId(fresh)]);
 			expect(calls).toBe(2);
 		} finally {
 			release.resolve(null);
@@ -674,7 +682,7 @@ describe("AuthStorage usage cache: explicit invalidation", () => {
 			await storage.usage.invalidate("openai-codex");
 			release.resolve(report);
 
-			expect(await pending).toEqual([report]);
+			expect(await pending).toEqual([withCredentialId(report)]);
 			expect(calls).toBe(1);
 		} finally {
 			release.resolve(null);
@@ -1326,6 +1334,49 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 			expect(rows[0]?.disabledCause).toBeNull();
 			expect(fetchSpy).toHaveBeenCalledTimes(1);
 			expect(fetchSpy.mock.calls[0]?.[0].credential.accessToken).toBe("oat-1");
+		} finally {
+			storage.close();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("keeps a leased SQLite credential when the usage probe's refresh gets invalid_grant", async () => {
+		// The SQLite store serializes refreshes through durable leases; that path
+		// must apply the same advisory policy as lease-less stores.
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+		await store.saveOAuth("anthropic", {
+			access: "oat-leased",
+			refresh: "refresh-leased",
+			expires: Date.now() + 30_000,
+			accountId: "account-leased",
+			email: "leased@example.com",
+		});
+		let refreshCalls = 0;
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+			refreshOAuthCredential: async () => {
+				refreshCalls += 1;
+				throw new Error(
+					'anthropic token refresh failed: 400 {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
+				);
+			},
+		});
+		await storage.credentials.reload();
+		const disabled: string[] = [];
+		storage.credentials.onDisabled(event => {
+			disabled.push(event.disabledCause);
+		});
+		const fetchSpy = vi
+			.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage")
+			.mockResolvedValue(makeReport("leased@example.com"));
+		try {
+			expect(anthropicReports(await storage.usage.reports())).toHaveLength(1);
+			expect(refreshCalls).toBe(1);
+			expect(fetchSpy.mock.calls[0]?.[0].credential.accessToken).toBe("oat-leased");
+			expect(disabled).toEqual([]);
+			expect(store.listAuthCredentials("anthropic").map(row => row.credential)).toMatchObject([
+				{ type: "oauth", refresh: "refresh-leased" },
+			]);
 		} finally {
 			storage.close();
 			vi.restoreAllMocks();

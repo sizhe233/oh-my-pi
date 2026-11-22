@@ -61,6 +61,10 @@ interface ProbeResult {
 	diagnostic?: ChromiumProbeDiagnostic;
 }
 
+/** Synthetic fixtures can omit exit events; the real ptree child always supplies them. */
+type ChromiumProbeChild = Pick<ChildProcess, "pid" | "exitCode" | "peekStderr" | "kill" | "wait"> &
+	Partial<Pick<ChildProcess, "exited">>;
+
 /** Narrow seams keep these tests from mutating Bun, process.env, or module mocks. */
 export interface ChromiumProbeHost {
 	platform: () => NodeJS.Platform;
@@ -72,8 +76,8 @@ export interface ChromiumProbeHost {
 	isFile: (executable: string) => Promise<boolean>;
 	makeProfile: () => Promise<string>;
 	findPort: () => Promise<number>;
-	spawn: (args: string[]) => Pick<ChildProcess, "pid" | "exitCode" | "peekStderr" | "kill" | "wait">;
-	waitForCdp: (url: string, timeoutMs: number) => Promise<void>;
+	spawn: (args: string[]) => ChromiumProbeChild;
+	waitForCdp: (url: string, timeoutMs: number, signal?: AbortSignal) => Promise<void>;
 	captureFailure?: (context: ChromiumFailureContext, signal: AbortSignal) => Promise<ChromiumFailureSnapshot>;
 	removeProfile: (directory: string) => Promise<void>;
 	report: (diagnostic: ChromiumProbeDiagnostic) => void;
@@ -97,7 +101,7 @@ export function createChromiumProbe(host: ChromiumProbeHost) {
 		const started = host.now();
 		let stage: ProbeStage = "profile";
 		let directory: string | undefined;
-		let child: Pick<ChildProcess, "pid" | "exitCode" | "peekStderr" | "kill" | "wait"> | undefined;
+		let child: ChromiumProbeChild | undefined;
 		let error: ProbeError | undefined;
 		const cleanupErrors: ProbeError[] = [];
 		let cdpUrl: string | undefined;
@@ -124,7 +128,15 @@ export function createChromiumProbe(host: ChromiumProbeHost) {
 				"about:blank",
 			]);
 			stage = "cdp";
-			await host.waitForCdp(cdpUrl, timeoutMs);
+			// Stop readiness polling when this child exits. A different process can
+			// reuse its released port; that process must not make the probe pass.
+			const exitedEarly = new AbortController();
+			child.exited?.then(
+				() => exitedEarly.abort(),
+				() => exitedEarly.abort(),
+			);
+			await host.waitForCdp(cdpUrl, timeoutMs, exitedEarly.signal);
+			exitedEarly.signal.throwIfAborted();
 		} catch (cause) {
 			error = probeError(stage, cause);
 			try {
@@ -304,7 +316,7 @@ const probe = createChromiumProbe({
 	makeProfile: () => fs.mkdtemp(path.join(os.tmpdir(), "omp-chromium-probe-")),
 	findPort: () => findFreeCdpPort(),
 	spawn: args => ptree.spawn(args, { stdin: "ignore", detached: true, subreaper: true }),
-	waitForCdp: (url, timeoutMs) => waitForCdp(url, timeoutMs),
+	waitForCdp: (url, timeoutMs, signal) => waitForCdp(url, timeoutMs, signal),
 	captureFailure: collectChromiumFailureSnapshot,
 	removeProfile: directory => fs.rm(directory, { recursive: true, force: true }),
 	// Only used by tests. JSON keeps stderr newlines/commands inside a single bounded record.
